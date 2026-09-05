@@ -19,7 +19,49 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = os.environ.get("AGENTHYDRA_URL", "http://127.0.0.1:7787")
+DEFAULT_PORT = 7787
+
+
+def _runtime_pointer_url(env, home: Path | None) -> str:
+    """The URL the daemon recorded in <config dir>/runtime.json when it bound its port, or ''.
+    The config dir is AGENTHYDRA_HOME when set, else ~/.agenthydra - the same rule the daemon's
+    own config.ts applies. A missing or unreadable pointer is simply '' (the caller falls back);
+    a stale one from a crashed daemon is caught by the first request failing, as it is for MCP."""
+    root = (env.get("AGENTHYDRA_HOME") or "").strip()
+    base = Path(root) if root else (home or Path.home()) / ".agenthydra"
+    try:
+        info = json.loads((base / "runtime.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    url = info.get("url") if isinstance(info, dict) else None
+    return str(url).rstrip("/") if isinstance(url, str) and url.startswith("http") else ""
+
+
+def resolve_base_url(env=None, home: Path | None = None) -> str:
+    """Where the daemon is, in the SAME precedence the MCP server uses (server/src/mcp.ts
+    daemonBase): an explicit AGENTHYDRA_URL, else an explicit AGENTHYDRA_PORT, else the port
+    the daemon ACTUALLY bound (its runtime.json pointer, which follows an auto-hop off a busy
+    7787), else the static default.
+
+    Audit AH-04 (2026-09-05): this used to be `AGENTHYDRA_URL or 7787` and nothing else, so a
+    daemon that had hopped ports had a toolbox that looked healthy (the menu needs no daemon)
+    while every fleet read failed - or, with an older daemon still on 7787, read the wrong one.
+    The daemon now also pins AGENTHYDRA_URL into the children it spawns; this is the standalone
+    half, for a script run from a shell."""
+    env = os.environ if env is None else env
+    url = (env.get("AGENTHYDRA_URL") or "").strip()
+    if url:
+        return url.rstrip("/")
+    port = (env.get("AGENTHYDRA_PORT") or "").strip()
+    if port.isdigit():
+        return f"http://127.0.0.1:{int(port)}"
+    pointer = _runtime_pointer_url(env, home)
+    if pointer:
+        return pointer
+    return f"http://127.0.0.1:{DEFAULT_PORT}"
+
+
+BASE = resolve_base_url()
 TIMEOUT_SECS = float(os.environ.get("AGENTHYDRA_TIMEOUT_SECS", "30"))
 
 # THE TEST SEAM, AND WHY THE SUITE NEEDS ONE (measured 2026-09-05). The unit tests' stub daemon

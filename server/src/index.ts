@@ -78,6 +78,7 @@ import {
   setNotificationSettings,
 } from './notify-settings'
 import { openUi } from './open-ui'
+import { setOrchestratorDaemonUrl } from './orchestrator'
 import { openPortableWindow } from './portable-window.mjs'
 import { startPriceCatalog } from './price-catalog'
 import { getProviderSettings, setProviderSettings } from './provider-settings'
@@ -687,6 +688,10 @@ writeInstanceInfo(boundPort, {
   portableMode: portableModeEnabled(),
   hideTrayIcon: hideTrayIconEnabled(),
 })
+// Every toolbox child this daemon spawns is told THIS daemon's URL (audit AH-04): the bound
+// port, not the configured one, so a hop off a busy 7787 does not leave the Python side talking
+// to whatever answers there. See orchestratorChildEnv.
+setOrchestratorDaemonUrl(readInstanceInfo()?.url ?? `http://127.0.0.1:${boundPort}`)
 // Say ONCE that this build has no tray icon. The single-file .exe carries no misc\ sidecar, so
 // misc\lunarwerx-tray.exe cannot exist and no tray icon can ever appear whatever the in-app
 // setting says (release.yml's asset table states this, but only on the Releases page - the .exe

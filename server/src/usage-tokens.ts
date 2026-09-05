@@ -315,28 +315,37 @@ export function mergeSpend(a: TokenSpend, b: TokenSpend): TokenSpend {
   }
 }
 
+/** How deep under `projects/` the walk goes. A subagent transcript sits at
+ *  `<project>/<parent-session>/subagents/agent-<id>.jsonl` (depth 3 from the root) and a
+ *  workflow's descendants one or two levels under that; six is headroom, not a target, and it
+ *  bounds the walk against a pathological tree. */
+const RECENT_TRANSCRIPT_MAX_DEPTH = 6
+
 /** Every *.jsonl under a transcripts root whose mtime is at/after `sinceMs`. The mtime filter is what
  *  keeps this cheap: the corpus is thousands of files and gigabytes, but a 5-hour window touches only
- *  the handful that were actually written to. */
+ *  the handful that were actually written to.
+ *
+ *  RECURSIVE, for the same reason transcript.ts's discovery is (audit AH-33): a Task-tool
+ *  subagent writes its OWN transcript, nested under its parent's, carrying its own usage blocks -
+ *  separate API calls and separate spend. The old two-level readdir never saw them, so a window in
+ *  which the work was delegated reported no token activity at all and the budget's remaining-turn
+ *  estimate came out optimistic. Reproduced with a nested-only 12-token fixture: raw 0, turns 0. */
 function recentTranscripts(root: string, sinceMs: number): string[] {
   const hits: string[] = []
-  let projects: string[]
-  try {
-    projects = readdirSync(root)
-  } catch {
-    return hits // no transcripts for this config dir (never used, or not logged in)
-  }
-  for (const proj of projects) {
-    const dir = join(root, proj)
-    let files: string[]
+  const walk = (dir: string, depth: number): void => {
+    let entries: import('node:fs').Dirent[]
     try {
-      files = readdirSync(dir)
+      entries = readdirSync(dir, { withFileTypes: true })
     } catch {
-      continue
+      return // no transcripts here (never used, not logged in, or vanished mid-scan)
     }
-    for (const f of files) {
-      if (!f.endsWith('.jsonl')) continue
-      const p = join(dir, f)
+    for (const entry of entries) {
+      const p = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (depth < RECENT_TRANSCRIPT_MAX_DEPTH) walk(p, depth + 1)
+        continue
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
       try {
         if (statSync(p).mtimeMs >= sinceMs) hits.push(p)
       } catch {
@@ -344,6 +353,7 @@ function recentTranscripts(root: string, sinceMs: number): string[] {
       }
     }
   }
+  walk(root, 0)
   return hits
 }
 

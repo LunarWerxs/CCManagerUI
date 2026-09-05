@@ -694,7 +694,78 @@ export function sweepUntitledDesktopChats(
   return { fixed, profiles: [...renamedProfiles], renamed }
 }
 
-export async function importSessionToDesktop(opts: {
+type ImportOpts = Parameters<typeof importSessionToDesktopUnclaimed>[0]
+type ImportResult = Awaited<ReturnType<typeof importSessionToDesktopUnclaimed>>
+
+/** Imports in flight, by session id (audit AH-05). Every entry point - the direct route, a
+ *  migration, a batch, the message route's heal, the landing serializer - funnels through
+ *  importSessionToDesktop, so an in-process claim here IS the fleet-wide one: the daemon is the
+ *  only process that performs imports. */
+const importClaims = new Map<string, { instanceDir: string; run: Promise<ImportResult> }>()
+/** Imports that spawned recently, by session id. The app creates the row some seconds after the
+ *  spawn; until it has, the rendered check below cannot see it, and a second import in that gap
+ *  is exactly the duplicate row this exists to prevent. */
+const recentImports = new Map<string, { instanceDir: string; at: number }>()
+const RECENT_IMPORT_MS = 120_000
+
+/**
+ * Import a finished session into a desktop instance as a visible chat - ONE import per session
+ * at a time, whoever asks (audit AH-05).
+ *
+ * Before this, the direct route checked "does the target already render it?" and then started an
+ * Electron import, with nothing shared between callers: two requests for the same session could
+ * both pass that check and both spawn, and two rows with one name make every later title-aimed
+ * action on that chat refuse as ambiguous. Serial execution inside migrate_batch did not cover
+ * migrate_chat, the direct route, or the message route racing it.
+ *
+ * The claim is held from before the rendered check through the verified landing (the stamp
+ * waits for the app to create the record). A second caller for the same session and the same
+ * target waits for the first and, if it landed, gets `alreadyRendered` + `coalesced` back - the
+ * row it wanted exists. A caller aiming the same session at a DIFFERENT target while one import
+ * runs is refused as busy rather than queued behind it: two homes for one session is its own
+ * mistake and the caller should re-plan. If the first attempt failed, the second runs normally.
+ */
+export async function importSessionToDesktop(opts: ImportOpts): Promise<ImportResult> {
+  const held = importClaims.get(opts.sessionId)
+  if (held) {
+    if (!samePathKey(held.instanceDir, opts.instanceDir))
+      return {
+        ok: false,
+        reason: `import-in-flight: this session is being imported into another instance (${held.instanceDir}) right now; wait for it, then re-plan`,
+      }
+    const first = await held.run
+    if (first.ok)
+      return {
+        ok: true,
+        alreadyRendered: true,
+        coalesced: true,
+        titled: false,
+        titleDurable: false,
+      }
+    // The first attempt failed; this caller gets its own try below.
+  }
+  const recent = recentImports.get(opts.sessionId)
+  if (recent && Date.now() - recent.at < RECENT_IMPORT_MS) {
+    if (!samePathKey(recent.instanceDir, opts.instanceDir))
+      return {
+        ok: false,
+        reason: `import-in-flight: this session was imported into another instance (${recent.instanceDir}) ${Math.round((Date.now() - recent.at) / 1000)}s ago and the app may still be creating its row; wait for it, then re-plan`,
+      }
+    return { ok: true, alreadyRendered: true, coalesced: true, titled: false, titleDurable: false }
+  }
+  const run = importSessionToDesktopUnclaimed(opts)
+  importClaims.set(opts.sessionId, { instanceDir: opts.instanceDir, run })
+  try {
+    const result = await run
+    if (result.ok && !result.alreadyRendered)
+      recentImports.set(opts.sessionId, { instanceDir: opts.instanceDir, at: Date.now() })
+    return result
+  } finally {
+    if (importClaims.get(opts.sessionId)?.run === run) importClaims.delete(opts.sessionId)
+  }
+}
+
+async function importSessionToDesktopUnclaimed(opts: {
   sessionId: string
   instanceDir: string
   /** Title for the imported chat. The import itself creates the chat as "Untitled" (the app
@@ -720,6 +791,9 @@ export async function importSessionToDesktop(opts: {
   titleDurable?: boolean
   /** True when no import was performed because the chat already renders in that instance. */
   alreadyRendered?: boolean
+  /** True when this call did no work of its own because another import of the same session into
+   *  the same instance was in flight (or had just landed) and that one succeeded. */
+  coalesced?: boolean
 }> {
   // THE NAMING LAW HOLDS AT THE CHOKEPOINT (owner directive 2026-08-29), not only at the
   // routes: adversarial review found the queue's auto-import landing chats with a null or

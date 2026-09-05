@@ -89,7 +89,11 @@ interface ScannedMeta {
 
 // One entry per transcript. Keeping mtime in the value (instead of in the Map key) makes an active
 // transcript replace its old parse rather than leaking one cache entry on every appended turn.
-const metaCache = new Map<string, { mtimeMs: number; meta: ScannedMeta }>()
+// Size rides along with mtime (audit AH-36): the persisted L2 and the in-flight key already treat
+// a revision as mtime+size, and this map alone did not - so an append that landed inside the same
+// timestamp tick (coarse filesystems, a same-millisecond rewrite) kept serving the parse of the
+// shorter file until something else happened to bump the mtime.
+const metaCache = new Map<string, { mtimeMs: number; sizeBytes: number; meta: ScannedMeta }>()
 
 // L2 behind that map: the same parse, persisted (see the session_scan_cache comment in db.ts). The
 // in-memory map alone meant every daemon restart re-parsed the whole visible list before answering.
@@ -203,7 +207,7 @@ function readScanCache(tf: TranscriptFile, key: string): ScannedMeta | null {
 }
 
 function rememberScan(tf: TranscriptFile, key: string, meta: ScannedMeta): ScannedMeta {
-  metaCache.set(key, { mtimeMs: tf.mtime_ms, meta })
+  metaCache.set(key, { mtimeMs: tf.mtime_ms, sizeBytes: tf.size_bytes, meta })
   try {
     upsertScan.run(
       key,
@@ -250,10 +254,11 @@ const inFlight = new Map<string, Promise<ScannedMeta | null>>()
 export function scanMeta(tf: TranscriptFile): Promise<ScannedMeta | null> {
   const key = cacheKey(tf)
   const cached = metaCache.get(key)
-  if (cached?.mtimeMs === tf.mtime_ms) return Promise.resolve(cached.meta)
+  if (cached && cached.mtimeMs === tf.mtime_ms && cached.sizeBytes === tf.size_bytes)
+    return Promise.resolve(cached.meta)
   const persisted = readScanCache(tf, key)
   if (persisted) {
-    metaCache.set(key, { mtimeMs: tf.mtime_ms, meta: persisted })
+    metaCache.set(key, { mtimeMs: tf.mtime_ms, sizeBytes: tf.size_bytes, meta: persisted })
     return Promise.resolve(persisted)
   }
   // Keyed by file revision, so a transcript that gains a turn mid-flight starts a fresh scan rather
@@ -296,7 +301,9 @@ function parseSharedStoreMeta(tf: TranscriptFile, key: string): ScannedMeta {
     // says which one this row came from.
     content = readHermesSession(tf.session_id, tf.path) ?? { events: [], messageCount: 0 }
   } else {
-    content = readOpenCodeSession(tf.session_id) ?? { events: [], messageCount: 0 }
+    // tf.path, not the default database, for the same reason as the Hermes line above: an
+    // OpenCode-compatible product (Kilo, MiMo Code, IcodeMate) is its own store (audit AH-34).
+    content = readOpenCodeSession(tf.session_id, tf.path) ?? { events: [], messageCount: 0 }
   }
   const textEvents = (content?.events ?? []).filter((event) => event.kind === 'text')
   const first = textEvents[0]

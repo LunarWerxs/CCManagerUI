@@ -174,9 +174,12 @@ function firstPath(input: unknown): string | null {
  */
 function scanOpenCodeAnalytics(
   sessionId: string | undefined,
+  /** The store's database - the row's own, not the default OpenCode one: Kilo, MiMo Code and
+   *  IcodeMate are separate OpenCode-format databases (audit AH-34). */
+  path: string,
   out: SessionAnalytics,
 ): SessionAnalytics {
-  const row = sessionId ? readOpenCodeUsage(sessionId) : null
+  const row = sessionId ? readOpenCodeUsage(sessionId, path) : null
   if (row) {
     const spend = openCodeSpend(row)
     out.tokens = spend.byModel
@@ -343,7 +346,7 @@ export async function scanSessionAnalytics(
   // OpenCode has already totalled its own session: the numbers are columns on its row, not events
   // in a log, so there is nothing to stream. See openCodeSpend for why `reasoning` is kept out of
   // `output` rather than added to it.
-  if (source === 'opencode') return scanOpenCodeAnalytics(sessionId, out)
+  if (source === 'opencode') return scanOpenCodeAnalytics(sessionId, path, out)
   if (source === 'hermes') return scanHermesAnalytics(sessionId, path, out)
   // Not one of these stores records what a turn cost — Copilot bills credits and never writes a
   // token count, and Grok, Kimi and Zed simply do not persist one. So a foreign session is listed

@@ -1561,7 +1561,11 @@ export async function tailTranscript(
     }
   }
   if (tf.source === 'opencode') {
-    const content = readOpenCodeSession(sessionId)
+    // tf.path is THE store (audit AH-34): Kilo, MiMo Code and IcodeMate are OpenCode-format
+    // stores with their own databases, and discovery already put each row's database here.
+    // Reading the default OpenCode database instead answered "transcript not found" for every
+    // session those products had, and a colliding id would have shown the wrong product's chat.
+    const content = readOpenCodeSession(sessionId, tf.path)
     if (!content) {
       return {
         session_id: sessionId,

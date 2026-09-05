@@ -177,6 +177,25 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
   locked profile) dropped the registry record anyway and reported success, leaving the login on
   disk with no row to manage it from; the record now stays and the real error comes back.
 
+- **Fleet actions land once and read the right store** (audit AH-04/05/06/33/34/36, 2026-09-05).
+  Six more findings, each reproduced before it was closed. The Python toolbox now finds the daemon
+  the way the MCP server does (explicit URL, explicit port, then the port the daemon ACTUALLY
+  bound, then 7787) and the daemon pins its own bound URL into every toolbox child it spawns - a
+  daemon that had hopped off a busy 7787 used to leave its toolbox talking to whatever answered
+  there. Importing a session into a desktop app now holds one claim per session across every
+  entry point (direct route, migration, batch, the message route's heal): a concurrent same-target
+  request waits and coalesces onto the row the first one made instead of spawning a second import
+  and a second identically named row, which made every later title-aimed action on that chat
+  refuse as ambiguous. Automatic reply staging checks for an existing pending reply inside the
+  same lock it appends under, so two lanes planning the same wake in one window produce one row.
+  The quota budget's token count walks nested subagent and workflow transcripts, which the
+  transcript index already counted as separate spend; a window in which the work was delegated
+  used to report no activity at all. Kilo, MiMo Code and IcodeMate sessions are read from their
+  own databases in tail, list metadata, export and analytics, not from the default OpenCode one
+  (they listed fine and then opened as "transcript not found"). And the in-memory metadata cache
+  treats a revision as mtime AND size, as the persisted cache always did, so an append that lands
+  inside the same timestamp tick is re-parsed rather than served stale.
+
 - **Delete and undo of one chat can no longer interleave, twin cleanup re-checks liveness at the
   moment it acts, and a failed self-update no longer erases edits made while it ran** (audit
   AH-28/32/39, 2026-09-05). Three more places a decision was older than the act it authorized.

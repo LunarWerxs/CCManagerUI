@@ -72,9 +72,10 @@ async function readAllEvents(
     const tf = await findTranscriptAsync(sessionId, 'foreign')
     return tf ? readForeignSession(tf.tool ?? '', tf.path) : []
   }
-  if (source === 'opencode') return readOpenCodeSession(sessionId)?.events ?? []
-  // path here IS the store's db path (see the two call sites below), so — unlike the OpenCode line
-  // above — a Hermes profile's own database is what actually gets read, not always the default one.
+  // path here IS the store's db path (see the two call sites below), so a Hermes profile's own
+  // database - or a Kilo / MiMo Code / IcodeMate store, which are OpenCode-format databases of
+  // their own (audit AH-34) - is what actually gets read, never always the default one.
+  if (source === 'opencode') return readOpenCodeSession(sessionId, path)?.events ?? []
   if (source === 'hermes') return readHermesSession(sessionId, path)?.events ?? []
   const events: TailEvent[] = []
   for await (const line of streamLines(path)) {

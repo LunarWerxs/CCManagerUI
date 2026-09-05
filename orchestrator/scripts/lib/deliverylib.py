@@ -96,13 +96,14 @@ def stage(session_id: str, text: str, *, title: str = "", instance: str = "",
     being written, so two lanes planning from their own reads in the same window cannot each
     inject a wake into one chat. A person's reply is never folded into someone else's row -
     stage_reply and interview leave this off.
+
+    The lookup and the append happen against ONE locked snapshot (audit AH-06, reproduced
+    2026-09-05): checked before the lock, two synchronized lanes both saw no pending row and
+    then both appended under the lock - two ids, neither `reused`, and the courier's per-id
+    claim and one-per-chat-per-pass rules only DELAYED the second wake rather than dropping it.
     """
     if not str(text).strip():
         raise ValueError("a staged reply needs text - staging an empty message is not a decision")
-    if dedupe:
-        already = pending(session_id)
-        if already:
-            return {**already[0], "reused": True}
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     if not verify_text:
         verify_text = _verify_snippet(evidence)
@@ -123,6 +124,13 @@ def stage(session_id: str, text: str, *, title: str = "", instance: str = "",
     }
     with ledgerlib.locked("deliveries"):
         rows = _load()
+        if dedupe:
+            already = sorted(
+                (r for r in rows if r.get("state") == "staged" and r.get("session") == session_id),
+                key=lambda r: r.get("stagedAt", 0),
+            )
+            if already:
+                return {**already[0], "reused": True}
         rows.append(entry)
         _save(rows)
     return entry

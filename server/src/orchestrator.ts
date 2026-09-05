@@ -20,6 +20,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { APP_ROOT } from './config'
+import { readInstanceInfo } from './instance'
 
 /** Where the toolbox lives. `AGENTHYDRA_ORCHESTRATOR_DIR` overrides for a layout where the Python
  *  tree sits somewhere else (a compiled binary with the tree copied beside it, or a developer
@@ -224,6 +225,43 @@ function killTree(proc: ReturnType<typeof Bun.spawn>): void {
   }
 }
 
+/** The URL THIS daemon answers on, recorded by index.ts the moment it has bound its port. */
+let daemonUrl: string | null = null
+
+export function setOrchestratorDaemonUrl(url: string): void {
+  daemonUrl = url
+}
+
+/**
+ * The environment a toolbox child runs with.
+ *
+ * Two things are pinned here rather than inherited:
+ *
+ *   * PYTHONUTF8 / PYTHONIOENCODING: Python writing to a PIPE on Windows encodes with the locale
+ *     code page (cp1252) unless told otherwise, and the toolbox prints '×', '🟢' and account names
+ *     - decoded as UTF-8 here that would be mojibake on a machine without UTF-8 mode.
+ *   * AGENTHYDRA_URL: THE DAEMON THAT SPAWNED THE CHILD (audit AH-04). hydralib's default is
+ *     127.0.0.1:7787 and it only ever read AGENTHYDRA_URL, while this daemon auto-hops to another
+ *     port when 7787 is taken and never told its child. Reproduced: AGENTHYDRA_PORT=17787 with no
+ *     URL set, and the toolbox still addressed 7787 - a menu that looks healthy while every fleet
+ *     read fails, or, with an older daemon on 7787, the wrong daemon answering. The bound URL
+ *     overrides any AGENTHYDRA_URL the daemon itself inherited: a child of this daemon talks to
+ *     this daemon, whatever the shell that started the daemon was pointed at.
+ */
+export function orchestratorChildEnv(
+  base: NodeJS.ProcessEnv = process.env,
+  url: string | null = daemonUrl,
+): Record<string, string> {
+  const env: Record<string, string> = {
+    ...(base as Record<string, string>),
+    PYTHONUTF8: '1',
+    PYTHONIOENCODING: 'utf-8',
+  }
+  const own = url ?? readInstanceInfo()?.url ?? null
+  if (own) env.AGENTHYDRA_URL = own
+  return env
+}
+
 async function realSpawn(command: string[], cwd: string, timeoutMs: number) {
   const proc = Bun.spawn(command, {
     cwd,
@@ -231,11 +269,7 @@ async function realSpawn(command: string[], cwd: string, timeoutMs: number) {
     stderr: 'pipe',
     stdin: 'ignore',
     windowsHide: true,
-    // Python writing to a PIPE on Windows encodes with the locale code page (cp1252) unless told
-    // otherwise, and the toolbox prints '×', '🟢' and account names - decoded as UTF-8 here that
-    // would be mojibake on a machine without UTF-8 mode. Stated at the spawn so it does not
-    // depend on how the second machine happens to be configured.
-    env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+    env: orchestratorChildEnv(),
   })
   let timedOut = false
   const killer = setTimeout(() => {
