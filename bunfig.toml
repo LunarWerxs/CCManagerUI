@@ -3,6 +3,16 @@
 [test]
 preload = ["./tests/setup.ts"]
 
+# `bun test` walks the WHOLE tree, so a *.test.ts left under a gitignored scratch dir runs as part
+# of the suite - and in the serial run CI uses, its leftovers land on every file after it. Found
+# 2026-09-05: three probe tests an audit session parked in tmp/audit2/ reassigned globalThis.fetch
+# (never restored) and mock.module'd node:child_process (never restored), and the two kit-synced
+# files that run last - instance-pointer and updater-engine - failed on a fetch that answered
+# synthetic JSON and a spawn that handed back an EventEmitter with no setEncoding. `bun run test`
+# (--parallel=4) happened to be green only because the workers split the files differently.
+# Mirrors .gitignore's `tmp/`: what git does not see, the suite does not run.
+pathIgnorePatterns = ["**/tmp/**"]
+
 # NO [install] block. An isolated linker backed by a global store was tried here on 2026-08-07 and
 # reverted the same day: it installs fine on a machine whose global store is already warm, and fails
 # on one where it is not. CI's windows-latest runner caches ~/.bun/install/cache but not the store,
