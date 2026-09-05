@@ -157,7 +157,11 @@ async function capture(command: string[], timeoutMs = 10_000): Promise<string | 
   }
 }
 
-async function listWindowsDesktopProcessRecords(): Promise<CodexDesktopProcessRecord[]> {
+/** null = the scan could not be performed (no PowerShell, spawn error, timeout, unparseable
+ *  output). An EMPTY string from a successful PowerShell is the genuine "nothing running". The
+ *  two used to share one `return []`, which is what let a delete guard read a broken scan as
+ *  "not running" (audit AH-02). */
+async function listWindowsDesktopProcessRecords(): Promise<CodexDesktopProcessRecord[] | null> {
   const script = [
     "$ErrorActionPreference = 'Stop';",
     `Get-CimInstance -ClassName Win32_Process -Filter "Name='ChatGPT.exe' OR Name='Codex.exe'" |`,
@@ -165,7 +169,8 @@ async function listWindowsDesktopProcessRecords(): Promise<CodexDesktopProcessRe
     'ConvertTo-Json -Compress -Depth 3',
   ].join(' ')
   const stdout = await capture(['powershell', '-NoProfile', '-NonInteractive', '-Command', script])
-  if (!stdout?.trim()) return []
+  if (stdout === null) return null
+  if (!stdout.trim()) return []
 
   try {
     const parsed: unknown = JSON.parse(stdout)
@@ -188,13 +193,14 @@ async function listWindowsDesktopProcessRecords(): Promise<CodexDesktopProcessRe
       ]
     })
   } catch {
-    return []
+    return null
   }
 }
 
-async function listUnixDesktopProcessRecords(): Promise<CodexDesktopProcessRecord[]> {
+/** null = `ps` could not be run; an empty listing from a successful `ps` is a real empty. */
+async function listUnixDesktopProcessRecords(): Promise<CodexDesktopProcessRecord[] | null> {
   const stdout = await capture(['ps', '-eo', 'pid=,ppid=,command='])
-  if (!stdout) return []
+  if (stdout === null) return null
 
   const records: CodexDesktopProcessRecord[] = []
   for (const line of stdout.split(/\r?\n/)) {
@@ -215,20 +221,34 @@ async function listUnixDesktopProcessRecords(): Promise<CodexDesktopProcessRecor
 /** The one OS scan behind {@link listCodexDesktopProcesses} — a second `Get-CimInstance
  *  Win32_Process` on Windows, and therefore a second ~490ms PowerShell spawn, on the Codex
  *  table's own 5s poll. Cached for the same reasons as core/process.ts's; see scan-cache.ts. */
-const codexProcessCache = createScanCache<CodexDesktopRuntime[]>(
+const codexProcessCache = createScanCache<CodexProcessScan>(
   async () => {
     try {
       const records =
         process.platform === 'win32'
           ? await listWindowsDesktopProcessRecords()
           : await listUnixDesktopProcessRecords()
-      return codexDesktopRuntimesFromRecords(records)
-    } catch {
-      return []
+      if (records === null) {
+        return {
+          ok: false,
+          reason:
+            process.platform === 'win32'
+              ? 'Get-CimInstance did not return a process list'
+              : '`ps` did not return a process list',
+        }
+      }
+      return { ok: true, runtimes: codexDesktopRuntimesFromRecords(records) }
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
     }
   },
   { freshMs: 3_000, staleMs: 30_000 },
 )
+
+/** One enumeration attempt: the runtimes, or the reason there is no answer. */
+export type CodexProcessScan =
+  | { ok: true; runtimes: CodexDesktopRuntime[] }
+  | { ok: false; reason: string }
 
 /**
  * Running Codex/ChatGPT Desktop processes, keyed by their `--user-data-dir`.
@@ -237,11 +257,41 @@ const codexProcessCache = createScanCache<CodexDesktopRuntime[]>(
  * every 5s and the underlying scan is a PowerShell + WMI round trip. `fresh: true` bypasses the
  * cache for anything about to act on the answer (launch / stop), which must not decide from a
  * snapshot a poll tick old.
+ *
+ * LENIENT: a scan that could not run reads as an empty list, which is right for a table and
+ * wrong for a delete. Destructive callers use {@link scanCodexDesktopProcesses}.
  */
 export async function listCodexDesktopProcesses(
   options: { fresh?: boolean } = {},
 ): Promise<CodexDesktopRuntime[]> {
+  const scan = await scanCodexDesktopProcesses(options)
+  return scan.ok ? scan.runtimes : []
+}
+
+/** {@link listCodexDesktopProcesses} without folding failure into empty (audit AH-02). */
+export async function scanCodexDesktopProcesses(
+  options: { fresh?: boolean } = {},
+): Promise<CodexProcessScan> {
   return await codexProcessCache.get({ fresh: options.fresh })
+}
+
+export type ScanDesktopProcesses = (options?: { fresh?: boolean }) => Promise<CodexProcessScan>
+
+/** Whether `target`'s desktop is running, stopped, or UNKNOWN because the OS could not be asked.
+ *  Always a fresh scan: every caller is about to act on the answer. */
+export async function codexDesktopRunState(
+  target: CodexDesktopTarget,
+  scan: ScanDesktopProcesses = scanCodexDesktopProcesses,
+): Promise<
+  | { state: 'running'; runtime: CodexDesktopRuntime }
+  | { state: 'stopped' }
+  | { state: 'unknown'; reason: string }
+> {
+  const result = await scan({ fresh: true })
+  if (!result.ok) return { state: 'unknown', reason: result.reason }
+  const wanted = pathKey(codexDesktopUserDataDir(target.codexHome))
+  const runtime = result.runtimes.find((r) => pathKey(r.desktopUserDataDir) === wanted)
+  return runtime ? { state: 'running', runtime } : { state: 'stopped' }
 }
 
 /** Forget the cached Codex process snapshot — call after launching or stopping one, so the row

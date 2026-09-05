@@ -294,12 +294,14 @@ async function listWindowsProcessesViaWmic(): Promise<WinProcRecord[] | null> {
   return records
 }
 
-async function listWindowsProcesses(): Promise<CMProcessInfo[]> {
+/** null = BOTH Windows strategies failed. That is "could not enumerate", which the public
+ *  `scanClaudeProcesses` reports as such; it is never folded into an empty list here. */
+async function listWindowsProcesses(): Promise<CMProcessInfo[] | null> {
   let records = await listWindowsProcessesViaCim()
   if (records === null) {
     records = await listWindowsProcessesViaWmic()
   }
-  if (records === null) return []
+  if (records === null) return null
 
   const out: CMProcessInfo[] = []
   for (const r of records) {
@@ -319,12 +321,13 @@ async function listWindowsProcesses(): Promise<CMProcessInfo[]> {
 // macOS / Linux: `ps -eo pid=,command=`.
 // ----------------------------------------------------------------------------
 
-async function listUnixProcesses(): Promise<CMProcessInfo[]> {
+/** null = `ps` could not be run or failed; see listWindowsProcesses. */
+async function listUnixProcesses(): Promise<CMProcessInfo[] | null> {
   // `pid=,command=` suppresses the header row; `command` (not `comm`) gives the full
   // argv/cmdline rather than just the truncated executable basename. BSD `ps` (macOS) and
   // procps `ps` (Linux) both support this `-o key=` no-header syntax.
   const stdout = await runCaptureStdout(['ps', '-eo', 'pid=,command='])
-  if (stdout === null) return []
+  if (stdout === null) return null
 
   const out: CMProcessInfo[] = []
   const lines = stdout.split(/\r?\n/)
@@ -371,24 +374,66 @@ async function listUnixProcesses(): Promise<CMProcessInfo[]> {
  * a different scan, so the two shapes share one cache entry.
  *
  * Never throws: enumeration failures (powershell/wmic/ps unavailable, spawn error, timeout,
- * unparseable output) resolve to an empty array.
+ * unparseable output) resolve to an empty array. THAT MAKES THIS THE WRONG CALL FOR ANYTHING
+ * DESTRUCTIVE - an empty array here means "none running OR could not look", and a delete guard
+ * that reads it as the former deletes a live profile the moment PowerShell hiccups (audit AH-02,
+ * reproduced with an injected spawn failure). Anything about to destroy data must call
+ * {@link scanClaudeProcesses}, which keeps the two apart. This lenient shape stays for the UI
+ * tables, where a blank tick is the right degradation.
  */
 export async function listClaudeProcesses(
   options: ListClaudeProcessesOptions = {},
 ): Promise<CMProcessInfo[]> {
-  const all = await claudeProcessCache.get({ fresh: options.fresh })
-  return options.includeChildren ? all : all.filter((p) => p.isMain)
+  const scan = await scanClaudeProcesses(options)
+  return scan.ok ? scan.processes : []
 }
 
-/** The one OS scan behind {@link listClaudeProcesses}. Always returns the FULL set (main +
- *  `--type=` children); the public function does the narrowing, so both shapes are served from a
- *  single cached snapshot. */
-const claudeProcessCache = createScanCache<CMProcessInfo[]>(
+/** The outcome of one enumeration attempt: the processes, or the reason there is no answer. */
+export type ClaudeProcessScan =
+  | { ok: true; processes: CMProcessInfo[] }
+  | { ok: false; reason: string }
+
+/**
+ * The same enumeration as {@link listClaudeProcesses}, WITHOUT collapsing failure into empty.
+ *
+ * `ok: false` means the OS could not be asked (no PowerShell/wmic/ps, spawn error, timeout,
+ * unparseable output). A caller deciding whether a profile is safe to delete must refuse on it;
+ * a caller only painting a table may treat it as nothing to show. Same cache, same `fresh`
+ * semantics, same `includeChildren` narrowing.
+ */
+export async function scanClaudeProcesses(
+  options: ListClaudeProcessesOptions = {},
+): Promise<ClaudeProcessScan> {
+  const scan = await claudeProcessCache.get({ fresh: options.fresh })
+  if (!scan.ok) return scan
+  return {
+    ok: true,
+    processes: options.includeChildren ? scan.processes : scan.processes.filter((p) => p.isMain),
+  }
+}
+
+/** The one OS scan behind {@link listClaudeProcesses} / {@link scanClaudeProcesses}. Always
+ *  holds the FULL set (main + `--type=` children); the public functions do the narrowing, so both
+ *  shapes are served from a single cached snapshot. A failed scan is cached like any other answer
+ *  (a `fresh: true` caller bypasses it anyway), so a broken PowerShell does not turn every poll
+ *  tick into a fresh 10-second timeout. */
+const claudeProcessCache = createScanCache<ClaudeProcessScan>(
   async () => {
     try {
-      return process.platform === 'win32' ? await listWindowsProcesses() : await listUnixProcesses()
-    } catch {
-      return []
+      const processes =
+        process.platform === 'win32' ? await listWindowsProcesses() : await listUnixProcesses()
+      if (processes === null) {
+        return {
+          ok: false,
+          reason:
+            process.platform === 'win32'
+              ? 'neither Get-CimInstance nor wmic returned a process list'
+              : '`ps` did not return a process list',
+        }
+      }
+      return { ok: true, processes }
+    } catch (err) {
+      return { ok: false, reason: err instanceof Error ? err.message : String(err) }
     }
   },
   // 3s fresh: comfortably inside the UI's 4s poll, so a tick that lands early costs nothing, and

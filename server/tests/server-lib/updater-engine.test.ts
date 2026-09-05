@@ -201,3 +201,88 @@ test("rollback message distinguishes a clean revert from a revert whose reinstal
   expect(head).toBe(preUpdateCommit);
   expect(readFileSync(log, "utf8").trim().split("\n")).toEqual(["install", "build", "install"]);
 }, 30_000); // real git+install+build — see the happy-path test's note on the widened timeout.
+
+/** A `bun -e` build step whose FIRST call edits a tracked file in the checkout and writes an
+ *  untracked one beside it, then fails - the developer who typed into the tree while
+ *  install/build were running. Later calls (the rollback's rebuild pass) log and succeed, so
+ *  what the test then finds in the tree is the rollback's doing, not the fixture's. */
+function editingThenFailingBuildCmd(logPath: string, appRoot: string, countFile: string): string[] {
+  const script = [
+    `const fs = require("fs")`,
+    `const n = (fs.existsSync(${JSON.stringify(countFile)}) ? Number(fs.readFileSync(${JSON.stringify(countFile)}, "utf8")) : 0) + 1`,
+    `fs.writeFileSync(${JSON.stringify(countFile)}, String(n))`,
+    `fs.appendFileSync(${JSON.stringify(logPath)}, "build\\n")`,
+    `if (n === 1) {`,
+    `fs.writeFileSync(${JSON.stringify(join(appRoot, "marker.txt"))}, "my edit, typed during the build\\n")`,
+    `fs.writeFileSync(${JSON.stringify(join(appRoot, "notes.txt"))}, "an untracked file I was writing\\n")`,
+    `console.error("boom"); process.exit(1)`,
+    `}`,
+  ].join("; ");
+  return [process.execPath, "-e", script];
+}
+
+test("an edit made during install/build survives the rollback, in a named stash, and the message says so", async () => {
+  // Audit AH-39: the tree was proven clean BEFORE the pull; install + build then ran for a
+  // while, and a `git reset --hard` erased whatever was typed into the checkout meanwhile.
+  const remote = await remoteRepo();
+  const local = await cloneRepo(remote);
+  const preUpdateCommit = (await $`git -C ${local} rev-parse HEAD`.text()).trim();
+  await advanceRemote(remote, "0.2.0");
+
+  const scratch = scratchDir("ue-scratch-");
+  const log = join(scratch, "steps.log");
+  const buildCount = join(scratch, "build.count");
+  const updater = updaterFor(
+    local,
+    loggingCmd(log, "install"),
+    editingThenFailingBuildCmd(log, local, buildCount),
+  );
+
+  let message = "";
+  try {
+    await updater.applyUpdate();
+  } catch (e) {
+    message = e instanceof Error ? e.message : String(e);
+  }
+  expect(message).toContain("boom; rolled back to the previous version");
+  expect(message).toContain("2 file(s) changed during the update were saved to git stash");
+  expect(message).toContain("testsvc-update-rollback-");
+  expect(message).toContain("git stash pop brings them back");
+
+  // The rollback itself still happened: HEAD is back, the tracked file is the pre-update one,
+  // the tree is clean.
+  expect((await $`git -C ${local} rev-parse HEAD`.text()).trim()).toBe(preUpdateCommit);
+  expect(readFileSync(join(local, "marker.txt"), "utf8").trim()).toBe("v1");
+  expect((await $`git -C ${local} status --porcelain`.text()).trim()).toBe("");
+
+  // And the edit is recoverable, not gone: one stash, named, holding both files.
+  const stashes = (await $`git -C ${local} stash list`.text()).trim().split("\n").filter(Boolean);
+  expect(stashes).toHaveLength(1);
+  expect(stashes[0]).toContain("testsvc-update-rollback-");
+  const stashed = await $`git -C ${local} stash show -p --include-untracked stash@{0}`.text();
+  expect(stashed).toContain("my edit, typed during the build");
+  expect(stashed).toContain("an untracked file I was writing");
+  // File-by-file recovery works regardless of whether a `stash pop` would conflict (it does
+  // here: the stash is based on the NEW commit, whose marker.txt differs from the rolled-back
+  // one). The tracked edit is the stash commit's tree; untracked files ride on its third parent.
+  expect((await $`git -C ${local} show stash@{0}:marker.txt`.text()).trim()).toBe("my edit, typed during the build");
+  expect((await $`git -C ${local} show stash@{0}^3:notes.txt`.text()).trim()).toBe("an untracked file I was writing");
+}, 30_000);
+
+test("a rollback of a tree nobody touched creates no stash", async () => {
+  const remote = await remoteRepo();
+  const local = await cloneRepo(remote);
+  await advanceRemote(remote, "0.2.0");
+  const scratch = scratchDir("ue-scratch-");
+  const log = join(scratch, "steps.log");
+  const buildCount = join(scratch, "build.count");
+  const updater = updaterFor(local, loggingCmd(log, "install"), failsOnCallsCmd(log, "build", buildCount, [1]));
+  let message = "";
+  try {
+    await updater.applyUpdate();
+  } catch (e) {
+    message = e instanceof Error ? e.message : String(e);
+  }
+  expect(message).toBe("boom; rolled back to the previous version");
+  expect((await $`git -C ${local} stash list`.text()).trim()).toBe("");
+}, 30_000);

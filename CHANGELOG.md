@@ -156,6 +156,45 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ### Fixed
 
+- **A damaged instance registry is never silently replaced, and a delete never claims more than it
+  did** (audit AH-01/02/03, 2026-09-05). Three related holes in how the CLI and Codex instance
+  registries and the profile deletes handled failure, each reproduced against the real functions
+  before it was closed. (1) Both registries read a malformed or unreadable `cli-instances.json` /
+  `codex-instances.json` as an EMPTY store and their next write overwrote it, so one create after a
+  corrupt read came back `ok: true` with a fresh file holding only the new record - every managed
+  login identity in the old file gone, with a success message. Every read and write now goes
+  through one `core/json-store.ts`: missing, corrupt and unreadable are told apart, every mutation
+  refuses on a damaged file and leaves its bytes exactly as found, writes are temp-file + rename,
+  and mutations hold an interprocess lock, because the quick-instance daemon writes the same files
+  as the main daemon and last-writer-wins between two processes silently dropped whichever record
+  landed first. Boot logs what the disk and the registry disagree about (a login dir no record
+  claims, a record whose dir is gone) instead of leaving that to be discovered by hand. (2) The
+  process scan behind the desktop-profile delete folded "could not enumerate" into "nothing
+  running", so a transient PowerShell/CIM failure during a confirmed delete authorized removing a
+  profile a running app was still writing into - its own fail-closed catch never fired because the
+  scanner had swallowed the error first. The scan now says which of the two it is, and both the
+  Claude and Codex deletes refuse on unknown. (3) A delete whose directory removal FAILED (a
+  locked profile) dropped the registry record anyway and reported success, leaving the login on
+  disk with no row to manage it from; the record now stays and the real error comes back.
+
+- **Delete and undo of one chat can no longer interleave, twin cleanup re-checks liveness at the
+  moment it acts, and a failed self-update no longer erases edits made while it ran** (audit
+  AH-28/32/39, 2026-09-05). Three more places a decision was older than the act it authorized.
+  `delete_chat` and its `--undo` now hold one per-chat lock for the whole transaction, because an
+  undo that landed between the trash copy and the unlink loop was itself unlinked - both sides
+  reported success and the chat was gone (reproduced with the production functions). Whichever
+  arrives second now defers, refused-class exit 3, and a later undo restores everything.
+  `audit_twins --fix` decided "not live" once per pass and then waited up to 60s for a window
+  mutex and drove a 240s actuator on that stale answer; it now takes the same per-chat archive
+  lock `archive_chat` holds, asks liveness and engine host again once the window is its own,
+  defers a copy that went live meanwhile, and treats a daemon that cannot report liveness as
+  unknown (refuse) rather than as an empty room. The shared source updater (kit
+  `updater-engine.mjs`, synced) proved the tree clean BEFORE the pull and then, on a failed
+  install/build minutes later, ran `git reset --hard` - deleting anything typed into the checkout
+  meanwhile. It now re-reads the tree first: changes made during the update go into a named git
+  stash before the reset and the message says so (`git stash pop` restores them); if the tree
+  cannot be inspected or stashed, it does not reset and says the checkout needs a hand instead.
+
 - **A compacted desktop chat no longer shows up as two or three chats** (owner, Michael,
   2026-09-03: "I have a feeling compacted chats or something, become multiple entries"). He was
   right, and the mechanism is specific. The desktop app rolls a chat onto a new transcript id when

@@ -239,8 +239,38 @@ export function createUpdater({ appRoot, serviceName, appLabel, updateRepoEnvVar
     } catch (err) {
       // Unattended self-update: a failed install/build must never leave the checkout
       // half-upgraded (new code, stale deps/build). Reset back to the pre-update commit
-      // (safe: the tree was clean and the pull was ff-only), then best-effort reinstall +
-      // rebuild the previous version so the running daemon stays consistent.
+      // (the pull was ff-only), then best-effort reinstall + rebuild the previous version so
+      // the running daemon stays consistent.
+      //
+      // BUT THE TREE WAS ONLY PROVEN CLEAN BEFORE THE PULL. Install + build run for minutes,
+      // and a developer editing the checkout meanwhile (this is a source install - the same
+      // tree they work in) has changes the clean check never saw. `git reset --hard` erases
+      // them without a trace. So the tree is re-read here: anything that changed since is
+      // moved into a named git stash BEFORE the reset, and the message says so. If the tree
+      // cannot be inspected, or the stash fails, the reset does NOT run - a half-updated
+      // checkout is recoverable by hand; a deleted edit is not.
+      const msg = err instanceof Error ? err.message : String(err);
+      const statusArgs = ["git", "status", "--porcelain"];
+      const statusNow = await runCommand(statusArgs, CHECK_TIMEOUT_MS);
+      output.push(commandSummary(statusArgs, statusNow));
+      if (!statusNow.ok) {
+        throw new Error(
+          `${msg}; the checkout could not be inspected afterwards (git status failed), so it was NOT rolled back: it is at the new commit with a failed install/build; inspect it by hand`,
+        );
+      }
+      const changedDuring = statusNow.stdout.split(/\r?\n/).filter(Boolean);
+      let stashName = null;
+      if (changedDuring.length) {
+        stashName = `${serviceName}-update-rollback-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+        const stashArgs = ["git", "stash", "push", "--include-untracked", "-m", stashName];
+        const stash = await runCommand(stashArgs, APPLY_TIMEOUT_MS);
+        output.push(commandSummary(stashArgs, stash));
+        if (!stash.ok) {
+          throw new Error(
+            `${msg}; ${changedDuring.length} file(s) changed in the checkout during the update and could not be stashed, so it was NOT rolled back (a reset would have deleted them): it is at the new commit with a failed install/build; recover by hand - changed: ${changedDuring.join(", ")}`,
+          );
+        }
+      }
       const resetArgs = ["git", "reset", "--hard", before.currentCommit];
       const reset = await runCommand(resetArgs, APPLY_TIMEOUT_MS);
       output.push(commandSummary(resetArgs, reset));
@@ -256,13 +286,18 @@ export function createUpdater({ appRoot, serviceName, appLabel, updateRepoEnvVar
           }
         }
       }
-      const msg = err instanceof Error ? err.message : String(err);
+      // The stash was taken against the NEW commit, so popping it onto the rolled-back tree can
+      // conflict where the update also touched the same file; the edit is intact either way and
+      // `git stash show -p` / `git checkout stash@{0} -- <file>` recover it file by file.
+      const preserved = stashName
+        ? `; ${changedDuring.length} file(s) changed during the update were saved to git stash "${stashName}" (git stash pop brings them back; resolve any conflict against the rolled-back files)`
+        : "";
       throw new Error(
-        reset.ok
+        (reset.ok
           ? restored
             ? `${msg}; rolled back to the previous version`
             : `${msg}; code was rolled back, but reinstalling/rebuilding it failed; the previous version may not run until this is fixed`
-          : `${msg}; rollback failed; the checkout may be partially updated`,
+          : `${msg}; rollback failed; the checkout may be partially updated`) + preserved,
       );
     }
 

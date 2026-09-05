@@ -32,21 +32,31 @@ Exit:  0 no twins (or all settled) - 2 twins found and not fixed - 1 daemon fail
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 from lib import armlib, clilib
 from lib import hydralib
+from lib import ledgerlib
 from lib import stamplib
 
+# The per-chat archive lock archive_chat.py holds for its whole act, and its stale window. Twin
+# cleanup archives a copy of the SAME chat by a side path, so it takes the SAME lock: two
+# lanes never drive Archive on one conversation at once (audit AH-32).
+ARCHIVE_LOCK_STALE_SECS = 300
 
-def _live_session_ids() -> set[str]:
+
+def _live_session_ids() -> set[str] | None:
+    """The daemon's live session ids, or None when the daemon could not be asked. None is
+    NOT an empty set: "nobody is live" and "I could not look" must never read alike to a lane
+    that archives on the strength of the answer (audit AH-02/AH-32)."""
     try:
         return {s.get("sessionId")
                 for s in hydralib.api_get("/api/sessions/live").get("sessions", [])}
     except hydralib.DaemonError:
-        return set()
+        return None
 
 
 def _visible_records_by_cli(fleet: dict) -> dict[str, list[dict]]:
@@ -110,12 +120,16 @@ def _pick_keeper(cli: str, copies: list[dict], home: str | None) -> dict | None:
     return next((c for c in copies if c["stem"] == canonical_name), None)
 
 
-def _build_twin(cli: str, copies: list[dict], keep: dict | None, live_ids: set[str]) -> dict:
+def _build_twin(cli: str, copies: list[dict], keep: dict | None,
+                live_ids: set[str] | None) -> dict:
     return {
         "cliSessionId": cli, "title": copies[0]["title"],
         "copies": copies, "keep": keep,
         "stale": [c for c in copies if keep and c["path"] != keep["path"]],
-        "live": cli in live_ids,
+        # An unreadable live registry makes every conversation LIVE for this pass: the guard
+        # then refuses (it cannot trace an engine it cannot see), which is the safe side.
+        "live": True if live_ids is None else cli in live_ids,
+        "liveUnknown": live_ids is None,
         "why": ("" if keep else
                 "cannot tell which copy is real - neither the daemon's instance nor the "
                 "canonical filename picks one; settle it by hand"),
@@ -227,11 +241,29 @@ def fix(twins: list[dict]) -> list[dict]:
             # forever and every account migration leaves a permanent twin - precisely the
             # state this script exists to clear. An engine traced to another instance's app
             # cannot be the one this copy is holding. An untraceable engine stays refused.
+            if t.get("liveUnknown"):
+                done.append({**t, "outcome": "REFUSED - the daemon's live registry could not be "
+                                             "read; liveness unknown, never touched",
+                             "staleCopy": stale["path"]})
+                continue
             refusal = _live_copy_refusal(t["live"], host, stale["instance"])
             if refusal:
                 done.append({**t, "outcome": "REFUSED - " + refusal, "staleCopy": stale["path"]})
                 continue
-            said = _archive_copy(stale["instance"], stale["path"], t["title"])
+            # THE DECISION ABOVE IS A SNAPSHOT (audit AH-32): a new engine can start on this
+            # copy between it and the archive that follows - and the archive waits on a window
+            # mutex for up to 60s and drives an actuator for up to 240s. So: the same per-chat
+            # lock archive_chat holds (a concurrent archive of this chat defers us), and the
+            # liveness question asked AGAIN once the window is ours, immediately before the act.
+            recheck = _recheck_for(t["cliSessionId"], stale["instance"])
+            with ledgerlib.try_locked(f"archive-{t['cliSessionId']}",
+                                      stale_secs=ARCHIVE_LOCK_STALE_SECS) as ours:
+                if not ours:
+                    done.append({**t, "outcome": "DEFERRED - an archive of this chat is already "
+                                                 "in progress (its archive lock is held); next pass",
+                                 "staleCopy": stale["path"]})
+                    continue
+                said = _archive_copy(stale["instance"], stale["path"], t["title"], recheck=recheck)
             done.append({**t, "outcome": said, "staleCopy": stale["path"]})
     return done
 
@@ -246,6 +278,22 @@ def _live_copy_refusal(live: bool, host_dir: str | None, instance: str) -> str:
     if inst_dir and Path(inst_dir).resolve() == Path(host_dir).resolve():
         return f"live chat - its engine runs under {instance}, never touched"
     return ""
+
+
+def _recheck_for(cli: str, instance: str):
+    """A closure that re-asks, from scratch, whether this copy may be archived RIGHT NOW: a
+    fresh live-registry read and a fresh engine trace. Returns the refusal, or '' to proceed.
+    Called after the window mutex is acquired and before the actuator (or the disk flag) runs,
+    so the decision the act rests on is seconds old, not a lock-wait old."""
+    def recheck() -> str:
+        live_ids = _live_session_ids()
+        if live_ids is None:
+            return "the daemon's live registry could not be read at act time; liveness unknown"
+        if cli not in live_ids:
+            return ""
+        host = _engine_host_dirs({cli}).get(cli)
+        return _live_copy_refusal(True, host, instance)
+    return recheck
 
 
 def _engine_host_dirs(cli_ids: set[str]) -> dict[str, str]:
@@ -339,9 +387,11 @@ def _app_running(instance: str) -> tuple[bool, str]:
     return False, ""
 
 
-def _drive_archive(inst_dir: str, title: str) -> tuple[int, str]:
+def _drive_archive(inst_dir: str, title: str, recheck=None) -> tuple[int, str]:
     """The app's OWN archive control on the row titled `title` in that window. Exits: 0 done -
-    1 error/ambiguity - 2 invoked but the row stayed - 3 not rendered."""
+    1 error/ambiguity - 2 invoked but the row stayed - 3 not rendered - 7 window busy -
+    8 deferred: `recheck()` (asked once the window was OURS, so after any wait) said the copy
+    may no longer be touched."""
     import subprocess
 
     from lib import windowlib
@@ -349,6 +399,9 @@ def _drive_archive(inst_dir: str, title: str) -> tuple[int, str]:
     with windowlib.instance_lock(inst_dir, wait_secs=60) as mine:
         if not mine:
             return 7, "window busy - another lane is driving it; next pass"
+        why = recheck() if recheck else ""
+        if why:
+            return 8, why
         r = clilib.run_text(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_ACTUATOR),
              "-Instance", inst_dir, "-Action", "Archive", "-Title", str(title)],
@@ -357,37 +410,59 @@ def _drive_archive(inst_dir: str, title: str) -> tuple[int, str]:
 
 
 def _flag_archived(path: str) -> str | None:
+    """Flip isArchived on one meta record on disk. Read, change, write to a temp file named for
+    THIS writer, replace, read back. The temp name carries the pid (audit AH-32): a fixed
+    `.json.tmp` let two writers interleave bytes into one scratch file - the same defect
+    stamplib closed on 2026-09-01. The read-back is what earns the word "archived"."""
     p = Path(path)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
     try:
         meta = json.loads(p.read_text(encoding="utf-8"))
         meta["isArchived"] = True
-        tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(meta), encoding="utf-8")
-        tmp.replace(p)
+        os.replace(tmp, p)
+        if not json.loads(p.read_text(encoding="utf-8")).get("isArchived"):
+            return "the flag did not stick (another writer replaced the record)"
         return None
     except (OSError, ValueError) as err:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         return str(err)
 
 
-def _archive_copy(instance: str, path: str, title: str) -> str:
+def _archive_copy(instance: str, path: str, title: str, recheck=None) -> str:
     """Archive one stale copy the way the OWNER will actually see it go (2026-09-01, owner:
     "there's still duplicate chats"): a RUNNING app holds its chat list in memory and never
     re-reads the file, so flipping isArchived on disk - all this did until tonight - left the
     row on his screen until a restart he never does. Through the app's own control the row
     disappears now and the app writes the flag itself. A closed app gets the flag (it reads
     it on start). A row the app has not rendered cannot be reached by any control: the flag
-    is set and the ghost sweep (find_ghosts) catches it the moment it renders."""
+    is set and the ghost sweep (find_ghosts) catches it the moment it renders.
+
+    `recheck` (see _recheck_for) is asked immediately before EITHER act - inside the window
+    mutex for the app's control, right before the write for the disk flag - and a non-empty
+    answer defers the copy untouched."""
     running, inst_dir = _app_running(instance)
     if running and inst_dir:
-        code, said = _drive_archive(inst_dir, title)
+        code, said = _drive_archive(inst_dir, title, recheck=recheck)
         if code == 0:
             return f"archived the stale copy in {instance} through the app's own control"
+        if code == 8:
+            return f"DEFERRED - {said}"
         if code == 3:
+            why = recheck() if recheck else ""
+            if why:
+                return f"DEFERRED - {why}"
             err = _flag_archived(path)
             return (f"archived the stale copy in {instance} on disk (its row is not rendered right "
                     "now; the ghost sweep clears it through the app the moment it shows)"
                     if not err else f"could NOT flag the copy in {instance}: {err}")
         return f"the app's control REFUSED the stale copy in {instance}: {said[:160]}"
+    why = recheck() if recheck else ""
+    if why:
+        return f"DEFERRED - {why}"
     err = _flag_archived(path)
     return (f"archived the stale copy in {instance} (app closed: disk flag)" if not err
             else f"could NOT archive the copy in {instance}: {err}")

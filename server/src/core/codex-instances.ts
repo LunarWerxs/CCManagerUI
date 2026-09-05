@@ -1,20 +1,29 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { CODEX_HOME, CONFIG_DIR, resolveCodexExe } from '../config'
 import type { CodexInstance } from '../types'
 import { localCodexAccount } from './codex-account'
 import {
   type CodexDesktopRuntime,
+  codexDesktopRunState,
   codexDesktopUserDataDir,
   codexPathKey,
   defaultCodexDesktopUserDataDir,
   focusCodexDesktop,
-  isCodexDesktopRunning,
   listCodexDesktopProcesses,
   openCodexDesktop,
   quitCodexDesktop,
+  type ScanDesktopProcesses,
+  scanCodexDesktopProcesses,
 } from './codex-desktop'
 import { instanceNumbers, instanceRef } from './instance-numbers'
+import {
+  describeStoreRefusal,
+  type JsonStoreMutation,
+  type JsonStoreSpec,
+  mutateJsonStore,
+  readJsonStore,
+} from './json-store'
 import { CODEX_LAUNCH_EFFORTS, type LaunchOptionsInput, launchOptionError } from './launch-options'
 import { isPathInside, normalizePath } from './paths'
 import type { CMActionResult } from './shared'
@@ -41,19 +50,90 @@ interface Store {
   instances: StoredCodexInstance[]
 }
 
-function readStore(): Store {
-  try {
-    const parsed = JSON.parse(readFileSync(STORE_PATH, 'utf8'))
-    if (parsed && Array.isArray(parsed.instances)) return { instances: parsed.instances }
-  } catch {
-    // Missing/corrupt state behaves like an empty registry.
-  }
-  return { instances: [] }
+// Persistence goes through core/json-store.ts, exactly as cli-instances.ts's does: a corrupt or
+// unreadable registry is never mistaken for an empty one, writes are atomic, and mutations hold
+// the interprocess lock shared with the quick-instance daemon. See that file for the why.
+
+const STORE_WHAT = 'Codex instance registry'
+
+const STORE_SPEC: JsonStoreSpec<Store> = {
+  path: STORE_PATH,
+  decode: (parsed) => {
+    if (!parsed || typeof parsed !== 'object') return null
+    const instances = (parsed as { instances?: unknown }).instances
+    if (!Array.isArray(instances)) return null
+    return { instances: instances as StoredCodexInstance[] }
+  },
+  empty: () => ({ instances: [] }),
 }
 
-function writeStore(store: Store): void {
-  mkdirSync(CONFIG_DIR, { recursive: true })
-  writeFileSync(STORE_PATH, JSON.stringify(store, null, 2))
+let reportedStoreFailure: string | null = null
+
+/** READERS: the store, or empty when missing. A damaged file also reads as empty - logged once,
+ *  never written back; every mutator refuses on the same condition. */
+function readStore(): Store {
+  const read = readJsonStore(STORE_SPEC)
+  if (read.status === 'ok') {
+    reportedStoreFailure = null
+    return read.value
+  }
+  if (read.status === 'missing') return STORE_SPEC.empty()
+  const key = `${read.status}:${read.reason}`
+  if (reportedStoreFailure !== key) {
+    reportedStoreFailure = key
+    console.error(
+      `[codex-instances] ${STORE_PATH} is ${read.status} (${read.reason}). Listing no stored Codex instances and refusing every change until it is repaired; the file has NOT been modified.`,
+    )
+  }
+  return STORE_SPEC.empty()
+}
+
+function mutate<R>(fn: (store: Store) => { result: R; changed: boolean }): JsonStoreMutation<R> {
+  return mutateJsonStore(STORE_SPEC, fn)
+}
+
+function refusal(
+  action: string,
+  dir: string | null,
+  data: Record<string, unknown>,
+  failure: { status: 'corrupt' | 'unreadable' | 'locked' | 'write-failed'; reason: string },
+): CMActionResult {
+  return {
+    ok: false,
+    action,
+    dir,
+    message: describeStoreRefusal(STORE_WHAT, STORE_PATH, failure),
+    data: { ...data, registry: failure.status, reason: failure.reason },
+  }
+}
+
+/** The on-disk layout versus the registry; the Codex twin of reconcileCliInstanceDirs. */
+export interface CodexInstanceReconciliation {
+  registry: 'ok' | 'missing' | 'corrupt' | 'unreadable'
+  orphanDirs: string[]
+  missingDirs: Array<{ id: string; name: string; codexHome: string }>
+}
+
+/** READ-ONLY report of CODEX_HOMEs no record claims and records whose home is gone. */
+export function reconcileCodexInstanceDirs(): CodexInstanceReconciliation {
+  const read = readJsonStore(STORE_SPEC)
+  const records = read.status === 'ok' ? read.value.instances : []
+  const claimed = new Set(records.map((rec) => basename(rec.codexHome)))
+  let orphanDirs: string[] = []
+  try {
+    if (existsSync(CODEX_INSTANCES_ROOT)) {
+      orphanDirs = readdirSync(CODEX_INSTANCES_ROOT, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !claimed.has(entry.name))
+        .map((entry) => join(CODEX_INSTANCES_ROOT, entry.name))
+        .sort()
+    }
+  } catch {
+    // An unreadable root reports no orphans; the registry status says whether to trust it.
+  }
+  const missingDirs = records
+    .map((rec) => ({ id: rec.id, name: rec.name, codexHome: rec.codexHome }))
+    .filter((rec) => !existsSync(rec.codexHome))
+  return { registry: read.status, orphanDirs, missingDirs }
 }
 
 export function isCodexLoggedIn(codexHome: string): boolean {
@@ -262,9 +342,19 @@ export function createCodexInstance(name: string): CMActionResult {
     codexHome,
     createdAt: Date.now(),
   }
-  const store = readStore()
-  store.instances.push(instance)
-  writeStore(store)
+  const outcome = mutate((store) => {
+    store.instances.push(instance)
+    return { result: null, changed: true }
+  })
+  if (!outcome.ok) {
+    // The record never landed; take the freshly minted home back rather than leave an orphan.
+    try {
+      rmSync(codexHome, { recursive: true, force: true })
+    } catch {
+      // Best effort; reconcileCodexInstanceDirs reports it if it survives.
+    }
+    return refusal('codex-create', null, { name }, outcome)
+  }
   return {
     ok: true,
     action: 'codex-create',
@@ -284,9 +374,14 @@ export function renameCodexInstance(id: string, name: string): CMActionResult {
       message: reason,
       data: { id },
     }
-  const store = readStore()
-  const instance = store.instances.find((candidate) => candidate.id === id)
-  if (!instance)
+  const outcome = mutate((store) => {
+    const instance = store.instances.find((candidate) => candidate.id === id)
+    if (!instance) return { result: null, changed: false }
+    instance.name = name.trim()
+    return { result: instance.codexHome, changed: true }
+  })
+  if (!outcome.ok) return refusal('codex-rename', null, { id }, outcome)
+  if (outcome.result === null)
     return {
       ok: false,
       action: 'codex-rename',
@@ -294,25 +389,38 @@ export function renameCodexInstance(id: string, name: string): CMActionResult {
       message: 'Codex instance not found.',
       data: { id },
     }
-  instance.name = name.trim()
-  writeStore(store)
   return {
     ok: true,
     action: 'codex-rename',
-    dir: instance.codexHome,
+    dir: outcome.result,
     message: 'Renamed.',
     data: { id },
   }
 }
 
+export interface DeleteCodexInstanceOptions {
+  /** Legacy/test injection: a plain runtime list, treated as a SUCCESSFUL scan. */
+  listDesktopProcesses?: () => Promise<CodexDesktopRuntime[]>
+  /** Injected scan that can also say "could not enumerate"; wins over listDesktopProcesses. */
+  scanDesktopProcesses?: ScanDesktopProcesses
+  /** Injected recursive remove, for tests that need the filesystem step to fail on every OS. */
+  removeDir?: (dir: string) => void
+}
+
+/**
+ * Guarded delete. Refuses when the name does not confirm, when the desktop is running, and - since
+ * audit AH-02 - when the OS could not say whether it is running: a failed process scan used to read
+ * as "not running" and wave the delete through. Since AH-03 the record is also kept whenever the
+ * CODEX_HOME survives the remove, instead of being dropped with a success message over a login
+ * that is still on disk.
+ */
 export async function deleteCodexInstance(
   id: string,
   confirmName?: string,
-  options: { listDesktopProcesses?: () => Promise<CodexDesktopRuntime[]> } = {},
+  options: DeleteCodexInstanceOptions = {},
 ): Promise<CMActionResult> {
-  const store = readStore()
-  const index = store.instances.findIndex((candidate) => candidate.id === id)
-  if (index < 0)
+  const instance = readStore().instances.find((candidate) => candidate.id === id)
+  if (!instance)
     return {
       ok: false,
       action: 'codex-delete',
@@ -320,7 +428,6 @@ export async function deleteCodexInstance(
       message: 'Codex instance not found.',
       data: { id },
     }
-  const instance = store.instances[index]!
   if (!confirmName || confirmName !== instance.name)
     return {
       ok: false,
@@ -330,27 +437,64 @@ export async function deleteCodexInstance(
       data: { id },
     }
 
-  if (
-    await isCodexDesktopRunning(instance, options.listDesktopProcesses ?? listCodexDesktopProcesses)
-  ) {
+  const legacyList = options.listDesktopProcesses
+  const scan: ScanDesktopProcesses =
+    options.scanDesktopProcesses ??
+    (legacyList
+      ? async () => ({ ok: true, runtimes: await legacyList() })
+      : scanCodexDesktopProcesses)
+  const runState = await codexDesktopRunState(instance, scan)
+  if (runState.state === 'unknown') {
+    return {
+      ok: false,
+      action: 'codex-delete',
+      dir: instance.codexHome,
+      message: `Could not verify whether this Codex Desktop instance is running (${runState.reason}). Refusing to delete: an unknown state is not a stopped instance. Retry once process enumeration works.`,
+      data: { id, runningState: 'unknown', reason: runState.reason },
+    }
+  }
+  if (runState.state === 'running') {
     return {
       ok: false,
       action: 'codex-delete',
       dir: instance.codexHome,
       message: 'Quit this Codex Desktop instance before deleting it.',
-      data: { id },
+      data: { id, runningState: 'running', pid: runState.runtime.pid },
     }
   }
 
   if (isPathInside(CODEX_INSTANCES_ROOT, instance.codexHome)) {
+    const removeDir =
+      options.removeDir ?? ((dir: string) => rmSync(dir, { recursive: true, force: true }))
     try {
-      rmSync(instance.codexHome, { recursive: true, force: true })
-    } catch {
-      // Best effort: remove the registry entry so a locked directory cannot wedge the UI.
+      removeDir(instance.codexHome)
+    } catch (error) {
+      return {
+        ok: false,
+        action: 'codex-delete',
+        dir: instance.codexHome,
+        message: `Could not delete '${instance.codexHome}': ${error instanceof Error ? error.message : String(error)}. The instance record was kept so it can be retried; its login data is still on disk.`,
+        data: { id, partial: true },
+      }
+    }
+    if (existsSync(instance.codexHome)) {
+      return {
+        ok: false,
+        action: 'codex-delete',
+        dir: instance.codexHome,
+        message: `'${instance.codexHome}' still exists after the delete (something is holding it open). The instance record was kept so it can be retried; its login data is still on disk.`,
+        data: { id, partial: true },
+      }
     }
   }
-  store.instances.splice(index, 1)
-  writeStore(store)
+  const outcome = mutate((store) => {
+    const index = store.instances.findIndex((candidate) => candidate.id === id)
+    if (index < 0) return { result: false, changed: false }
+    store.instances.splice(index, 1)
+    return { result: true, changed: true }
+  })
+  if (!outcome.ok)
+    return refusal('codex-delete', instance.codexHome, { id, dirRemoved: true }, outcome)
   return {
     ok: true,
     action: 'codex-delete',

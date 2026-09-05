@@ -19,7 +19,7 @@ import { linkCliInstanceToDesktop, listCliInstances } from './cli-instances'
 import { deleteInstanceMeta } from './instance-meta'
 import { openInstance } from './instances'
 import { defaultClaudeDir, instancesRoot, isPathInside, normalizePath } from './paths'
-import { listClaudeProcesses } from './process'
+import { type ClaudeProcessScan, scanClaudeProcesses } from './process'
 import type { CMActionResult } from './shared'
 
 // ----------------------------------------------------------------------------
@@ -252,6 +252,8 @@ export async function createInstance(
 export interface RemoveInstanceOptions {
   /** Must equal the folder leaf name of `dir`, or the call is refused. */
   confirmName?: string
+  /** Injected process scan (tests). Defaults to the real fresh {@link scanClaudeProcesses}. */
+  scanProcesses?: (options: { fresh: true }) => Promise<ClaudeProcessScan>
 }
 
 /**
@@ -319,19 +321,35 @@ export async function removeInstance(
     }
   }
 
-  // --- Guard 3: must not be currently running. ---
+  // --- Guard 3: must not be currently running, AND WE MUST ACTUALLY KNOW THAT. ---
+  //
+  // Audit AH-02: this guard used to read `listClaudeProcesses`, whose contract folds "could not
+  // enumerate" into an empty list. The catch below looked like fail-closed but never fired,
+  // because the scanner swallowed its own failure first - a transient PowerShell/CIM error during
+  // a confirmed delete authorized removing a profile a desktop app was still writing into
+  // (reproduced with an injected spawn failure against a synthetic profile). `scanClaudeProcesses`
+  // keeps the two states apart, and UNKNOWN refuses.
   try {
     // fresh: this guard is the only thing standing between "delete the profile tree" and a live
     // instance writing into it. It must never clear on a cached snapshot.
-    const procs = await listClaudeProcesses({ fresh: true })
-    const running = procs.find((p) => p.dir && normalizePath(p.dir) === normDir)
+    const scan = await (options.scanProcesses ?? scanClaudeProcesses)({ fresh: true })
+    if (!scan.ok) {
+      return {
+        ok: false,
+        action: 'remove',
+        dir: normDir,
+        message: `Could not verify whether '${normDir}' is running (${scan.reason}). Refusing to delete: an unknown state is not a stopped instance. Retry once process enumeration works.`,
+        data: { runningState: 'unknown', reason: scan.reason },
+      }
+    }
+    const running = scan.processes.find((p) => p.dir && normalizePath(p.dir) === normDir)
     if (running) {
       return {
         ok: false,
         action: 'remove',
         dir: normDir,
         message: `Refusing to delete '${normDir}': instance is currently running (PID ${running.pid}). Quit it first.`,
-        data: {},
+        data: { runningState: 'running', pid: running.pid },
       }
     }
   } catch (err) {
@@ -342,7 +360,7 @@ export async function removeInstance(
       action: 'remove',
       dir: normDir,
       message: `Could not verify running state for '${normDir}' (${message}). Refusing delete to be safe.`,
-      data: {},
+      data: { runningState: 'unknown', reason: message },
     }
   }
 

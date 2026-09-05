@@ -18,7 +18,7 @@ from stubdaemon import StubDaemon, dossier_query  # noqa: E402
 from util import run_cli  # noqa: E402
 
 import delete_chat  # noqa: E402
-from lib import holdlib, hydralib, mutationlib  # noqa: E402
+from lib import holdlib, hydralib, ledgerlib, mutationlib  # noqa: E402
 
 SID = "aaaa1111-2222-3333-4444-555566667777"
 OTHER = "bbbb1111-2222-3333-4444-555566667777"
@@ -339,6 +339,60 @@ class DeleteChatTest(unittest.TestCase):
         self.assertEqual(kinds, ["delete", "undelete"])
         self.assertEqual(mutationlib.INVERSE_KIND["delete"], "undelete")
         self.assertEqual(mutationlib.INVERSE_KIND["undelete"], "delete")
+
+    # --- audit AH-28: delete and undo of ONE chat never interleave ------------------------------
+    #
+    # Reproduced 2026-09-05 with the production copy_to_trash / undo / unlink functions: delete
+    # paused right after its trash copy, undo restored the manifest, delete resumed and unlinked
+    # the just-restored transcript. deleteOk true, undoOk true, transcript gone. The per-chat
+    # lock makes whichever arrives second DEFER instead.
+
+    def test_an_undo_arriving_mid_delete_is_deferred_and_the_delete_still_completes(self):
+        real_copy = delete_chat.copy_to_trash
+        mid = {}
+
+        def copy_then_undo(*a, **kw):
+            manifest = real_copy(*a, **kw)
+            # The operator's undo, landing exactly where the audit paused the delete: after the
+            # trash copy exists and before a single source file has been unlinked.
+            mid["undo"] = delete_chat.undo(SID)
+            mid["transcript_still_there"] = self.transcript.exists()
+            return manifest
+
+        with mock.patch.object(delete_chat, "copy_to_trash", side_effect=copy_then_undo):
+            res = delete_chat.delete(SID)
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(mid["undo"]["ok"])
+        self.assertEqual(mid["undo"]["code"], 3)
+        self.assertTrue(mid["undo"].get("deferred"))
+        self.assertIn("still running", mid["undo"]["why"])
+        self.assertTrue(mid["transcript_still_there"])  # the deferred undo copied nothing
+        self.assertFalse(self.transcript.exists())
+        self.assertFalse(self.meta.exists())
+        # Once the delete has released the lock, a standalone undo restores every file.
+        later = delete_chat.undo(SID)
+        self.assertTrue(later["ok"], later)
+        self.assertTrue(self.transcript.exists())
+        self.assertTrue(self.meta.exists())
+        # No lock file is left behind by either side.
+        self.assertFalse(list((self.root / "state").glob(".lock-delete-*")))
+
+    def test_a_second_delete_of_the_same_chat_is_deferred_while_the_first_runs(self):
+        with ledgerlib.try_locked(f"delete-{SID}", stale_secs=900) as ours:
+            self.assertTrue(ours)
+            res = delete_chat.delete(SID)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["code"], 3)
+        self.assertTrue(res.get("deferred"))
+        # Nothing moved: no trash copy, no manifest, both source files intact.
+        self.assertTrue(self.meta.exists())
+        self.assertTrue(self.transcript.exists())
+        self.assertFalse(delete_chat.trash_dir(SID).exists())
+        # And the CLI reports it as a refusal (exit 3), the same class as a hold.
+        with ledgerlib.try_locked(f"delete-{SID}", stale_secs=900):
+            code, out, _ = run_cli(delete_chat.main, [SID, "--json"])
+        self.assertEqual(code, 3)
+        self.assertTrue(json.loads(out).get("deferred"))
 
     def test_bad_usage_is_exit_3(self):
         for argv in ([], ["--undo"], [SID, OTHER]):

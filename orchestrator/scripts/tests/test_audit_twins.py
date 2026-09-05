@@ -267,7 +267,7 @@ class LiveCopyGuardTest(unittest.TestCase):
         self.archived = []
         self._arch = mock.patch.object(
             audit_twins, "_archive_copy",
-            side_effect=lambda instance, path, title: self.archived.append(instance) or "archived")
+            side_effect=lambda instance, path, title, **kw: self.archived.append(instance) or "archived")
         self._arch.start()
 
     def tearDown(self):
@@ -316,6 +316,77 @@ class LiveCopyGuardTest(unittest.TestCase):
             done = audit_twins.fix([twin])
         self.assertEqual(self.archived, ["source"])
         self.assertEqual(done[0]["outcome"], "archived")
+
+    # --- audit AH-32: the liveness decision must not be older than the act ----------------
+
+    def test_a_live_registry_that_cannot_be_read_refuses_every_copy(self):
+        twin = {**self._twin(), "live": True, "liveUnknown": True}
+        with mock.patch.object(audit_twins, "_claude_process_tree", return_value={}):
+            done = audit_twins.fix([twin])
+        self.assertEqual(self.archived, [])
+        self.assertIn("liveness unknown", done[0]["outcome"])
+
+    def test_find_twins_marks_liveness_unknown_when_the_daemon_cannot_say(self):
+        self.stub.routes["/api/sessions/live"] = lambda m, p, q, b: (503, {"error": "not now"})
+        twin = audit_twins._build_twin("x", [{"title": "t", "path": "a", "stem": "s", "instance": "i"},
+                                             {"title": "t", "path": "b", "stem": "s2", "instance": "j"}],
+                                       None, audit_twins._live_session_ids())
+        self.assertTrue(twin["liveUnknown"])
+        self.assertTrue(twin["live"])
+
+    def test_an_archive_already_in_progress_for_the_chat_defers_the_twin_fix(self):
+        from lib import ledgerlib
+
+        twin = {**self._twin(), "live": False}
+        with ledgerlib.try_locked(f"archive-{self.CLI}", stale_secs=300) as ours:
+            self.assertTrue(ours)
+            done = audit_twins.fix([twin])
+        self.assertEqual(self.archived, [])
+        self.assertTrue(done[0]["outcome"].startswith("DEFERRED"))
+        self.assertIn("archive lock", done[0]["outcome"])
+        # The lock is released again once fix() is done with the copy (no leftover .lock).
+        done_after = audit_twins.fix([twin])
+        self.assertEqual(self.archived, ["source"])
+        self.assertEqual(done_after[0]["outcome"], "archived")
+
+    def test_a_copy_that_goes_live_between_plan_and_act_is_deferred_untouched(self):
+        # The plan saw a DEAD conversation. By the time the window mutex is ours, an engine is
+        # running under the STALE copy's own app. The actuator must not fire and no flag may
+        # be written; the outcome says so.
+        self._arch.stop()  # drive the real _archive_copy / _drive_archive this once
+        self.addCleanup(self._arch.start)
+        twin = {**self._twin(), "live": False}
+        stale_meta = Path(self.source_dir) / "a.json"
+        stale_meta.parent.mkdir(parents=True, exist_ok=True)
+        stale_meta.write_text(json.dumps({"cliSessionId": self.CLI, "title": "Moved chat",
+                                          "isArchived": False}), encoding="utf-8")
+        import contextlib
+
+        @contextlib.contextmanager
+        def window_is_ours(_inst_dir, wait_secs=60):
+            yield True
+
+        actuator_runs = []
+        with mock.patch("lib.windowlib.instance_lock", side_effect=window_is_ours), \
+             mock.patch.object(audit_twins, "_claude_process_tree",
+                               return_value=self._tree_hosted_by(self.source_dir)), \
+             mock.patch.object(audit_twins.clilib, "run_text",
+                               side_effect=lambda *a, **k: actuator_runs.append(a)):
+            done = audit_twins.fix([twin])
+        self.assertEqual(actuator_runs, [])
+        self.assertTrue(done[0]["outcome"].startswith("DEFERRED"), done[0]["outcome"])
+        self.assertIn("its engine runs under source", done[0]["outcome"])
+        self.assertFalse(json.loads(stale_meta.read_text(encoding="utf-8"))["isArchived"])
+
+    def test_the_disk_flag_uses_a_writer_owned_temp_name_and_verifies_the_result(self):
+        meta = self.root / "m.json"
+        meta.write_text(json.dumps({"cliSessionId": "z", "isArchived": False}), encoding="utf-8")
+        self.assertIsNone(audit_twins._flag_archived(str(meta)))
+        self.assertTrue(json.loads(meta.read_text(encoding="utf-8"))["isArchived"])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.name.startswith("m.json")),
+                         ["m.json"])  # no fixed-name .json.tmp and no pid temp left behind
+        err = audit_twins._flag_archived(str(self.root / "missing.json"))
+        self.assertIsNotNone(err)
 
 
 class ProcessTreeReadingTest(unittest.TestCase):

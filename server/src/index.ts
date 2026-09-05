@@ -51,7 +51,8 @@ import {
   updateAppearance,
 } from './connections'
 import { createChatGptContextPack } from './context-pack'
-import { migrateCliInstanceConfigDirs } from './core/cli-instances'
+import { migrateCliInstanceConfigDirs, reconcileCliInstanceDirs } from './core/cli-instances'
+import { reconcileCodexInstanceDirs } from './core/codex-instances'
 import { readUiPrefs, writeUiPrefs } from './core/ui-prefs'
 import { getSetting, setSetting } from './db'
 import { buildDetachedSpawn } from './detached-spawn.mjs'
@@ -892,6 +893,29 @@ startUsageRefresh()
   const migrated = migrateCliInstanceConfigDirs()
   if (migrated.length)
     console.log(`[cli-instances] repointed ${migrated.length} config dir(s) to ${CONFIG_DIR}`)
+}
+
+// --- registry health: say out loud what the disk and the registries disagree about --------------
+// Read-only. Before writes were guarded (core/json-store.ts) a registry could be overwritten as
+// empty, leaving every login dir it described as an unexplained folder; this is how such damage
+// surfaces instead of staying invisible. Nothing is repaired here - which orphan is a lost identity
+// and which is a leftover is the owner's call - so it prints and moves on.
+for (const [label, report] of [
+  ['cli-instances', reconcileCliInstanceDirs()],
+  ['codex-instances', reconcileCodexInstanceDirs()],
+] as const) {
+  if (report.registry === 'corrupt' || report.registry === 'unreadable')
+    console.error(
+      `[${label}] registry is ${report.registry}: no changes will be accepted until it is repaired (the file has not been touched)`,
+    )
+  if (report.orphanDirs.length)
+    console.warn(
+      `[${label}] ${report.orphanDirs.length} directory(ies) under the instances root that no record claims: ${report.orphanDirs.join(', ')}`,
+    )
+  if (report.missingDirs.length)
+    console.warn(
+      `[${label}] ${report.missingDirs.length} record(s) whose directory is gone: ${report.missingDirs.map((r) => `${r.name} (${r.id})`).join(', ')}`,
+    )
 }
 
 // --- reset notifications (ON by default; see server/src/reset-watch.ts) ------------------------

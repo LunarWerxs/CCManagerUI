@@ -39,8 +39,8 @@ Usage: python delete_chat.py <chat> [--stop-idle] [--force] [--json]
                                                           # whose transcript or marker is still on
                                                           # disk - listed by default, --yes deletes
 Exit:  0 deleted and verified (or nothing to sweep) - 2 partial (something remains; the report
-       names it) - 3 refused (not found / ambiguous / held / live writer / bad usage) -
-       1 daemon failure.
+       names it) - 3 refused (not found / ambiguous / held / live writer / bad usage / another
+       delete or undo of the same chat still running) - 1 daemon failure.
 """
 
 from __future__ import annotations
@@ -60,7 +60,22 @@ TRASH = "trash"
 # The daemon caches desktop meta for ~15 s; the verify polls that long before it calls a
 # lingering record real.
 VERIFY_SECS = 25
+# ONE delete or undo per chat at a time (audit AH-28, reproduced 2026-09-05): a delete paused
+# right after its trash copy while an undo restored the manifest, then went on through its
+# unlink loop and removed the just-restored transcript - and BOTH reported success, leaving
+# deletion as the final state after an undo. The per-window UI mutex serializes one desktop
+# window, not the transcript files, the trash dir, or the undo. This lock covers the whole
+# transaction. Stale after 15 minutes: the slowest honest delete is a 60s window wait plus a
+# 240s actuator per running profile, then the verify, so a live holder is never mistaken for a
+# crashed one and its lock stolen mid-act (the archive lane learned that the hard way at 30s).
+DELETE_LOCK_STALE_SECS = 900
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _busy(session_id: str, verb: str) -> dict:
+    return {"ok": False, "code": 3, "sessionId": session_id, "deferred": True,
+            "why": f"another delete or undo of this chat is still running - {verb} deferred; "
+                   "retry once it finishes"}
 
 
 def trash_dir(session_id: str) -> Path:
@@ -202,6 +217,15 @@ def copy_to_trash(session_id: str, records: list[dict], transcripts: list[Path],
 
 
 def undo(session_id: str) -> dict:
+    """Restore from the trash manifest - under the same per-chat lock the delete holds, so a
+    restore can never land in the middle of a delete's unlink loop (audit AH-28)."""
+    with ledgerlib.try_locked(f"delete-{session_id}", stale_secs=DELETE_LOCK_STALE_SECS) as ours:
+        if not ours:
+            return _busy(session_id, "undo")
+        return _undo_locked(session_id)
+
+
+def _undo_locked(session_id: str) -> dict:
     d = trash_dir(session_id)
     try:
         manifest = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
@@ -302,6 +326,18 @@ def delete(query: str, stop_idle: bool = False, force: bool = False,
     match, sid, refusal = resolve(query)
     if refusal or not sid:
         return {"ok": False, "code": 3, "why": refusal or "no session id"}
+    # The lock is taken by session id, which is the only name a delete and an undo share, and
+    # held through the trash copy, the app's own control, the unlinks, the verify and the
+    # mutation record. A second delete or an undo arriving meanwhile is DEFERRED, never run
+    # alongside (audit AH-28 - see DELETE_LOCK_STALE_SECS).
+    with ledgerlib.try_locked(f"delete-{sid}", stale_secs=DELETE_LOCK_STALE_SECS) as ours:
+        if not ours:
+            return _busy(sid, "delete")
+        return _delete_locked(match, sid, stop_idle, force, instance_hint)
+
+
+def _delete_locked(match: dict | None, sid: str, stop_idle: bool, force: bool,
+                   instance_hint: str | None) -> dict:
     title = str((match or {}).get("title") or "")
     held = holdlib.why_blocked(sid)
     if held and not force:
