@@ -21,6 +21,13 @@ from stubdaemon import StubDaemon, dossier_query  # noqa: E402
 
 import audit_twins  # noqa: E402
 from lib import armlib  # noqa: E402
+
+# Captured BEFORE any test patches it: LiveCopyGuardTest replaces audit_twins._archive_copy in
+# setUp, and the one test there that needs the real function swaps this back in under a nested
+# patch - never by stopping the class-level patch (stop + re-start in a cleanup left the mock
+# armed for every module loaded after this one in a single-process run; found 2026-09-05 when
+# test_bands_and_groundskeeper's twin tests saw "archived" instead of the real outcome).
+_REAL_ARCHIVE_COPY = audit_twins._archive_copy
 from lib import hydralib  # noqa: E402
 
 from util import run_cli  # noqa: E402
@@ -353,8 +360,6 @@ class LiveCopyGuardTest(unittest.TestCase):
         # The plan saw a DEAD conversation. By the time the window mutex is ours, an engine is
         # running under the STALE copy's own app. The actuator must not fire and no flag may
         # be written; the outcome says so.
-        self._arch.stop()  # drive the real _archive_copy / _drive_archive this once
-        self.addCleanup(self._arch.start)
         twin = {**self._twin(), "live": False}
         stale_meta = Path(self.source_dir) / "a.json"
         stale_meta.parent.mkdir(parents=True, exist_ok=True)
@@ -367,7 +372,10 @@ class LiveCopyGuardTest(unittest.TestCase):
             yield True
 
         actuator_runs = []
-        with mock.patch("lib.windowlib.instance_lock", side_effect=window_is_ours), \
+        # The real _archive_copy / _drive_archive this once, under a NESTED patch so the
+        # class-level mock comes back on exit (see _REAL_ARCHIVE_COPY above).
+        with mock.patch.object(audit_twins, "_archive_copy", _REAL_ARCHIVE_COPY), \
+             mock.patch("lib.windowlib.instance_lock", side_effect=window_is_ours), \
              mock.patch.object(audit_twins, "_claude_process_tree",
                                return_value=self._tree_hosted_by(self.source_dir)), \
              mock.patch.object(audit_twins.clilib, "run_text",

@@ -36,8 +36,15 @@ class MutateMetaTest(unittest.TestCase):
         self._state.cleanup()
 
     def _external_write(self, **fields):
-        """The app rewriting the record from memory - not a cooperating writer, no lock."""
+        """The app rewriting the record from memory - not a cooperating writer, no lock.
+        ONE write: `_between` is invoked on every attempt, and a writer that fired again on the
+        retry would (correctly) be judged never-still - a different scenario, tested below."""
+        fired = {"done": False}
+
         def go():
+            if fired["done"]:
+                return
+            fired["done"] = True
             cur = json.loads(self.meta.read_text(encoding="utf-8"))
             cur.update(fields)
             # A different size guarantees the revision differs even inside one mtime tick.
