@@ -11,6 +11,7 @@ files on disk, and lib/armlib's own gated-script set."""
 
 import json
 import sys
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -27,7 +28,31 @@ from lib import armlib  # noqa: E402
 # actuator/ and tests/ - the same scope orch.py's own SCRIPTS.glob("*.py") already has,
 # because lib/ and actuator/ are subdirectories a non-recursive glob never sees in the first
 # place. Nothing needs excluding here beyond that.
-SCRIPT_FILES = {p.stem for p in SCRIPTS.glob("*.py")}
+def _tracked_scripts() -> set[str]:
+    """The scripts the REPOSITORY has, not the ones this checkout happens to hold.
+
+    Scanning the directory made an untracked work in progress fail the suite for everyone with a
+    copy of it, which is a false red on somebody else's unfinished file: the catalog cannot
+    describe a script the repository does not contain, and the first version of that catalog was
+    in fact derived from a dirty tree and shipped an entry for a file nobody else had. Judging
+    tracked files instead keeps the gate honest in both directions - an untracked draft is
+    ignored, and the moment it is committed its catalog entry is required. Same rule, and the
+    same reasoning, as tests/test_collection_guard.py.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "--", "*.py"],
+            cwd=str(SCRIPTS), capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        # No git here (an exported tree): fall back to the directory, the stricter reading.
+        return {p.stem for p in SCRIPTS.glob("*.py")}
+    # ls-files is recursive; the catalog covers only the top level, matching orch.py's own glob.
+    return {line.strip()[:-3] for line in out.splitlines()
+            if line.strip().endswith(".py") and "/" not in line.strip()}
+
+
+SCRIPT_FILES = _tracked_scripts()
 
 
 class CatalogCoversDiskTest(unittest.TestCase):
@@ -152,12 +177,19 @@ class MenuGeneratedFromCatalogTest(unittest.TestCase):
             self.assertEqual(rows.count(name), 1, f"{name} appears as a row {rows.count(name)} times")
 
     def test_unknown_script_dispatch_is_unaffected_by_the_catalog(self):
-        # main()'s "unknown script" check reads the real files on disk (_scripts_on_disk),
-        # not the catalog, so a script that exists but is not yet catalogued would still run -
-        # this is the regression rail for that design choice.
+        # main()'s "unknown script" check reads the real files on DISK (_scripts_on_disk), not the
+        # catalog, so a script that exists but is not yet catalogued still runs - this is the
+        # regression rail for that design choice. Deliberately a superset, not an equality: the
+        # catalog is checked against TRACKED scripts (see _tracked_scripts) so an untracked draft
+        # is nobody else's red, while dispatch must still find that draft on the machine holding
+        # it. Every tracked script is dispatchable; a working copy may hold more.
         import orch
 
-        self.assertEqual(orch._scripts_on_disk(), SCRIPT_FILES)
+        on_disk = orch._scripts_on_disk()
+        self.assertTrue(
+            SCRIPT_FILES <= on_disk,
+            f"tracked but not dispatchable: {sorted(SCRIPT_FILES - on_disk)}",
+        )
 
     def test_menu_prints_each_rows_catalog_invocation(self):
         # AH-25's own gap: the menu named the switch but never said, per row, which scripts it
