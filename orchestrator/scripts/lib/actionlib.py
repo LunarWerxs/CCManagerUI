@@ -367,16 +367,12 @@ CATALOG: dict[str, dict] = {
         "availability": "available",
         "summary": "OBSERVE ONLY: every instance, open or not, with account and usage.",
     },
-    "migrate_batch": {
-        "kind": "mutate",
-        "invocation": "direct",
-        "platforms": "any",
-        "guards": ("hold", "breaker", "live-writer", "force"),
-        "result": "0 every named chat landed, or under --dry-run every plan resolved - 2 the flags do not make sense - 4 nothing landed - 5 a PARTIAL batch (deliberately distinct from total success/failure)",
-        "availability": "available",
-        "summary": "move MANY chats between accounts in ONE run, sequentially, sharing every read.",
-        "notes": "runs migrate_chat.py's own pipeline per chat inside one interpreter, inheriting its hold/breaker/live-writer guards and its windows-only actuator fallback path; marked platform=any because migrate_batch.py owns no ACTUATOR constant itself - flagged rather than guessed.",
-    },
+    # migrate_batch is DELIBERATELY ABSENT. Its script is an untracked work in progress in
+    # one contributor's tree, and the first version of this catalog was derived from a dirty
+    # working directory, so it catalogued a file the repository does not contain and
+    # test_actionlib went red the moment it ran anywhere else. Whoever commits
+    # migrate_batch.py adds its entry here in the same commit; the disk-vs-catalog test
+    # names it until they do, which is that test working.
     "migrate_chat": {
         "kind": "mutate",
         "invocation": "direct",
