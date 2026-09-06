@@ -22,10 +22,15 @@ function file(
 
 const ids = (files: TranscriptFile[]) => files.map((f) => f.session_id)
 
+// The counts map is keyed source:storeKey:id (session-locator.ts's storeKeyOf), not bare
+// source:id — audit AH-35 follow-up. `file()`'s default store is 'C:/store/opencode.db'.
+const countKey = (id: string, path = 'C:/store/opencode.db', source = 'opencode') =>
+  `${source}:${path}:${id}`
+
 test('a subagent whose parent is present is not a row, and counts on its parent', () => {
   const { rows, counts } = collapseSubagents([file('parent'), file('child', 'parent')])
   expect(ids(rows)).toEqual(['parent'])
-  expect(counts.get('opencode:parent')).toBe(1)
+  expect(counts.get(countKey('parent'))).toBe(1)
 })
 
 test('a subagent whose parent is absent stays a row', () => {
@@ -45,7 +50,7 @@ test('nesting deeper than one level collapses to its root and counts there', () 
   expect(ids(rows)).toEqual(['root'])
   // Both of them, on the row the user can actually see — crediting the immediate parent would put
   // the leaf's count on a row that is not in the list.
-  expect(counts.get('opencode:root')).toBe(2)
+  expect(counts.get(countKey('root'))).toBe(2)
 })
 
 test('parentage is matched within a source, never across', () => {
@@ -84,7 +89,29 @@ test('siblings all count on the one parent', () => {
     file('c3', 'parent'),
   ])
   expect(ids(rows)).toEqual(['parent'])
-  expect(counts.get('opencode:parent')).toBe(3)
+  expect(counts.get(countKey('parent'))).toBe(3)
+})
+
+test("two stores sharing a tool and a session id do not steal each other's children or counts", () => {
+  // Same bug class as sessionMarkKey: tool alone ('hermes' for both) is not enough to tell two
+  // physical stores apart. Two Hermes-profile-shaped stores, same session id 'shared' in each,
+  // each with its own child — before the storeKey-aware fix this collapsed to ONE 'shared' entry
+  // in `byId`, so one store's child silently resolved to the OTHER store's parent, and both rows
+  // reported the combined count instead of their own.
+  const storeA = 'C:/hermes/profiles/a/state.db'
+  const storeB = 'C:/hermes/profiles/b/state.db'
+  const { rows, counts } = collapseSubagents([
+    file('shared', null, { source: 'hermes', tool: 'hermes', path: storeA }),
+    file('childA', 'shared', { source: 'hermes', tool: 'hermes', path: storeA }),
+    file('shared', null, { source: 'hermes', tool: 'hermes', path: storeB }),
+    file('childB', 'shared', { source: 'hermes', tool: 'hermes', path: storeB }),
+  ])
+  // Both top-level 'shared' rows survive, one per store; both children collapsed away.
+  expect(ids(rows)).toEqual(['shared', 'shared'])
+  expect(rows.map((r) => r.path)).toEqual([storeA, storeB])
+  // Each store owns exactly its OWN child, not both.
+  expect(counts.get(countKey('shared', storeA, 'hermes'))).toBe(1)
+  expect(counts.get(countKey('shared', storeB, 'hermes'))).toBe(1)
 })
 
 test('an index with no parentage at all is returned untouched', () => {

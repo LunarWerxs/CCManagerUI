@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync } from 'node:fs'
 import { join, normalize } from 'node:path'
 import { buildDetachedSpawn } from '../detached-spawn.mjs'
-import { extractUserDataDir } from './process'
+import { extractUserDataDir, linuxProcTable } from './process'
 import { createScanCache } from './scan-cache'
 import type { CMActionResult } from './shared'
 
@@ -197,9 +197,13 @@ async function listWindowsDesktopProcessRecords(): Promise<CodexDesktopProcessRe
   }
 }
 
-/** null = `ps` could not be run; an empty listing from a successful `ps` is a real empty. */
+/** null = no process table could be read; an empty listing from a successful read is a real
+ *  empty. Linux reads /proc (no `ps` needed, see core/process.ts linuxProcTable); elsewhere `ps`. */
 async function listUnixDesktopProcessRecords(): Promise<CodexDesktopProcessRecord[] | null> {
-  const stdout = await capture(['ps', '-eo', 'pid=,ppid=,command='])
+  const table = linuxProcTable()
+  const stdout = table
+    ? table.map((r) => `${r.pid} ${r.ppid} ${r.command}`).join('\n')
+    : await capture(['ps', '-eo', 'pid=,ppid=,command='])
   if (stdout === null) return null
 
   const records: CodexDesktopProcessRecord[] = []
@@ -234,7 +238,7 @@ const codexProcessCache = createScanCache<CodexProcessScan>(
           reason:
             process.platform === 'win32'
               ? 'Get-CimInstance did not return a process list'
-              : '`ps` did not return a process list',
+              : 'neither /proc nor `ps` returned a process list',
         }
       }
       return { ok: true, runtimes: codexDesktopRuntimesFromRecords(records) }

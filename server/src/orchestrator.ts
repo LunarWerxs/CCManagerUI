@@ -17,7 +17,7 @@
  * the process as an argv array, never through a shell, so there is nothing to inject.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { APP_ROOT } from './config'
 import { readInstanceInfo } from './instance'
@@ -400,10 +400,20 @@ export interface SpawnDeps {
 export async function drainBounded(
   stream: ReadableStream<Uint8Array> | null | undefined,
   cap = MAX_OUTPUT_CHARS,
+  abandon?: AbortSignal,
 ): Promise<{ text: string; dropped: number }> {
   if (!stream) return { text: '', dropped: 0 }
   const decoder = new TextDecoder('utf-8')
   const reader = stream.getReader()
+  // `abandon` fires when the child was killed and its pipe STILL has not closed: a grandchild the
+  // tree walk could not see is holding it. What arrived so far is returned; waiting longer would
+  // hold the route open for as long as that stranger lives (the CI container proved it: no
+  // process table, a 120 s grandchild, a route that never answered).
+  const giveUp = () => {
+    reader.cancel().catch(() => {})
+  }
+  if (abandon?.aborted) giveUp()
+  else abandon?.addEventListener('abort', giveUp, { once: true })
   let text = ''
   let dropped = 0
   const trim = () => {
@@ -425,6 +435,7 @@ export async function drainBounded(
     // A read error (the child was killed mid-write, the pipe closed under us): what arrived is
     // still the honest answer, and the exit code says the rest.
   } finally {
+    abandon?.removeEventListener('abort', giveUp)
     try {
       reader.releaseLock()
     } catch {
@@ -450,7 +461,62 @@ const UNIX_TREE_MAX_DEPTH = 12
  * until that grandchild happened to exit. A process group would be the canonical answer, but
  * Bun.spawn offers no `detached`, so the tree is enumerated and killed leaf-first instead.
  */
+/** Linux: the process table straight from /proc, so the walk needs no `pgrep` or `ps`. A minimal
+ *  image (the CI container is one: oven/bun ships neither) made the pgrep walk answer EMPTY, so a
+ *  timed-out run killed only the interpreter, its grandchild kept the pipes open, and the route
+ *  hung until the caller gave up (2026-09-05). Null where /proc is not readable (macOS), so the
+ *  caller falls back to pgrep. */
+function procDescendants(pid: number, maxDepth: number): number[] | null {
+  let entries: string[]
+  try {
+    entries = readdirSync('/proc')
+  } catch {
+    return null
+  }
+  const children = new Map<number, number[]>()
+  let sawAny = false
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue
+    let stat: string
+    try {
+      stat = readFileSync(`/proc/${name}/stat`, 'utf8')
+    } catch {
+      continue // raced with an exit
+    }
+    // "pid (comm) state ppid ..." - comm may hold spaces and parentheses, so split after the LAST ')'.
+    const close = stat.lastIndexOf(')')
+    if (close < 0) continue
+    const fields = stat
+      .slice(close + 1)
+      .trim()
+      .split(/\s+/)
+    const ppid = Number.parseInt(fields[1] ?? '', 10)
+    const child = Number.parseInt(name, 10)
+    if (!Number.isFinite(ppid) || !Number.isFinite(child)) continue
+    sawAny = true
+    const list = children.get(ppid)
+    if (list) list.push(child)
+    else children.set(ppid, [child])
+  }
+  if (!sawAny) return null
+  const out: number[] = []
+  const walk = (parent: number, depth: number): void => {
+    if (depth >= maxDepth) return
+    for (const child of children.get(parent) ?? []) {
+      if (child === parent) continue
+      walk(child, depth + 1) // grandchildren first, so a parent cannot respawn what we killed
+      out.push(child)
+    }
+  }
+  walk(pid, 0)
+  return out
+}
+
 export function unixDescendants(pid: number, maxDepth = UNIX_TREE_MAX_DEPTH): number[] {
+  if (process.platform === 'linux') {
+    const viaProc = procDescendants(pid, maxDepth)
+    if (viaProc !== null) return viaProc
+  }
   const out: number[] = []
   const walk = (parent: number, depth: number): void => {
     if (depth >= maxDepth) return
@@ -539,6 +605,9 @@ export function orchestratorChildEnv(
   return env
 }
 
+/** After a kill, how long an unclosed pipe is waited on before the drain is abandoned. */
+const DRAIN_GRACE_MS = 5_000
+
 async function realSpawn(command: string[], cwd: string, timeoutMs: number, hooks?: SpawnHooks) {
   const proc = Bun.spawn(command, {
     cwd,
@@ -548,19 +617,27 @@ async function realSpawn(command: string[], cwd: string, timeoutMs: number, hook
     windowsHide: true,
     env: orchestratorChildEnv(),
   })
-  hooks?.onProcess?.(() => killTree(proc))
+  const abandon = new AbortController()
+  let grace: ReturnType<typeof setTimeout> | null = null
+  const killAndBound = () => {
+    killTree(proc)
+    // The kill takes the tree we can see. If a pipe is still open DRAIN_GRACE_MS later, something
+    // we could not see holds it; stop reading rather than hang the route on it.
+    grace ??= setTimeout(() => abandon.abort(), DRAIN_GRACE_MS)
+  }
+  hooks?.onProcess?.(killAndBound)
   let timedOut = false
   const killer = setTimeout(() => {
     timedOut = true
-    killTree(proc)
+    killAndBound()
   }, timeoutMs)
   try {
     // Both streams drained together, bounded as they arrive (drainBounded): a child that fills one
     // pipe while the other is unread would otherwise deadlock, and one that never stops talking
     // would otherwise be held whole in memory until its deadline.
     const [out, err, code] = await Promise.all([
-      drainBounded(proc.stdout),
-      drainBounded(proc.stderr),
+      drainBounded(proc.stdout, MAX_OUTPUT_CHARS, abandon.signal),
+      drainBounded(proc.stderr, MAX_OUTPUT_CHARS, abandon.signal),
       proc.exited,
     ])
     return {
@@ -575,6 +652,7 @@ async function realSpawn(command: string[], cwd: string, timeoutMs: number, hook
     // Whatever happened above (a drain that threw, a rejected exit), the deadline timer must not
     // fire on a run that is already over, and a child still alive must not outlive its adapter.
     clearTimeout(killer)
+    if (grace) clearTimeout(grace)
     if (proc.exitCode === null && !proc.killed) killTree(proc)
   }
 }

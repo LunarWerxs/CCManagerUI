@@ -47,6 +47,7 @@ import { useUpdates } from '@/composables/useUpdates'
 import type { MonitorStateName, SearchIndexStatus, SyncStatus } from '@/lib/api'
 import * as api from '@/lib/api'
 import { type BadgeVariant, baseName, formatBytes } from '@/lib/format'
+import { HEADLESS_QUEUEING_ENABLED } from '@/lib/headless'
 import { composeSessionPathClipboard } from '@/lib/session-clipboard'
 import { bindSignInNudgeStatus, nudgeOnSettingsChange } from '@/lib/sign-in-nudge'
 import { useTheme } from '@/lib/theme'
@@ -1361,13 +1362,26 @@ defineExpose({ save })
       class="scroll-mt-4"
       :class="flashSection === 'scheduler' ? 'settings-flash' : ''"
     >
+      <!-- AH-12: AgentHydra never runs a chat nobody can see (headless-policy.ts) — the scheduler
+           exists solely to spawn those runs automatically, so it can never dispatch anything in
+           this build. Say so up front and disable the controls below with that reason, rather than
+           offer a toggle that would only fail moments after being flipped on. Mirrors QueueView /
+           QueueBuilder's AH-12 fix, both reading the same HEADLESS_QUEUEING_ENABLED flag. -->
+      <div v-if="!HEADLESS_QUEUEING_ENABLED" class="px-3.5 py-2.5 text-[11px] text-warning">
+        {{ $t('settings.schedulerUnavailableHint') }}
+      </div>
       <SettingsRow :icon="Power" :label="$t('settings.schedulerEnabledLabel')">
         <template #control>
           <span>
             {{ scheduler?.running_count ?? 0 }} {{ $t('settings.running') }} ·
             {{ scheduler?.queued_count ?? 0 }} {{ $t('settings.queued') }}
           </span>
-          <Switch :model-value="scheduler?.enabled ?? false" @update:model-value="toggleScheduler" />
+          <Switch
+            :model-value="scheduler?.enabled ?? false"
+            :disabled="!HEADLESS_QUEUEING_ENABLED"
+            :title="!HEADLESS_QUEUEING_ENABLED ? $t('settings.schedulerUnavailableHint') : undefined"
+            @update:model-value="toggleScheduler"
+          />
         </template>
       </SettingsRow>
       <!-- the composer's "Tomorrow …" quick option reads this time (its tiny gear lands here) -->
@@ -1376,7 +1390,14 @@ defineExpose({ save })
           <InfoHint :text="$t('settings.tomorrowTimeHint')" />
         </template>
         <template #control>
-          <Input v-model="sched.tomorrow_time" type="time" class="w-28" @change="saveScheduler" />
+          <Input
+            v-model="sched.tomorrow_time"
+            type="time"
+            class="w-28"
+            :disabled="!HEADLESS_QUEUEING_ENABLED"
+            :title="!HEADLESS_QUEUEING_ENABLED ? $t('settings.schedulerUnavailableHint') : undefined"
+            @change="saveScheduler"
+          />
         </template>
       </SettingsRow>
       <SettingsRow
@@ -1396,15 +1417,15 @@ defineExpose({ save })
         <div class="grid grid-cols-3 gap-3 px-3.5 pb-3.5 pt-2.5">
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-muted-foreground">{{ $t('settings.spacingLabel') }}</label>
-            <Input v-model="sched.spacing_seconds" type="number" />
+            <Input v-model="sched.spacing_seconds" type="number" :disabled="!HEADLESS_QUEUEING_ENABLED" />
           </div>
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-muted-foreground">{{ $t('settings.pollLabel') }}</label>
-            <Input v-model="sched.poll_seconds" type="number" />
+            <Input v-model="sched.poll_seconds" type="number" :disabled="!HEADLESS_QUEUEING_ENABLED" />
           </div>
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-muted-foreground">{{ $t('settings.maxConcurrentLabel') }}</label>
-            <Input v-model="sched.max_concurrent" type="number" />
+            <Input v-model="sched.max_concurrent" type="number" :disabled="!HEADLESS_QUEUEING_ENABLED" />
           </div>
         </div>
       </ExpandTransition>

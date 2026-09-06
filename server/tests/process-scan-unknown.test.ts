@@ -29,6 +29,7 @@ import { instancesRoot } from '../src/core/paths'
 import {
   invalidateClaudeProcessCache,
   listClaudeProcesses,
+  procTableForTests,
   scanClaudeProcesses,
 } from '../src/core/process'
 
@@ -45,16 +46,21 @@ function desktopFixture(label: string): string {
   return dir
 }
 
-/** Run `fn` with Bun.spawn replaced by one that throws, then put it back and drop the caches. */
+/** Run `fn` with Bun.spawn replaced by one that throws - and, since Linux now answers from /proc
+ *  without spawning anything, with the /proc table answering "unreadable" too - then put both
+ *  back and drop the caches. "Could not look" must be reachable on every platform. */
 async function withBrokenSpawn<T>(fn: () => Promise<T>): Promise<T> {
   const actual = Bun.spawn
+  const actualProc = procTableForTests.override
   ;(Bun as unknown as { spawn: unknown }).spawn = () => {
     throw new Error('injected process-enumeration failure')
   }
+  procTableForTests.override = () => null
   try {
     return await fn()
   } finally {
     ;(Bun as unknown as { spawn: unknown }).spawn = actual
+    procTableForTests.override = actualProc
     invalidateClaudeProcessCache()
     invalidateCodexProcessCache()
   }

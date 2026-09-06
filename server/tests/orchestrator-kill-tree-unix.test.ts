@@ -3,10 +3,15 @@
 //
 // Windows always had `taskkill /T`; the Unix branch was `proc.kill()` alone, so an actuator the
 // script had spawned survived the deadline and kept the pipes open. These tests run only where the
-// Unix branch runs (CI's ubuntu leg has python3 and pgrep); on Windows they are skipped and the
-// Windows tree kill is covered by the toolbox's own taskkill discipline.
+// Unix branch runs; on Windows they are skipped and the Windows tree kill is covered by the
+// toolbox's own taskkill discipline.
+//
+// On Linux the walk reads /proc and needs no `pgrep`: the CI container (oven/bun) ships neither
+// pgrep nor ps, and with the pgrep-only walk the first version of these tests failed there exactly
+// the way the bug they guard against fails - an empty tree, a surviving grandchild, and a route
+// that hung on its pipe until the test's own timeout (2026-09-05).
 import { expect, test } from 'bun:test'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pythonBinary, runOrchestrator, unixDescendants } from '../src/orchestrator'
@@ -26,10 +31,26 @@ const hasPython = (() => {
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0)
-    return true
   } catch (e) {
     return (e as { code?: string }).code !== 'ESRCH'
   }
+  if (process.platform === 'linux') {
+    // A killed process whose parent is gone is a ZOMBIE until PID 1 reaps it, and signal 0 still
+    // "succeeds" on a zombie. Under systemd (a GitHub runner) that is instant; in a container
+    // whose PID 1 is a plain shell or `sleep` it never happens, and the first run of this test
+    // read a reaped-in-all-but-name grandchild as alive. State Z is dead for our purposes.
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const state = stat
+        .slice(stat.lastIndexOf(')') + 1)
+        .trim()
+        .charAt(0)
+      if (state === 'Z') return false
+    } catch {
+      return false
+    }
+  }
+  return true
 }
 
 async function waitGone(pid: number, ms: number): Promise<boolean> {
@@ -55,6 +76,16 @@ test.skipIf(!unix)(
       expect(tree.length).toBeGreaterThanOrEqual(1)
       // Every listed pid is a live process we can see.
       for (const pid of tree) expect(alive(pid)).toBe(true)
+      if (process.platform === 'linux') {
+        // No `pgrep`, no `ps` on the PATH: the walk must answer from /proc alone.
+        const savedPath = process.env.PATH
+        process.env.PATH = '/nonexistent'
+        try {
+          expect(unixDescendants(parent.pid)).toEqual(tree)
+        } finally {
+          process.env.PATH = savedPath
+        }
+      }
     } finally {
       for (const pid of unixDescendants(parent.pid)) {
         try {

@@ -165,6 +165,21 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ### Fixed
 
+- **Linux enumeration no longer depends on `ps`/`pgrep`, and two identity keys follow the store**
+  (2026-09-05, found by running the repo's own ubuntu CI leg in its container after the audit
+  closed; GitHub's runner ships procps and had hidden all of it). On Linux the process table is
+  read from /proc for Claude and Codex discovery alike, and the orchestrator's tree kill walks
+  /proc too. In the CI image, which has neither `ps` nor `pgrep`, every Unix enumeration used to
+  answer "could not look": the delete guard rightly refused every instance removal, and a
+  timed-out toolbox run killed only the interpreter while its grandchild held the pipes and the
+  route never answered. The drain after a kill is now bounded as well: a pipe still open five
+  seconds after the tree kill is abandoned with what arrived. Done-marks and subagent ownership
+  key on the session's store (database path for OpenCode-format and Hermes stores), so two Hermes
+  profiles or two OpenCode-format databases sharing a session id no longer share a mark or steal
+  each other's children; marks set under the old key are still found. And Settings' scheduler
+  panel now says plainly that this build cannot dispatch unattended runs, instead of offering a
+  switch that does nothing.
+
 - **The last twelve audit findings** (audit AH-07/08/09/10/11/12/16/25/30/35/40/42, 2026-09-05),
   which closes the 42-item orchestrator audit. A compiled update now brings `orchestrator/` and
   `misc/` to the release's exact content as one unit with the executable: the toolbox is swapped

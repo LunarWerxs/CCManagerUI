@@ -10,7 +10,7 @@ import {
 import { readOpenCodeSession } from './opencode-sessions'
 import { createLimitStopTracker, type LimitStop } from './rate-limit-signal'
 import { classifyEnding, endingEventText, type SessionEnding } from './session-ending'
-import { makeLocator } from './session-locator'
+import { makeLocator, storeKeyOf } from './session-locator'
 import {
   decodeProjectKey,
   describeTaggedText,
@@ -743,13 +743,16 @@ export function collapseSubagents(files: TranscriptFile[]): {
   // A store that records no parentage at all is every store but OpenCode, so leave early rather than
   // build an index of every session on the machine for nothing.
   if (!files.some((f) => f.parentId)) return { rows: files, counts: new Map() }
-  // Keyed by TOOL, not just source: a parent/child pair is always read out of the same physical
-  // store's own tables, so tool is exactly the disambiguator a bare source misses — two OpenCode-
-  // format products (Kilo, MiMo Code) can otherwise hand out the same bare session id, and one of
-  // them must not be able to claim ownership of the other's row (audit AH-35, same bug class as the
-  // index's own de-dup — see session-locator.ts).
-  const key = (tf: Pick<TranscriptFile, 'source' | 'tool'>, id: string) =>
-    `${tf.tool ?? tf.source}:${id}`
+  // Keyed by the locator's STORE identity (session-locator.ts's storeKeyOf), not just tool: a
+  // parent/child pair is always read out of the same physical store's own tables, so storeKey is
+  // exactly the disambiguator a bare tool misses whenever the store is database-backed. Tool alone
+  // stops two OpenCode-format PRODUCTS (Kilo, MiMo Code) from colliding, but not two catalog entries
+  // of the SAME product/tool backed by different databases, nor two Hermes profiles (both
+  // `tool: 'hermes'`, different `state.db` paths) — either pair could otherwise claim ownership of
+  // each other's row (audit AH-35 follow-up; storeKeyOf already reduces to the tool id for
+  // file-backed formats, so this is a strict extension of the previous key for those).
+  const key = (tf: Pick<TranscriptFile, 'source' | 'tool' | 'path'>, id: string) =>
+    `${storeKeyOf({ source: tf.source, tool: tf.tool, path: tf.path, session_id: id })}:${id}`
   const byId = new Map(files.map((f) => [key(f, f.session_id), f]))
 
   /** The top-level session this row belongs to, or null when it is one itself — or owned by nothing
@@ -778,9 +781,11 @@ export function collapseSubagents(files: TranscriptFile[]): {
       continue
     }
     // Credited to the ROOT rather than to the immediate parent, so a chain two deep still counts on
-    // the row the user can actually see. Counted by source:id (not the tool-keyed lookup key above)
-    // because that is what callers of this map already look it up by (see listSessions/getSession).
-    const k = `${owner.source}:${owner.session_id}`
+    // the row the user can actually see. Counted by source:storeKey:id, the same store-aware shape
+    // as the lookup key above (not bare source:id — two owners in different stores sharing a session
+    // id would otherwise collide on one counts entry and each report the OTHER's total; audit AH-35
+    // follow-up). Callers (toSummary/getSession below) build the identical key to look this up.
+    const k = `${owner.source}:${storeKeyOf(owner)}:${owner.session_id}`
     counts.set(k, (counts.get(k) ?? 0) + 1)
   }
   return { rows, counts }
@@ -985,9 +990,12 @@ export async function listSessions(opts: ListSessionsOptions = {}): Promise<Sess
       queue_status: tf.source === 'claude' ? (qmap.get(tf.session_id) ?? null) : null,
       instance: desk?.instance ?? null,
       archived: tf.archived || (desk?.archived ?? false),
-      done: dmap.get(sessionMarkKey(tf.source, tf.session_id, tf.tool)) ?? false,
+      done:
+        dmap.get(sessionMarkKey(tf.source, tf.session_id, tf)) ??
+        dmap.get(legacyMarkKey(tf.source, tf.session_id, tf.tool)) ??
+        false,
       dispatched: tf.source === 'claude' && qmap.has(tf.session_id),
-      subagent_count: collapsed.counts.get(`${tf.source}:${tf.session_id}`) ?? 0,
+      subagent_count: collapsed.counts.get(`${tf.source}:${storeKeyOf(tf)}:${tf.session_id}`) ?? 0,
       limit_stop: m.limit_stop,
       title_source: m.title_source,
       title_tag: m.title_tag,
@@ -1082,14 +1090,40 @@ function toolIdOf(tf: TranscriptFile): string {
 /**
  * The done-mark's storage key. Bare `sessionId` for claude is kept exactly as it always was — that
  * namespace has real marks on disk and Claude Code sessions are never format-ambiguous — but a
- * non-claude mark keys on TOOL rather than source alone whenever the tool is known and differs from
- * the source: two products of one format (Kilo and MiMo Code, both `opencode`; two Hermes profiles,
- * both `hermes`) can hold the same session id, and a mark keyed on source+id would toggle whichever
- * one the id happened to resolve to (audit AH-35). Passing no `tool` (the caller has only a source,
- * not a resolved row) falls back to the old `source:id` key unchanged, so a call site that has not
- * been updated yet keeps working exactly as before rather than silently losing marks.
+ * non-claude mark keys on the locator's STORE identity (session-locator.ts's `storeKeyOf`), not tool
+ * alone: tool distinguishes two products of one format (Kilo vs MiMo Code, both `opencode`), but not
+ * two Hermes profiles, which both report `tool: 'hermes'` yet are separate `state.db` files, nor two
+ * catalog entries of the same product pointed at different databases. A mark keyed on tool alone
+ * would let either pair toggle whichever store's session the id happened to resolve to (audit AH-35
+ * follow-up). `storeKeyOf` already reduces to the tool id (or source) for file-backed formats, so
+ * for those this produces the BYTE-FOR-BYTE same string as before: only db-backed formats (opencode,
+ * hermes) change shape, from `${source}:${tool}:${id}` to `${source}:${storeKey}:${id}` where
+ * storeKey is the database path. Passing no `tf` (the caller has only a source, not a resolved row)
+ * falls back to the old `source:id` key unchanged, exactly the pre-locator behavior.
+ *
+ * BACKWARD COMPAT: a mark written under the pre-storeKey key (tool-only, no path) for a db-backed
+ * session is not silently orphaned — see {@link legacyMarkKey}, checked as a fallback at both read
+ * sites in this file (the `done` field in toSummary and getSession). Nothing ever writes under the
+ * old key again; the fallback exists only so a mark set before this change stays findable until it
+ * is next toggled, which rewrites it under the new key.
  */
-export function sessionMarkKey(source: SessionSource, sessionId: string, tool?: string): string {
+export function sessionMarkKey(
+  source: SessionSource,
+  sessionId: string,
+  tf?: { tool?: string; path?: string },
+): string {
+  if (source === 'claude') return sessionId
+  if (!tf) return `${source}:${sessionId}`
+  const storeKey = storeKeyOf({ source, tool: tf.tool, path: tf.path ?? '', session_id: sessionId })
+  return storeKey === source ? `${source}:${sessionId}` : `${source}:${storeKey}:${sessionId}`
+}
+
+/**
+ * The done-mark key {@link sessionMarkKey} produced BEFORE this change — tool only, never the store
+ * path. Read-only fallback: a Hermes/OpenCode mark set before this fix is still found under its old
+ * key. Never write under this key going forward.
+ */
+export function legacyMarkKey(source: SessionSource, sessionId: string, tool?: string): string {
   if (source === 'claude') return sessionId
   const t = tool && tool !== source ? tool : null
   return t ? `${source}:${t}:${sessionId}` : `${source}:${sessionId}`
@@ -1250,13 +1284,18 @@ export async function getSession(
     queue_status: tf.source === 'claude' ? (qmap.get(tf.session_id) ?? null) : null,
     instance: tf.source === 'claude' ? (meta?.instance ?? null) : null,
     archived: tf.archived || (meta?.archived ?? false),
-    done: dmap.get(sessionMarkKey(tf.source, sessionId, tf.tool)) ?? false,
+    done:
+      dmap.get(sessionMarkKey(tf.source, sessionId, tf)) ??
+      dmap.get(legacyMarkKey(tf.source, sessionId, tf.tool)) ??
+      false,
     dispatched: tf.source === 'claude' && qmap.has(tf.session_id),
     // Asked of the whole index rather than tracked per row, because this route can be handed a
     // subagent's own id — reached from a search hit — and that row is not in the collapsed list at
     // all. It answers 0 for itself, which is true: a subagent spawned nothing.
     subagent_count:
-      collapseSubagents(listTranscriptFiles()).counts.get(`${tf.source}:${tf.session_id}`) ?? 0,
+      collapseSubagents(listTranscriptFiles()).counts.get(
+        `${tf.source}:${storeKeyOf(tf)}:${tf.session_id}`,
+      ) ?? 0,
     limit_stop: m.limit_stop,
     title_source: m.title_source,
     title_tag: m.title_tag,

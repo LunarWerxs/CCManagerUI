@@ -201,15 +201,22 @@ app.post('/api/sessions/:id/done', async (c) => {
   const body = await jsonBody(c)
   const done = body.done === true
   // Resolved so the mark keys on the SAME product+store a locator (or source+id) actually named:
-  // two products sharing a format can hold the same session id (audit AH-35), and marking "done" by
-  // source+id alone would toggle whichever one that id happened to resolve to. A row this app has
-  // never indexed (already deleted, or a locator from elsewhere) still gets marked, under the plain
-  // source+id key — exactly the pre-locator behavior — because sessionMarkKey's `tool` is optional.
+  // two products sharing a format, or two stores of the same product (two Hermes profiles, two
+  // OpenCode-format databases), can hold the same session id, and marking "done" by source+id alone
+  // would toggle whichever one that id happened to resolve to. A row this app has never indexed
+  // (already deleted, or a locator from elsewhere) still gets marked, under the plain source+id key
+  // — exactly the pre-locator behavior — because sessionMarkKey's `tf` is optional.
   const tf = await findTranscriptAsync(id, source, locator)
   db.query(
     'insert into session_marks (session_id, done, updated_at) values (?, ?, ?) ' +
       'on conflict(session_id) do update set done = ?, updated_at = ?',
-  ).run(sessionMarkKey(source, id, tf?.tool), done ? 1 : 0, Date.now(), done ? 1 : 0, Date.now())
+  ).run(
+    sessionMarkKey(source, id, tf ?? undefined),
+    done ? 1 : 0,
+    Date.now(),
+    done ? 1 : 0,
+    Date.now(),
+  )
   return c.json({ session_id: id, source, done })
 })
 // Download a copy of the raw transcript (browser save-as; works over remote too). The filename is

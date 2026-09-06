@@ -22,8 +22,73 @@
 // empty array rather than rejecting, since "we can't currently enumerate processes" should
 // degrade to "no known running instances", not crash the caller.
 
+import { readdirSync, readFileSync } from 'node:fs'
 import { normalizePath } from './paths.ts'
 import { createScanCache } from './scan-cache.ts'
+
+/** One row of the OS process table, as `ps -eo pid=,ppid=,command=` would print it. */
+export interface ProcTableRow {
+  pid: number
+  ppid: number
+  command: string
+}
+
+/**
+ * Linux: the process table read straight from /proc, so it needs no `ps`.
+ *
+ * Both Unix listers below used to shell out to `ps`, and a Linux box without procps (a minimal
+ * container is one; the CI image ships neither ps nor pgrep) answered "could not enumerate", which
+ * the delete guard rightly refuses to act on - so on such a box no instance could ever be deleted
+ * (2026-09-05, reproduced in the container). /proc is the source `ps` itself reads. Returns null
+ * off Linux or where /proc is unreadable, and the caller falls back to `ps` (macOS).
+ */
+/** Test seam. process-scan-unknown.test.ts injects an enumeration failure by making Bun.spawn
+ *  throw, which on Linux no longer reaches /proc at all; this lets that test make /proc answer
+ *  "unreadable" too, so "could not look" is exercised on every platform. Null = no override. */
+export const procTableForTests: { override: (() => ProcTableRow[] | null) | null } = {
+  override: null,
+}
+
+export function linuxProcTable(): ProcTableRow[] | null {
+  if (procTableForTests.override) return procTableForTests.override()
+  if (process.platform !== 'linux') return null
+  let entries: string[]
+  try {
+    entries = readdirSync('/proc')
+  } catch {
+    return null
+  }
+  const NUL = String.fromCharCode(0)
+  const rows: ProcTableRow[] = []
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue
+    const pid = Number.parseInt(name, 10)
+    let stat: string
+    let cmdline: string
+    try {
+      stat = readFileSync(`/proc/${name}/stat`, 'utf8')
+      cmdline = readFileSync(`/proc/${name}/cmdline`, 'utf8')
+    } catch {
+      continue // raced with an exit
+    }
+    // "pid (comm) state ppid ..." - comm may hold spaces and parentheses, so split after the LAST ')'.
+    const close = stat.lastIndexOf(')')
+    if (close < 0) continue
+    const fields = stat
+      .slice(close + 1)
+      .trim()
+      .split(/\s+/)
+    const ppid = Number.parseInt(fields[1] ?? '', 10)
+    if (!Number.isFinite(ppid)) continue
+    // cmdline is the NUL-separated argv; a kernel thread has none, and `ps` prints its comm in
+    // brackets for those, so this does the same.
+    const argv = cmdline.split(NUL).filter((part) => part.length > 0)
+    const command =
+      argv.length > 0 ? argv.join(' ') : `[${stat.slice(stat.indexOf('(') + 1, close)}]`
+    rows.push({ pid, ppid, command })
+  }
+  return rows.length > 0 ? rows : null
+}
 
 // `--user-data-dir` shows up three ways in a reported command line, depending on how the value
 // was quoted when the process was launched — the discovery here must handle all three or a
@@ -326,7 +391,12 @@ async function listUnixProcesses(): Promise<CMProcessInfo[] | null> {
   // `pid=,command=` suppresses the header row; `command` (not `comm`) gives the full
   // argv/cmdline rather than just the truncated executable basename. BSD `ps` (macOS) and
   // procps `ps` (Linux) both support this `-o key=` no-header syntax.
-  const stdout = await runCaptureStdout(['ps', '-eo', 'pid=,command='])
+  // Linux answers from /proc first (see linuxProcTable): a box without procps still gets a real
+  // table rather than "unknown". The parser below is the same for both sources.
+  const table = linuxProcTable()
+  const stdout = table
+    ? table.map((r) => `${r.pid} ${r.command}`).join('\n')
+    : await runCaptureStdout(['ps', '-eo', 'pid=,command='])
   if (stdout === null) return null
 
   const out: CMProcessInfo[] = []
@@ -428,7 +498,7 @@ const claudeProcessCache = createScanCache<ClaudeProcessScan>(
           reason:
             process.platform === 'win32'
               ? 'neither Get-CimInstance nor wmic returned a process list'
-              : '`ps` did not return a process list',
+              : 'neither /proc nor `ps` returned a process list',
         }
       }
       return { ok: true, processes }
