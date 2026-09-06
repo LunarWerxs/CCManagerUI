@@ -15,7 +15,7 @@
 // asserting the older answer never reaches the visible ref — "last resolved" must lose to "last
 // issued".
 
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { nextTick, ref } from 'vue'
 import type {
   QueueItem,
@@ -79,6 +79,16 @@ let tailCalls: {
   resolve: (v: TailResult) => void
 }[] = []
 
+// The api module is mocked for the WHOLE bun test process, not for this file: mock.module is global
+// for the run and stays in force for every file that loads after this one. resource-status.test.ts
+// runs next in the serial order CI uses, imports the real runQueueItem, and got a getQueue whose
+// promise nothing here would ever resolve - three 5s timeouts, and because a timed-out test never
+// reaches its finally, its own fetch stub then leaked on to instance-pointer.test.ts as well. So the
+// real exports are copied BEFORE the fake lands (mock.module rewrites the live bindings of a
+// namespace that is already imported, so a copy taken afterwards would be a copy of the fake) and
+// the module is re-mocked to that copy in afterAll. mock.restore() does not unmock modules.
+const realApi = { ...(await import('../src/lib/api')) }
+
 mock.module('../src/lib/api', () => ({
   getQueue: () => {
     const d = deferred<QueueItem[]>()
@@ -100,6 +110,10 @@ mock.module('../src/lib/api', () => ({
     return d.promise
   },
 }))
+
+afterAll(() => {
+  mock.module('../src/lib/api', () => realApi)
+})
 
 const { useData } = await import('../src/composables/useData')
 const { useOpenSession } = await import('../src/composables/useOpenSession')

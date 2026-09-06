@@ -117,6 +117,15 @@ jobs:
       - name: Guardrail (agent catalog row provenance ratchet)
         run: bun scripts/checks/catalog-row-provenance.mjs
 
+      # Fails if a test file's stub outlives it. `bun test` runs every file in one process, so a
+      # global stubbed at module scope (or in a before* hook) with no after* restore, and any
+      # mock.module() with no re-mock to the real exports, is what the NEXT file's code calls.
+      # 2026-09-05, twice: probe tests under tmp/ broke instance-pointer + updater-engine, then
+      # request-generations' mock of web/src/lib/api hung resource-status for three 5s timeouts.
+      # Every file involved passes alone; only the serial run below sees it. See the check's header.
+      - name: Guardrail (a test stub must not outlive its file)
+        run: bun scripts/checks/test-stub-outlives-its-file.mjs
+
       - name: Build (web SPA)
         run: bun run build
 

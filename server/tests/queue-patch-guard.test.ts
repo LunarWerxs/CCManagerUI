@@ -7,15 +7,25 @@
 // and identity fields lock once a row's status is 'running' (isActive() OR the boot-recovery window
 // before reattachRuns() repopulates the in-memory `active` map — both read the same DB column).
 //
-// Routes are exercised through the real Hono app (`app.request`, no listening port) with routes/
-// queue.ts's side-effecting registration imported once. The sqlite db is the suite's isolated
-// scratch file (tests/setup.ts preload), so rows are inserted directly, same pattern as
-// dispatch.test.ts's makeItem.
+// Routes are exercised through the real registrations (routes/queue.ts's side-effecting import,
+// no listening port) but dispatched on a PRIVATE Hono copied from the shared app, never on the
+// shared app itself - see `http` below. The sqlite db is the suite's isolated scratch file
+// (tests/setup.ts preload), so rows are inserted directly, same pattern as dispatch.test.ts's
+// makeItem.
 
 import { beforeEach, expect, test } from 'bun:test'
+import { Hono } from 'hono'
 import { app } from '../src/http-app'
 import '../src/routes/queue'
 import { db } from '../src/db'
+
+// Hono builds its router on the first request and refuses new routes after that, and `app` in
+// http-app.ts is ONE object for the whole bun test process. The first file to call app.request()
+// therefore freezes it for every file that loads a routes/*.ts module after it: this file did, and
+// session-locator-multi-store.test.ts, importing routes/sessions later in the serial order, died at
+// import with "Can not add a route since the matcher is already built". route('/', app) copies the
+// routes registered so far into a fresh app with its own router, so the shared one stays open.
+const http = new Hono().route('/', app)
 
 let counter = 0
 function insertItem(overrides: { status?: string; cwd?: string } = {}) {
@@ -33,7 +43,7 @@ function rowOf(id: string) {
 }
 
 async function patch(id: string, body: Record<string, unknown>) {
-  const res = await app.request(`/api/queue/${id}`, {
+  const res = await http.request(`/api/queue/${id}`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -106,14 +116,14 @@ test('canceling via PATCH is refused once the item is no longer queued', async (
 
 test('DELETE refuses a row that is still marked active', async () => {
   const id = insertItem({ status: 'running' })
-  const res = await app.request(`/api/queue/${id}`, { method: 'DELETE' })
+  const res = await http.request(`/api/queue/${id}`, { method: 'DELETE' })
   expect(res.status).toBe(409)
   expect(rowOf(id)).toBeTruthy() // not deleted
 })
 
 test('DELETE succeeds for a pending (queued) item', async () => {
   const id = insertItem()
-  const res = await app.request(`/api/queue/${id}`, { method: 'DELETE' })
+  const res = await http.request(`/api/queue/${id}`, { method: 'DELETE' })
   expect(res.status).toBe(200)
   expect(rowOf(id)).toBeNull() // sqlite's .get() answers null, not undefined, for no match
 })

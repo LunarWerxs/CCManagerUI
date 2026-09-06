@@ -39,6 +39,71 @@ const CMD_LINE = 'Command' + 'Line'
 // each check's own header comment documents, not a synthetic near-miss. A check that exports
 // findViolations but has no entry here fails loudly below rather than being silently skipped.
 const FIXTURES_BY_FILE: Record<string, { broken: string[]; fixed: string[] }> = {
+  'test-stub-outlives-its-file.mjs': {
+    broken: [
+      // The tmp/audit2 probe shape (2026-09-05): fetch replaced at module scope, never put back, so
+      // instance-pointer's findLiveInstance probed its own server through this fake and saw 0 hits.
+      `
+      import { expect, test } from 'bun:test'
+      const calls: string[] = []
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        calls.push(String(input))
+        return new Response('{}', { status: 200 })
+      }) as typeof fetch
+      test('refreshAll', async () => { expect(calls).toEqual([]) })
+      `,
+      // The request-generations shape before its fix: a module mocked for the whole run with no
+      // re-mock, so resource-status (next in order) awaited a getQueue nothing would resolve.
+      `
+      import { beforeEach, describe, expect, mock, test } from 'bun:test'
+      mock.module('../src/lib/api', () => ({ getQueue: () => new Promise(() => {}) }))
+      const { useData } = await import('../src/composables/useData')
+      test('x', () => { expect(useData).toBeTruthy() })
+      `,
+      // A before-hook stub is module scope by another name: it runs once and nothing undoes it.
+      `
+      import { beforeAll, expect, test } from 'bun:test'
+      beforeAll(() => { globalThis.fetch = (async () => new Response('{}')) as typeof fetch })
+      test('x', () => { expect(1).toBe(1) })
+      `,
+    ],
+    fixed: [
+      // resource-status.test.ts's shape: stubbed inside the test through a helper, restored in finally.
+      `
+      import { expect, test } from 'bun:test'
+      function setFetch(fn: typeof fetch): void { globalThis.fetch = fn }
+      test('x', async () => {
+        const originalFetch = globalThis.fetch
+        setFetch((async () => new Response('{}')) as typeof fetch)
+        try { expect(1).toBe(1) } finally { globalThis.fetch = originalFetch }
+      })
+      `,
+      // connections-sync.test.ts's shape: a module-scope stub with an afterAll that puts it back.
+      `
+      import { afterAll, expect, test } from 'bun:test'
+      const realFetch = globalThis.fetch
+      globalThis.fetch = (async () => new Response('{}')) as typeof fetch
+      afterAll(() => { globalThis.fetch = realFetch })
+      test('x', () => { expect(1).toBe(1) })
+      `,
+      // request-generations.test.ts after its fix: the real exports copied BEFORE the fake lands,
+      // and the module re-mocked to that copy once the file is done.
+      `
+      import { afterAll, expect, mock, test } from 'bun:test'
+      const realApi = { ...(await import('../src/lib/api')) }
+      mock.module('../src/lib/api', () => ({ getQueue: () => new Promise(() => {}) }))
+      afterAll(() => { mock.module('../src/lib/api', () => realApi) })
+      test('x', () => { expect(1).toBe(1) })
+      `,
+      // A file that only TALKS about the hazard, the way tunnel.test.ts and monitor.test.ts do.
+      `
+      import { expect, test } from 'bun:test'
+      // never mock.module('node:child_process') here: it is global for the whole run, and
+      // globalThis.fetch = fake at module scope leaks the same way.
+      test('x', () => { expect(1).toBe(1) })
+      `,
+    ],
+  },
   'reka-popper-root-inside-tooltip.mjs': {
     broken: [
       // DropdownMenu wraps AROUND the IconTooltip, so DropdownMenuTrigger's nearest PopperRoot is

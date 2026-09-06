@@ -7,9 +7,11 @@
 // has, and a value dropped here is a value gone.
 //
 // The api module is mocked rather than the network: what is under test is the ownership rule (when
-// does the store win, when does this window win), not fetch.
+// does the store win, when does this window win), not fetch. The mock is process-wide, though - in
+// Bun, mock.module holds for every file that loads after this one - so the real exports are copied
+// before the fake lands and put back in afterAll (see request-generations.test.ts for the incident).
 
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { nextTick, ref } from 'vue'
 
 const KEY = 'agenthydra.instances.usageFilter.enabled'
@@ -25,6 +27,8 @@ let readFailures = 0
 let writes: Record<string, string>[] = []
 /** Writes to reject — a request the closing window cancelled. */
 let writeFailures = 0
+
+const realApi = { ...(await import('../src/lib/api')) }
 
 mock.module('../src/lib/api', () => ({
   API_BASE: '',
@@ -45,6 +49,10 @@ mock.module('../src/lib/api', () => ({
     return { prefs: { ...store } }
   },
 }))
+
+afterAll(() => {
+  mock.module('../src/lib/api', () => realApi)
+})
 
 const { hydrateSharedPrefs, registerSharedPref, resetSharedPrefsForTest } = await import(
   '../src/composables/useSharedPrefs'

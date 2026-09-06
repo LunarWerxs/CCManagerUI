@@ -15,10 +15,16 @@ import { afterAll, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Hono } from 'hono'
 import { app } from '../src/http-app'
 import '../src/routes/sessions'
 import { dedupeKey, makeLocator, matchesLocator, parseLocator } from '../src/session-locator'
 import { findTranscriptAsync, listTranscriptFiles, tailTranscript } from '../src/transcript'
+
+// Dispatched on a PRIVATE Hono copied from the shared app, never on the shared app itself: its
+// router freezes on the first request, and it is one object for the whole bun test process. The
+// full account is in queue-patch-guard.test.ts, the file whose dispatch froze it under this one.
+const http = new Hono().route('/', app)
 
 const SID = `ses_shared_${crypto.randomUUID().slice(0, 8)}`
 const root = mkdtempSync(join(tmpdir(), 'ah-multi-store-'))
@@ -142,7 +148,7 @@ test('GET /api/sessions/:id?locator= resolves the exact row named, not the other
   const kilo = rows.find((r) => r.tool === 'kilo')!
   const mimo = rows.find((r) => r.tool === 'mimocode')!
 
-  const kiloRes = await app.request(
+  const kiloRes = await http.request(
     `/api/sessions/${SID}?source=opencode&locator=${encodeURIComponent(kilo.locator!)}`,
   )
   expect(kiloRes.status).toBe(200)
@@ -150,7 +156,7 @@ test('GET /api/sessions/:id?locator= resolves the exact row named, not the other
   expect(kiloBody.tool).toBe('kilo')
   expect(kiloBody.locator).toBe(kilo.locator!)
 
-  const mimoRes = await app.request(
+  const mimoRes = await http.request(
     `/api/sessions/${SID}?source=opencode&locator=${encodeURIComponent(mimo.locator!)}`,
   )
   expect(mimoRes.status).toBe(200)
