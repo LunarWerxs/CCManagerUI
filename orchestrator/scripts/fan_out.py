@@ -410,17 +410,9 @@ def spawn_exit_code(group: dict) -> int:
 
 # --- status ----------------------------------------------------------------------------------
 
-def _member_status(m: dict) -> dict:
-    sid = m.get("sessionId")
-    out = {"index": m.get("index"), "title": m.get("title"), "instance": m.get("instance"),
-           "sessionId": sid, "spawnState": m.get("state"), "why": m.get("why")}
-    if not sid:
-        out["state"] = m.get("state")
-        return out
-    if m.get("deleted"):
-        out["state"] = "deleted"
-        out["trash"] = (m.get("deleteReport") or {}).get("trash")
-        return out
+def _load_row_and_live(out: dict, sid: str) -> tuple[dict | None, object]:
+    """Reads the session row and liveness for sid, recording any read failure onto out
+    (liveness's own failure note wins if both reads fail, matching the original order)."""
     row = None
     try:
         row = hydralib.session_row(sid)
@@ -433,25 +425,26 @@ def _member_status(m: dict) -> dict:
         live = None
         out["liveKnown"] = False
         out["note"] = f"liveness unread: {err.detail or err}"
-    tp = (row or {}).get("transcript_path") or gatelib.find_transcript_on_disk(sid)
-    out["chatTitle"] = (row or {}).get("title")
-    if not out["liveKnown"]:
-        # LIVENESS UNKNOWN IS NOT "NOT LIVE" (hydralib.live_for's own contract; review
-        # 2026-09-05): gating with live=None would print a confident finished/crashed verdict
-        # for a chat that may still be working. Report the last words, never a verdict.
-        out["state"] = "unknown"
-        out["quietSecs"] = gatelib.quiet_secs_of(tp) if tp else None
-        try:
-            text = gatelib.last_assistant_text(gatelib.read_records(tp)) if tp else ""
-        except OSError:
-            text = ""
-        out["lastText"] = text[-LAST_TEXT_CHARS:] if text else ""
-        return out
-    verdict = gatelib.gate(sid, tp, live) if tp else None
-    if verdict is None:
-        out["state"] = "ungateable" if tp else "unknown"
-        out["quietSecs"] = None
-        return out
+    return row, live
+
+
+def _unknown_liveness_status(out: dict, tp: str | None) -> dict:
+    """Fills the report for a session whose liveness could not be determined."""
+    # LIVENESS UNKNOWN IS NOT "NOT LIVE" (hydralib.live_for's own contract; review
+    # 2026-09-05): gating with live=None would print a confident finished/crashed verdict
+    # for a chat that may still be working. Report the last words, never a verdict.
+    out["state"] = "unknown"
+    out["quietSecs"] = gatelib.quiet_secs_of(tp) if tp else None
+    try:
+        text = gatelib.last_assistant_text(gatelib.read_records(tp)) if tp else ""
+    except OSError:
+        text = ""
+    out["lastText"] = text[-LAST_TEXT_CHARS:] if text else ""
+    return out
+
+
+def _finalize_gated_status(out: dict, tp: str, verdict: dict) -> dict:
+    """Fills the report fields derived from a completed gate verdict."""
     out["quietSecs"] = verdict.get("quiet_secs")
     if verdict.get("state") == "running":
         out["state"] = ("stalled" if verdict.get("stalled")
@@ -469,6 +462,30 @@ def _member_status(m: dict) -> dict:
         text = ""
     out["lastText"] = text[-LAST_TEXT_CHARS:] if text else ""
     return out
+
+
+def _member_status(m: dict) -> dict:
+    sid = m.get("sessionId")
+    out = {"index": m.get("index"), "title": m.get("title"), "instance": m.get("instance"),
+           "sessionId": sid, "spawnState": m.get("state"), "why": m.get("why")}
+    if not sid:
+        out["state"] = m.get("state")
+        return out
+    if m.get("deleted"):
+        out["state"] = "deleted"
+        out["trash"] = (m.get("deleteReport") or {}).get("trash")
+        return out
+    row, live = _load_row_and_live(out, sid)
+    tp = (row or {}).get("transcript_path") or gatelib.find_transcript_on_disk(sid)
+    out["chatTitle"] = (row or {}).get("title")
+    if not out["liveKnown"]:
+        return _unknown_liveness_status(out, tp)
+    verdict = gatelib.gate(sid, tp, live) if tp else None
+    if verdict is None:
+        out["state"] = "ungateable" if tp else "unknown"
+        out["quietSecs"] = None
+        return out
+    return _finalize_gated_status(out, tp, verdict)
 
 
 def status(group: dict) -> dict:
@@ -720,6 +737,108 @@ def _print_status(s: dict) -> None:
             print(f"      {m['why'][:140]}")
 
 
+def _cmd_list(as_json: bool) -> int:
+    """Prints every recorded fan-out group as one summary line (or as JSON rows)."""
+    rows = [{"id": g["id"], "name": g.get("name"), "createdAt": g.get("createdAt"),
+             "dryRun": g.get("dryRun", False),
+             "members": len(g.get("members", [])),
+             "spawned": sum(1 for m in g.get("members", []) if m.get("sessionId")),
+             "sends": len(g.get("sends", []))} for g in groups()]
+    if as_json:
+        print(json.dumps({"groups": rows}, indent=2))
+    else:
+        for r in rows:
+            print(f"{r['id']}  {r.get('name') or '-':<24} {r['createdAt']}  "
+                  f"{r['spawned']}/{r['members']} spawned, {r['sends']} sends")
+        if not rows:
+            print("no fan-outs recorded")
+    return 0
+
+
+def _cmd_status(words: list[str], as_json: bool) -> int:
+    """Looks up the named group and prints its members' current status."""
+    group = find_group(words[1] if len(words) > 1 else None)
+    if not group:
+        print("REFUSED: no such fan-out group (fan_out list shows them)", file=sys.stderr)
+        return 3
+    s = status(group)
+    if as_json:
+        print(json.dumps(s, indent=2))
+    else:
+        _print_status(s)
+    return 0
+
+
+def _cmd_send(argv: list[str], words: list[str], as_json: bool, force: bool) -> int:
+    """Validates the send arguments, then delivers the text and reports per-member results."""
+    text = _take_value(argv, "--text")
+    if len(words) < 2 or not text or not text.strip():
+        print(__doc__.strip(), file=sys.stderr)
+        return 3
+    group = find_group(words[1])
+    if not group:
+        print("REFUSED: no such fan-out group (fan_out list shows them)", file=sys.stderr)
+        return 3
+    record = send(group, text.strip(), _take_values(argv, "--only"), force=force)
+    if as_json:
+        print(json.dumps({"id": group["id"], **record}, indent=2))
+    else:
+        for r in record["results"]:
+            print(f"  [{r.get('index')}] {str(r.get('title'))[:40]:<40} "
+                  f"{'delivered' if r.get('delivered') else 'NOT delivered'}"
+                  f"  {r.get('route') or ''} {r.get('skipped') or r.get('error') or r.get('detail') or ''}")
+    return send_exit_code(record)
+
+
+def _cmd_delete(words: list[str], as_json: bool, force: bool) -> int:
+    """Looks up the named group and deletes its spawned members, reporting the outcome."""
+    if len(words) < 2:
+        print(__doc__.strip(), file=sys.stderr)
+        return 3
+    group = find_group(words[1])
+    if not group:
+        print("REFUSED: no such fan-out group (fan_out list shows them)", file=sys.stderr)
+        return 3
+    record = delete_group(group, force=force)
+    if as_json:
+        print(json.dumps(record, indent=2))
+    else:
+        for r in record["results"]:
+            print(f"  [{r.get('index')}] {str(r.get('title'))[:40]:<40} "
+                  f"{'deleted' if r.get('deleted') else 'NOT deleted'}"
+                  f"  {r.get('skipped') or r.get('why') or ''}"
+                  f"{'  STILL THERE: ' + '; '.join(r['remaining']) if r.get('remaining') else ''}")
+    return delete_exit_code(record)
+
+
+def _cmd_spawn(argv: list[str], force: bool, as_json: bool) -> int:
+    """Parses --spec, ranks targets, plans assignments, and spawns the new fan-out group."""
+    spec_raw = _take_value(argv, "--spec")
+    if not spec_raw:
+        print(__doc__.strip(), file=sys.stderr)
+        return 3
+    try:
+        spec = parse_spec(spec_raw)
+        per_account = int(_take_value(argv, "--per-account") or 1)
+        ranking = rank_targets(exclude=_take_values(argv, "--exclude"),
+                               only=_take_values(argv, "--only"),
+                               open_closed="--open-closed" in argv)
+    except ValueError as err:
+        print(f"REFUSED: {err}", file=sys.stderr)
+        return 3
+    assignments = plan(spec["tasks"], ranking["targets"], per_account)
+    group = spawn_group(spec, assignments, force=force, dry_run="--dry-run" in argv)
+    if as_json:
+        print(json.dumps({**group, "targets": ranking["targets"],
+                          "skippedTargets": ranking["skipped"],
+                          "usageSource": ranking["source"]}, indent=2))
+    else:
+        _print_plan(group, ranking)
+    if group.get("dryRun"):
+        return 0 if all(m.get("state") == "planned" for m in group["members"]) else 4
+    return spawn_exit_code(group)
+
+
 def main(argv: list[str]) -> int:
     clilib.use_utf8_console()
     if "--help" in argv or "-h" in argv:
@@ -732,95 +851,14 @@ def main(argv: list[str]) -> int:
 
     try:
         if cmd == "list":
-            rows = [{"id": g["id"], "name": g.get("name"), "createdAt": g.get("createdAt"),
-                     "dryRun": g.get("dryRun", False),
-                     "members": len(g.get("members", [])),
-                     "spawned": sum(1 for m in g.get("members", []) if m.get("sessionId")),
-                     "sends": len(g.get("sends", []))} for g in groups()]
-            if as_json:
-                print(json.dumps({"groups": rows}, indent=2))
-            else:
-                for r in rows:
-                    print(f"{r['id']}  {r.get('name') or '-':<24} {r['createdAt']}  "
-                          f"{r['spawned']}/{r['members']} spawned, {r['sends']} sends")
-                if not rows:
-                    print("no fan-outs recorded")
-            return 0
-
+            return _cmd_list(as_json)
         if cmd == "status":
-            group = find_group(words[1] if len(words) > 1 else None)
-            if not group:
-                print("REFUSED: no such fan-out group (fan_out list shows them)", file=sys.stderr)
-                return 3
-            s = status(group)
-            if as_json:
-                print(json.dumps(s, indent=2))
-            else:
-                _print_status(s)
-            return 0
-
+            return _cmd_status(words, as_json)
         if cmd == "send":
-            text = _take_value(argv, "--text")
-            if len(words) < 2 or not text or not text.strip():
-                print(__doc__.strip(), file=sys.stderr)
-                return 3
-            group = find_group(words[1])
-            if not group:
-                print("REFUSED: no such fan-out group (fan_out list shows them)", file=sys.stderr)
-                return 3
-            record = send(group, text.strip(), _take_values(argv, "--only"), force=force)
-            if as_json:
-                print(json.dumps({"id": group["id"], **record}, indent=2))
-            else:
-                for r in record["results"]:
-                    print(f"  [{r.get('index')}] {str(r.get('title'))[:40]:<40} "
-                          f"{'delivered' if r.get('delivered') else 'NOT delivered'}"
-                          f"  {r.get('route') or ''} {r.get('skipped') or r.get('error') or r.get('detail') or ''}")
-            return send_exit_code(record)
-
+            return _cmd_send(argv, words, as_json, force)
         if cmd == "delete":
-            if len(words) < 2:
-                print(__doc__.strip(), file=sys.stderr)
-                return 3
-            group = find_group(words[1])
-            if not group:
-                print("REFUSED: no such fan-out group (fan_out list shows them)", file=sys.stderr)
-                return 3
-            record = delete_group(group, force=force)
-            if as_json:
-                print(json.dumps(record, indent=2))
-            else:
-                for r in record["results"]:
-                    print(f"  [{r.get('index')}] {str(r.get('title'))[:40]:<40} "
-                          f"{'deleted' if r.get('deleted') else 'NOT deleted'}"
-                          f"  {r.get('skipped') or r.get('why') or ''}"
-                          f"{'  STILL THERE: ' + '; '.join(r['remaining']) if r.get('remaining') else ''}")
-            return delete_exit_code(record)
-
-        spec_raw = _take_value(argv, "--spec")
-        if not spec_raw:
-            print(__doc__.strip(), file=sys.stderr)
-            return 3
-        try:
-            spec = parse_spec(spec_raw)
-            per_account = int(_take_value(argv, "--per-account") or 1)
-            ranking = rank_targets(exclude=_take_values(argv, "--exclude"),
-                                   only=_take_values(argv, "--only"),
-                                   open_closed="--open-closed" in argv)
-        except ValueError as err:
-            print(f"REFUSED: {err}", file=sys.stderr)
-            return 3
-        assignments = plan(spec["tasks"], ranking["targets"], per_account)
-        group = spawn_group(spec, assignments, force=force, dry_run="--dry-run" in argv)
-        if as_json:
-            print(json.dumps({**group, "targets": ranking["targets"],
-                              "skippedTargets": ranking["skipped"],
-                              "usageSource": ranking["source"]}, indent=2))
-        else:
-            _print_plan(group, ranking)
-        if group.get("dryRun"):
-            return 0 if all(m.get("state") == "planned" for m in group["members"]) else 4
-        return spawn_exit_code(group)
+            return _cmd_delete(words, as_json, force)
+        return _cmd_spawn(argv, force, as_json)
     except hydralib.DaemonError as err:
         print(f"fan_out FAILED: {err}", file=sys.stderr)
         return 1

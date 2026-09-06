@@ -1031,6 +1031,11 @@ export interface ProviderSettings {
   codexDesktopEnabled: boolean
   codexCliEnabled: boolean
   chatGptHandoffEnabled: boolean
+  /** Keep every account's rolling 5-hour window ticking by spending one throwaway turn on any that
+   *  is idle. OFF by default — it is the only setting here that costs quota. */
+  keepaliveEnabled: boolean
+  /** Weekly-usage percentage at or above which an account is left alone by the keepalive. */
+  keepaliveWeeklyFloorPct: number
 }
 
 /** Bounded, secret-screened repository context returned for a manual ChatGPT handoff. */

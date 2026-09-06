@@ -310,6 +310,61 @@ create index if not exists idx_incidents_state on incidents(state);
   add('scan_version', 'integer')
 }
 
+// --- THE PERMANENT RECORD ------------------------------------------------------------------------
+//
+// ⛔ EVERYTHING ELSE IN THIS TIER IS A CACHE, AND A CACHE IS DELETED WHEN ITS FILE GOES. Claude Code
+// removes transcripts on its own schedule (`cleanupPeriodDays`, 30 days by default), and
+// warmSessionScanCache prunes every row whose transcript it can no longer glob. So a chat's entire
+// history — what it cost, how long it ran, which account paid for it — evaporated 30 days after it
+// finished, and the Analytics tab's "all time" quietly meant "the last month or so". Measured on the
+// machine this was written for: 35,943 transcripts on disk totalling 233.5B tokens, with NOTHING
+// older than 30 June, against a year of real use.
+//
+// This table is the opposite: written once per session as it is scanned, and NEVER pruned. When the
+// transcript disappears the row stays and is stamped `gone_at`, so the numbers outlive the file they
+// came from. It is what makes a lifetime total possible at all.
+//
+// Still not message text — same rule as the cache above. Numbers, ids, paths and dates only. About
+// a kilobyte a session: a hundred thousand sessions is ~100 MB, which is the right price for the
+// only copy of this history that will exist.
+db.exec(`
+create table if not exists session_stats (
+  session_key     text primary key,
+  session_id      text not null,
+  source          text not null,
+  tool            text,
+  project         text,
+  cwd             text,
+  title           text,
+  instance        text,
+  first_ts        integer,
+  last_ts         integer,
+  turns           integer,
+  input_tokens    integer,
+  cache_read      integer,
+  cache_write     integer,
+  output_tokens   integer,
+  weighted        real,
+  cost_usd        real,
+  active_ms       integer,
+  tool_calls      integer,
+  tool_errors     integer,
+  compactions     integer,
+  edit_count      integer,
+  files_touched   integer,
+  lines_added     integer,
+  lines_removed   integer,
+  size_bytes      integer,
+  tokens_json     text,
+  days_json       text,
+  first_seen_at   integer,
+  last_scanned_at integer,
+  gone_at         integer
+)
+`)
+db.exec('create index if not exists session_stats_last_ts on session_stats(last_ts)')
+db.exec('create index if not exists session_stats_gone on session_stats(gone_at)')
+
 // The recent-edits feed. Its own table, and the only unbounded-per-session list in the tier, so it
 // carries a GLOBAL row cap (analytics.ts pruneEdits) rather than growing with the store.
 db.exec(`
@@ -492,6 +547,13 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   // model opus + the ultracode keyword in the first prompt; explicit caller choice wins.
   new_chat_model: 'opus',
   new_chat_ultracode: '1',
+  // 5-hour window keepalive (server/src/session-keepalive.ts) — OFF by default, and this one is
+  // not a preference so much as a permission: it SPENDS a turn of real quota on an idle account
+  // to get its rolling 5-hour clock started, unattended. The floor is the guard that matters:
+  // an account at or above this weekly percentage is left alone, because burning the last of a
+  // weekly cap to start a window that refills the same day is exactly backwards.
+  keepalive_enabled: '0',
+  keepalive_weekly_floor: '80',
 }
 
 export function getSetting(key: string): string {

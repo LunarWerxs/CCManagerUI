@@ -55,6 +55,20 @@ export default {
   // Account-column hover. The handle is on the badge; this is where the full address and the
   // Anthropic profile display name live, so the column itself stays one comparable thing per row.
   accountTitleWithProfile: '{email}\nAnthropic profile name: {profile}',
+  // …and the badge copies that full address, because the handle it shows is not one: two accounts
+  // on different domains render the same chip, so the short form is for reading and the long form
+  // is for pasting.
+  accountCopyHint: 'Click to copy the full address.',
+  // A name you typed once overrides everything and nothing ever re-checked it, so an instance
+  // signed into a different account keeps the old account's name for good. The marker reports it;
+  // the ⋯ menu clears it. Deliberately not automatic — the override is still the user's choice.
+  labelStale: 'This name does not match the account',
+  labelStaleHint:
+    'You named this instance “{label}”, but it is signed into {account}. Names you type are kept until you change them, so this one stayed behind when the account did. Use “Name it after the account” in the ⋯ menu to drop it.',
+  useAccountName: 'Name it after the account',
+  toastUsingAccountName: 'Cleared the typed name. This instance is called “{name}” again.',
+  copyAccountEmailAria: 'Copy the account address {email}',
+  toastEmailCopied: 'Copied {email} — the account this instance is signed into.',
   openFolder: 'Open folder',
   createShortcut: 'Create desktop shortcut',
   checkUsage: 'Check usage',

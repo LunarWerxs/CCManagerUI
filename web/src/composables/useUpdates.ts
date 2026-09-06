@@ -41,6 +41,33 @@ const updateAvailable = computed(
 /** The version being offered, for the hint's label. Null when unknown. */
 const latestVersion = computed(() => availability.value?.latestVersion ?? null)
 
+/**
+ * Has the user looked at the update hint in THIS run of the app?
+ *
+ * A plain module-scope ref, deliberately: not useUiPrefs (which mirrors through the daemon) and not
+ * useAppSettings (which round-trips to /api/settings). Both of those survive a restart, and a
+ * dismissal that survives a restart is a dismissal you never see again — the dot would go quiet for
+ * good on the first click and stop being a signal. Living only in memory means it clears itself
+ * when the app is next opened, which is exactly the intended lifetime: "yes, I've seen it, stop
+ * nagging me for now."
+ *
+ * It deliberately does NOT record WHICH version was dismissed. Availability is re-read hourly, so a
+ * newer release arriving mid-session would otherwise have to fight a flag set for the previous one;
+ * on the next launch the dot returns for whatever is current, which is the simpler promise.
+ */
+const updateDotDismissed = ref(false)
+
+/** What the header should actually draw. Separate from {@link updateAvailable} so the FACT (there
+ *  is a newer version) stays available to anything that needs it — the Settings card still says so
+ *  in full — while only the nag is dismissible. */
+const showUpdateDot = computed(() => updateAvailable.value && !updateDotDismissed.value)
+
+/** Called when the user opens Settings from the dotted button: they are now looking at the thing
+ *  the dot was pointing at, so it has done its job for this session. */
+function dismissUpdateDot(): void {
+  updateDotDismissed.value = true
+}
+
 async function refreshAvailability(): Promise<void> {
   try {
     availability.value = await api.getUpdateAvailability()
@@ -183,6 +210,8 @@ export function useUpdates() {
     applyUpdate: applyUpdateWithProgress,
     availability,
     updateAvailable,
+    showUpdateDot,
+    dismissUpdateDot,
     latestVersion,
     refreshAvailability,
     startAvailabilityPolling,

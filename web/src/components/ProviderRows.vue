@@ -9,9 +9,10 @@
 // `showHandoff` is off in the toolbar flyout: the ChatGPT handoff is a button in the session
 // composer, not a section of the instances tab, and listing it beside four table toggles would say
 // it hides a table too.
-import { AppWindow, MessageCircleQuestion, Monitor, Terminal } from '@lucide/vue'
+import { AppWindow, Gauge, MessageCircleQuestion, Monitor, Terminal, Timer } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
+import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useAppSettings } from '@/composables/useAppSettings'
 import type { ProviderSettings, UsageSettings } from '@/lib/api'
@@ -27,6 +28,8 @@ const {
   codexDesktopEnabled,
   codexCliEnabled,
   chatGptHandoffEnabled,
+  keepaliveEnabled,
+  keepaliveWeeklyFloorPct,
   update: updateAppSettings,
 } = useAppSettings()
 
@@ -97,6 +100,43 @@ async function patchProvider(value: Partial<ProviderSettings>) {
       <Switch
         :model-value="chatGptHandoffEnabled"
         @update:model-value="(v: boolean) => patchProvider({ chatGptHandoffEnabled: v })"
+      />
+    </template>
+  </SettingsRow>
+
+  <!-- ⛔ THE ONE SWITCH ON THIS SCREEN THAT SPENDS MONEY. Everything else here shows or hides
+       something; this sends a real turn to an idle account to get its 5-hour clock running. The
+       hint says so in as many words, because a toggle that quietly costs quota is the kind of
+       thing you should never discover from a bill. -->
+  <SettingsRow :icon="Timer" :label="$t('settings.keepaliveLabel')">
+    <template #info>
+      <InfoHint :text="$t('settings.keepaliveHint')" />
+    </template>
+    <template #control>
+      <Switch
+        :model-value="keepaliveEnabled"
+        @update:model-value="(v: boolean) => patchProvider({ keepaliveEnabled: v })"
+      />
+    </template>
+  </SettingsRow>
+  <SettingsRow
+    v-if="keepaliveEnabled"
+    :icon="Gauge"
+    :label="$t('settings.keepaliveFloorLabel')"
+  >
+    <template #info>
+      <InfoHint :text="$t('settings.keepaliveFloorHint')" />
+    </template>
+    <template #control>
+      <Input
+        class="w-20"
+        type="number"
+        min="0"
+        max="100"
+        :model-value="keepaliveWeeklyFloorPct"
+        @update:model-value="
+          (v: string | number) => patchProvider({ keepaliveWeeklyFloorPct: Number(v) })
+        "
       />
     </template>
   </SettingsRow>

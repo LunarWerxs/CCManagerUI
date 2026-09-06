@@ -1,3 +1,4 @@
+import { markSessionGone } from './analytics'
 import { db } from './db'
 import { readForeignSession } from './foreign-sessions'
 import { readHermesSession } from './hermes-sessions'
@@ -1224,8 +1225,20 @@ export async function warmSessionScanCache(newest = 400): Promise<void> {
       .filter((r) => !live.has(r.path))
     if (dead.length) {
       const del = db.query('delete from session_scan_cache where cache_key = ?')
+      // The CACHE row goes — it describes a file revision that no longer exists. The PERMANENT
+      // record does not: it is stamped `gone_at` and keeps every number the chat ever had. Losing
+      // the cache is housekeeping; losing the history is what made "all time" mean "the last
+      // month", because Claude Code deletes transcripts after 30 days. See db.ts session_stats.
+      const gone = db.query<{ session_id: string; source: string }, [string]>(
+        'select session_id, source from session_scan_cache where cache_key = ?',
+      )
+      const now = Date.now()
       db.transaction(() => {
-        for (const r of dead) del.run(r.cache_key)
+        for (const r of dead) {
+          const row = gone.get(r.cache_key)
+          if (row?.session_id) markSessionGone.run(now, `${row.source}:${row.session_id}`)
+          del.run(r.cache_key)
+        }
       })()
     }
   } catch {

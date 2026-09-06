@@ -7,6 +7,91 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-09-06
+
+### Added
+
+- **A permanent record for every chat, which outlives the chat** (`server/src/db.ts`
+  `session_stats`, `server/src/analytics.ts`). Claude Code deletes transcripts on its own schedule
+  (`cleanupPeriodDays`, 30 days by default) and the scan cache was pruned along with them, so a
+  conversation's entire history (tokens, cost, how long it ran, which account paid for it)
+  evaporated a month after it finished, and the Analytics tab's "all time" quietly meant "the last
+  month". Measured on the machine this was written for: 35,943 transcripts on disk totalling 233.5B
+  tokens, with nothing older than 30 June, against a year of real use. Every scan now writes a row
+  that is NEVER pruned: tokens by kind, cost, first/last activity, turns, engaged time, tool calls
+  and errors, compactions, files touched, lines added and removed, size, and the instance that ran
+  it. When a transcript disappears the row is stamped `gone_at` instead of deleted, and the spend
+  report folds those rows back in, so a total stops shrinking when a file is cleaned up.
+
+- **Money or tokens, across the whole Analytics tab** (`web/src/components/AnalyticsView.vue`,
+  `composables/useAnalyticsPrefs.ts`). Several panels could only ever answer in dollars, so "how
+  many tokens went where" was unanswerable on a tab named Analytics. One switch changes the unit
+  everywhere; per-day, per-project and per-account token splits were added server-side to make that
+  possible. A panel with no token figures says so rather than drawing an empty chart, because blank
+  bars and "you spent nothing" look identical.
+
+- **A calendar grain for "when the work happens"** (`web/src/components/charts/CalendarGrid.vue`).
+  The hour-of-week heatmap collapses every date into a 7x24 rhythm and throws the calendar away, so
+  it could not answer "which weeks was I actually working" over a window of months. One square per
+  day, months across the top; the hour grid is one click away.
+
+- **Keep the 5-hour window running** (`server/src/session-keepalive.ts`). The rolling 5-hour quota
+  window only starts when an account is used, so an idle account makes you wait the full five hours
+  from the moment you need it. Opt-in, OFF by default, and it declines on its own terms: an account
+  whose window is already running is skipped, one at or above a weekly-percentage floor is skipped,
+  and an unreadable quota reading is a skip rather than a guess. Not a headless chat: it is the
+  same shape as the `/usage` probe that `headless-policy.ts` explicitly carves out, being one
+  throwaway prompt, the answer read, the transcript deleted.
+
+- **Click an account, get its address** (Instances tab, Codex table and the quick-instances window).
+  The column shows the email handle because that is what fits; clicking copies the full address,
+  which is the only form that identifies a login outside the app.
+
+- **Which account a chat is talking to**, on the open transcript (`useSessionAccount.ts`). A chip
+  under the title, and an account section at the top of the three-dot menu with "Open this account"
+  and "Copy the account address". Every instance runs a different login and the transcript pane
+  named none of them.
+
+### Changed
+
+- **Instance rows follow the login, not the profile's display name**
+  (`web/src/lib/instance-appearance.ts`). The Anthropic profile's `full_name` is whatever someone
+  typed into claude.ai, so a fleet named that way read "Toby", "Martin", "Michael Griswold":
+  friendly words that do not say which login each row is. Rows now use the email handle, and a
+  stored name that no longer matches the account it is signed into is flagged, with a one-click
+  "Name it after the account" in the three-dot menu.
+
+- **A time period on Analytics now means what it says** (`server/src/analytics.ts` `windowShare`).
+  The window was applied per SESSION on `last_ts`, so a session whose last turn landed inside it
+  contributed its ENTIRE life and one that ended a day earlier contributed nothing, not even the
+  part that was inside. Every panel now takes the same day-proportioned slice, so the headline, the
+  per-model split and the day chart cannot disagree. A sub-day window is answered at day
+  granularity, which is the resolution a stored row actually has.
+
+- **The settings dot explains itself.** Clicking the header's gear while an update is waiting
+  scrolls to the Updates card and pulses it, and the dot goes quiet for the rest of the session,
+  returning on the next launch because the update is still there.
+
+- **The Focus button carries the running dot** the status column already shows, on both the Claude
+  and Codex tables.
+
+### Fixed
+
+- **`default` and `other` are refused as instance names** (`server/src/core/lifecycle.ts`). Both are
+  words the app already uses to mean something other than a folder: `default` is the regular
+  non-isolated Claude Desktop, `other` is the sessions filter's no-instance scope. An instance
+  taking either could not be told apart from it, and nothing failed loudly: a chat in a folder
+  called `default` was indistinguishable from one in the real default install.
+
+- **The regular Claude Desktop is identifiable** (`CMInstance.isDefault`). A session records its
+  instance as a folder name or the literal `default`, and nothing on the instance row could match
+  the second, so the app had no honest way to name that account. One shared helper now answers "is
+  this the regular install?" for the row, the quit guard and the delete guard, which each kept their
+  own copy, and it folds case only on Windows, matching `normalizePath`. The old copies folded it
+  everywhere, which on Linux and macOS made a differently-cased folder look like the default
+  profile.
+
+
 ### Added
 
 - **The courier lane, entered here late** (`orchestrator/scripts/courier.py`, `stage_reply.py`,

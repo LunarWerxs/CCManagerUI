@@ -86,6 +86,14 @@ export default {
   codexDesktopProviderHint: 'Show desktop launch, focus, quit, and running status for Codex.',
   codexCliProviderLabel: 'Codex CLI',
   codexCliProviderHint: 'Show Codex CLI launch and login actions.',
+  // ⛔ THE ONLY SETTING ON THIS SCREEN THAT SPENDS QUOTA. Say so plainly: a toggle whose cost you
+  // discover later is a toggle that should not have existed.
+  keepaliveLabel: 'Keep the 5-hour window running',
+  keepaliveHint:
+    'The 5-hour quota window only starts when an account is used, so an idle account makes you wait the full five hours from the moment you need it. This sends ONE throwaway prompt to any account whose window is not running, which costs a small amount of real quota each time. Off by default. It never touches an account whose window is already running.',
+  keepaliveFloorLabel: 'Leave alone above (weekly %)',
+  keepaliveFloorHint:
+    'Accounts at or above this share of their WEEKLY cap are skipped. The weekly window is the one that matters — a 5-hour window refills the same day — so spending the last of a weekly allowance to start one is a bad trade. Set 0 to stop the keepalive spending on anything.',
   chatGptHandoffLabel: 'ChatGPT handoff',
   chatGptHandoffHint:
     'Adds a composer action that downloads a bounded, secret-screened repository context file, copies the task prompt, and opens ChatGPT. You still review and submit everything manually.',

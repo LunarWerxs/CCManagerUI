@@ -107,9 +107,43 @@ useShortcuts([
 ])
 
 // settings + queue share the right edge; usePanels keeps them mutually exclusive
-const { settingsOpen, queueOpen } = usePanels()
+const { settingsOpen, queueOpen, openSettingsTab } = usePanels()
 // The passive "a newer version exists" signal — see the dot on the Settings button below.
-const { updateAvailable, startAvailabilityPolling, stopAvailabilityPolling } = useUpdates()
+const {
+  updateAvailable,
+  showUpdateDot,
+  dismissUpdateDot,
+  startAvailabilityPolling,
+  stopAvailabilityPolling,
+} = useUpdates()
+
+/**
+ * Opening Settings from the header button.
+ *
+ * With an update waiting this is a DEEP LINK rather than a plain toggle: the dot is the only
+ * thing telling you a new version exists and it says nothing about what or why, so the click it
+ * invites should land on the answer. openSettingsTab scrolls to the updates card and pulses it
+ * (SettingsView's flashSection), and the dot goes quiet for the rest of this run — it has been
+ * seen. Next launch it comes back, because the update is still there.
+ *
+ * With nothing waiting it stays an ordinary open/close toggle: deep-linking every click would
+ * yank a user who just wanted the top of the page down to a card they did not ask for.
+ */
+function onSettingsButton() {
+  // Already open: this click means CLOSE, whatever the dot says. Deep-linking here would make the
+  // button stop closing the panel for as long as an update is pending, which is the button's
+  // primary job.
+  if (settingsOpen.value) {
+    settingsOpen.value = false
+    return
+  }
+  if (showUpdateDot.value) {
+    dismissUpdateDot()
+    openSettingsTab('updates')
+    return
+  }
+  settingsOpen.value = true
+}
 const anyPanelOpen = computed(() => settingsOpen.value || queueOpen.value)
 const { wide } = useShellWidth()
 // widthPx drives the content shift, the --content-inset-right var, and both panels'
@@ -298,11 +332,11 @@ onUnmounted(stopAvailabilityPolling)
           class="relative"
           :title="updateAvailable ? $t('app.settingsUpdateAvailable') : $t('app.settings')"
           :aria-pressed="settingsOpen"
-          @click="settingsOpen = !settingsOpen"
+          @click="onSettingsButton"
         >
           <Settings2 />
           <span
-            v-if="updateAvailable"
+            v-if="showUpdateDot"
             class="absolute right-0.5 top-0.5 size-2 rounded-full bg-info ring-2 ring-background"
           />
         </Button>

@@ -68,15 +68,21 @@ export function __resetGatewayForTests(): void {
   statusTimer = undefined
 }
 
-/** Resolves once `delay` has passed, `false` if a newer `connect()` superseded this wait. */
+/** Resolves once `delay` has passed, `false` if a newer `connect()` superseded this wait.
+ *
+ *  `Promise.withResolvers()` rather than reaching into a `new Promise` executor to smuggle its
+ *  `resolve` out to module scope: the resolver genuinely has to outlive the constructor here (a
+ *  newer connect() settles this wait early, see reset above), and that is precisely the case
+ *  withResolvers exists for. The hand-rolled form has to be read twice to see that the capture is
+ *  deliberate rather than a leak. */
 function wait(delay: number, gen: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    pendingWaitResolve = resolve
-    reconnectTimer = setTimeout(() => {
-      pendingWaitResolve = undefined
-      resolve(gen === connectGeneration)
-    }, delay)
-  })
+  const { promise, resolve } = Promise.withResolvers<boolean>()
+  pendingWaitResolve = resolve
+  reconnectTimer = setTimeout(() => {
+    pendingWaitResolve = undefined
+    resolve(gen === connectGeneration)
+  }, delay)
+  return promise
 }
 
 export function useGateway() {

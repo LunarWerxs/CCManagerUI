@@ -1545,7 +1545,83 @@ function collectTailEventsFromRaw(
   return { events: collected.reverse().flat(), cwd }
 }
 
-/** Read the last `limit` real turns of a session's transcript, thinking filtered out. */
+/**
+ * The result shape every branch of tailTranscript returns.
+ *
+ * Extracted because it was written out six times with the same four fallback chains, and a chain
+ * copied six times is a chain that will eventually differ in one of them — the title and cwd
+ * fallbacks in particular (`opts` first, then whatever the index knows, then the id) are behaviour,
+ * not formatting. One place to read them, one place to change them.
+ */
+function tailResult(
+  sessionId: string,
+  tf: TranscriptFile,
+  opts: TailOptions,
+  events: TailEvent[],
+  error?: string,
+): TailResult {
+  return {
+    session_id: sessionId,
+    source: tf.source,
+    title: opts.title ?? tf.title ?? sessionId,
+    cwd: opts.cwd ?? tf.cwd ?? '',
+    events,
+    ...(error ? { error } : {}),
+  }
+}
+
+/** Foreign adapters return the WHOLE conversation; these stores are small enough that a windowed
+ *  read would add a code path for no gain. */
+function tailForeignStore(
+  sessionId: string,
+  tf: TranscriptFile,
+  opts: TailOptions,
+  keep: (e: TailEvent) => boolean,
+  limit: number,
+): TailResult {
+  const events = readForeignSession(tf.tool ?? '', tf.path)
+    .filter(keep)
+    .slice(-limit)
+  return tailResult(sessionId, tf, opts, events)
+}
+
+/** Hermes: `tf.path` is passed through because a Hermes profile is a SEPARATE database from the
+ *  default store, so reading without it would silently answer from the wrong one whenever more
+ *  than one store exists. */
+function tailHermesStore(
+  sessionId: string,
+  tf: TranscriptFile,
+  opts: TailOptions,
+  keep: (e: TailEvent) => boolean,
+  limit: number,
+): TailResult {
+  const content = readHermesSession(sessionId, tf.path)
+  if (!content) return tailResult(sessionId, tf, opts, [], 'transcript not found')
+  return tailResult(sessionId, tf, opts, content.events.filter(keep).slice(-limit))
+}
+
+/** OpenCode: `tf.path` is THE store (audit AH-34). Kilo, MiMo Code and IcodeMate are
+ *  OpenCode-format stores with their own databases, and discovery already put each row's database
+ *  here. Reading the default OpenCode database instead answered "transcript not found" for every
+ *  session those products had, and a colliding id would have shown the wrong product's chat. */
+function tailOpenCodeStore(
+  sessionId: string,
+  tf: TranscriptFile,
+  opts: TailOptions,
+  keep: (e: TailEvent) => boolean,
+  limit: number,
+): TailResult {
+  const content = readOpenCodeSession(sessionId, tf.path)
+  if (!content) return tailResult(sessionId, tf, opts, [], 'transcript not found')
+  return tailResult(sessionId, tf, opts, content.events.filter(keep).slice(-limit))
+}
+
+/** Read the last `limit` real turns of a session's transcript, thinking filtered out.
+ *
+ *  One branch per STORE KIND, each in its own helper above: the stores answer the same question in
+ *  genuinely different ways (a database read, an adapter, a windowed byte read off the end of a
+ *  .jsonl), and inlining all four put this function over the complexity gate while hiding which
+ *  fallbacks belonged to which store. */
 export async function tailTranscript(
   sessionId: string,
   opts: TailOptions = {},
@@ -1560,6 +1636,8 @@ export async function tailTranscript(
   // poll — or, before the sweep became async, freeze the daemon while it looked.
   const tf = await findTranscriptAsync(sessionId, source, locator)
   if (!tf) {
+    // No row at all, so there is no TranscriptFile to take a title or cwd from — this is the one
+    // return that cannot go through tailResult().
     return {
       session_id: sessionId,
       source: source ?? 'claude',
@@ -1569,69 +1647,11 @@ export async function tailTranscript(
       error: 'transcript not found',
     }
   }
-  if (tf.source === 'foreign') {
-    // Each adapter returns the whole conversation; these stores are small enough that a windowed
-    // read would add a code path for no gain.
-    const events = readForeignSession(tf.tool ?? '', tf.path)
-      .filter(keep)
-      .slice(-limit)
-    return {
-      session_id: sessionId,
-      source: tf.source,
-      title: opts.title ?? tf.title ?? sessionId,
-      cwd: opts.cwd ?? tf.cwd ?? '',
-      events,
-    }
-  }
-  if (tf.source === 'hermes') {
-    // Unlike readOpenCodeSession above, tf.path is passed through: a Hermes profile is a SEPARATE
-    // database from the default store, so reading without it would silently answer from the wrong
-    // one whenever more than one store exists.
-    const content = readHermesSession(sessionId, tf.path)
-    if (!content) {
-      return {
-        session_id: sessionId,
-        source: tf.source,
-        title: opts.title ?? tf.title ?? sessionId,
-        cwd: opts.cwd ?? tf.cwd ?? '',
-        events: [],
-        error: 'transcript not found',
-      }
-    }
-    const events = content.events.filter(keep).slice(-limit)
-    return {
-      session_id: sessionId,
-      source: tf.source,
-      title: opts.title ?? tf.title ?? sessionId,
-      cwd: opts.cwd ?? tf.cwd ?? '',
-      events,
-    }
-  }
-  if (tf.source === 'opencode') {
-    // tf.path is THE store (audit AH-34): Kilo, MiMo Code and IcodeMate are OpenCode-format
-    // stores with their own databases, and discovery already put each row's database here.
-    // Reading the default OpenCode database instead answered "transcript not found" for every
-    // session those products had, and a colliding id would have shown the wrong product's chat.
-    const content = readOpenCodeSession(sessionId, tf.path)
-    if (!content) {
-      return {
-        session_id: sessionId,
-        source: tf.source,
-        title: opts.title ?? tf.title ?? sessionId,
-        cwd: opts.cwd ?? tf.cwd ?? '',
-        events: [],
-        error: 'transcript not found',
-      }
-    }
-    const events = content.events.filter(keep).slice(-limit)
-    return {
-      session_id: sessionId,
-      source: tf.source,
-      title: opts.title ?? tf.title ?? sessionId,
-      cwd: opts.cwd ?? tf.cwd ?? '',
-      events,
-    }
-  }
+  if (tf.source === 'foreign') return tailForeignStore(sessionId, tf, opts, keep, limit)
+  if (tf.source === 'hermes') return tailHermesStore(sessionId, tf, opts, keep, limit)
+  if (tf.source === 'opencode') return tailOpenCodeStore(sessionId, tf, opts, keep, limit)
+
+  // Claude and Codex: a real .jsonl on disk, read from the END rather than parsed whole.
   const raw = await readTailBytes(tf.path, 6 * 1024 * 1024)
   const { events, cwd: rawCwd } = collectTailEventsFromRaw(raw, tf.source, filter, keep, limit)
   const title = opts.title || sessionId

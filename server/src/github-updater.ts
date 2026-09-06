@@ -839,14 +839,27 @@ export interface ApplyUpdateDeps {
   move?: (from: string, to: string) => void
 }
 
-export async function applyUpdate(deps: ApplyUpdateDeps = {}): Promise<UpdateApplyResult> {
-  const doCheckForUpdate = deps.checkForUpdate ?? checkForUpdate
-  const doFetchLatestRelease = deps.fetchLatestRelease ?? fetchLatestRelease
-  const doDownloadAndVerifyUpdate = deps.downloadAndVerifyUpdate ?? downloadAndVerifyUpdate
-  const isOrchestratorBusy = deps.orchestratorBusy ?? orchestratorBusy
-  const rename = deps.rename ?? renameSync
-  const move = deps.move ?? ((from: string, to: string) => moveInto(from, to, rename))
+/** What an update needs before anything on disk is touched: which version, and the two assets that
+ *  prove it. Anything short of all three is a refusal, returned as the failure itself. */
+interface ResolvedUpdate {
+  remoteVersion: string
+  asset: GhAsset
+  sums: GhAsset
+  stamp: string
+}
 
+/**
+ * Decide WHAT to install, touching nothing.
+ *
+ * Split from the install itself because the two halves fail for completely different reasons and at
+ * completely different costs: everything here is a refusal with the disk untouched, while every
+ * failure below has to be rolled back. Keeping them in one function is what put applyUpdate over
+ * the complexity gate, and it also made it hard to see that this half can never leave a mess.
+ */
+async function resolveUpdateToApply(
+  doCheckForUpdate: NonNullable<ApplyUpdateDeps['checkForUpdate']>,
+  doFetchLatestRelease: NonNullable<ApplyUpdateDeps['fetchLatestRelease']>,
+): Promise<ResolvedUpdate | UpdateApplyResult> {
   beginUpdateProgress('Checking for the latest release…')
   const status = await doCheckForUpdate({ fresh: true })
   if (!status.ok) return fail(status.reason ?? 'update check failed')
@@ -876,12 +889,114 @@ export async function applyUpdate(deps: ApplyUpdateDeps = {}): Promise<UpdateApp
       `v${remoteVersion} published no ${CHECKSUM_MANIFEST}, so the download cannot be verified - refusing to update`,
     )
 
-  const exePath = deps.exePath ?? process.execPath
-  const exeName = basename(exePath)
-  const bundledExeName = process.platform === 'win32' ? 'AgentHydra.exe' : 'agenthydra'
-  const installDir = deps.installDir ?? APP_ROOT
-  const staging = join(installDir, '.update-staging')
-  const stamp = String(status.checkedAt) // Date.now() is unavailable here; reuse the check time
+  // Date.now() is unavailable here; reuse the check time as the swap-aside stamp.
+  return { remoteVersion, asset, sums, stamp: String(status.checkedAt) }
+}
+
+/**
+ * The swap itself: components aside, exe aside, new exe in, reconcile, tidy up.
+ *
+ * Every line here can throw, and the caller's catch is what puts the install back — so this
+ * function's ONE job beyond moving files is to report what it has moved aside before it fails.
+ * `recordExeAside` exists for exactly that: the exe rename is the point of no return, and the
+ * caller cannot roll it back unless it learns the aside path the instant it is created.
+ */
+async function swapInBundle(
+  prepared: { newExe: string; bundleDirPath: string | null },
+  resolved: ResolvedUpdate,
+  ctx: {
+    exePath: string
+    exeName: string
+    installDir: string
+    staging: string
+    isOrchestratorBusy: () => boolean
+    rename: RenameFn
+    move: (from: string, to: string) => void
+  },
+  output: string[],
+  componentAsides: ComponentAside[],
+  recordExeAside: (aside: string) => void,
+): Promise<UpdateApplyResult> {
+  const { remoteVersion, stamp } = resolved
+  const { exePath, exeName, installDir, staging, rename, move } = ctx
+  const { newExe, bundleDirPath } = prepared
+  const bundleDir = bundleDirPath ?? staging
+  setUpdatePhase('installing', `Installing v${remoteVersion}…`)
+
+  // A toolbox script mid-run executes out of orchestrator/; replacing that folder under it
+  // is not an update, it is a crash with a good excuse. Refuse and let the next tick retry.
+  if (ctx.isOrchestratorBusy())
+    return fail(
+      'an orchestrator script is running through this daemon; the update would replace the code it is executing - retry when it finishes',
+    )
+
+  // --- 1. swap-strategy components (orchestrator/), each rollbackable ---
+  for (const comp of RELEASE_COMPONENTS) {
+    if (comp.strategy !== 'swap') continue
+    const aside = swapComponent(bundleDir, installDir, comp, stamp, remoteVersion, output)
+    if (aside) componentAsides.push(aside)
+  }
+
+  // --- 2. swap the exe (rename-aside is allowed on a running Windows image) ---
+  const exeAside = join(installDir, `${exeName}.old-${stamp}`)
+  rename(exePath, exeAside)
+  recordExeAside(exeAside)
+  move(newExe, exePath)
+  if (process.platform !== 'win32') {
+    try {
+      await run('chmod', ['+x', exePath])
+    } catch {
+      /* best-effort; the bundle already ships it executable */
+    }
+  }
+  output.push(`installed v${remoteVersion}`)
+
+  // --- 3. reconcile-strategy components (misc/), best-effort and last: nothing below can fail
+  //        the update, and everything above it is already consistent. ---
+  for (const comp of RELEASE_COMPONENTS) {
+    if (comp.strategy !== 'reconcile') continue
+    reconcileComponent(bundleDir, installDir, comp, remoteVersion, output)
+  }
+
+  // The previous component copies are only garbage once the whole update has landed.
+  for (const { aside } of componentAsides) rmSync(aside, { recursive: true, force: true })
+  rmSync(staging, { recursive: true, force: true })
+  cached = null // force the next check to re-read the (now-current) version
+  finishUpdateProgress(true, `Updated to v${remoteVersion}. Restarting…`)
+  return {
+    ok: true,
+    message: `Updated to v${remoteVersion}. Restarting…`,
+    restartRequired: true,
+    status: baseStatus({ currentVersion: remoteVersion, updateAvailable: false }),
+    output,
+  }
+}
+
+/**
+ * Put the verified bundle in place, or leave the install exactly as it was.
+ *
+ * EVERY failure past this point has to roll back, which is the whole reason it is one function with
+ * one try/catch: the aside paths it records are the only record that a swap was half-done, and
+ * splitting the rollback away from the moves that need it is how an installer ends up bricked.
+ */
+async function installVerifiedUpdate(
+  resolved: ResolvedUpdate,
+  ctx: {
+    exePath: string
+    exeName: string
+    bundledExeName: string
+    installDir: string
+    staging: string
+    doDownloadAndVerifyUpdate: NonNullable<ApplyUpdateDeps['downloadAndVerifyUpdate']>
+    isOrchestratorBusy: () => boolean
+    rename: RenameFn
+    move: (from: string, to: string) => void
+  },
+): Promise<UpdateApplyResult> {
+  // stamp / move / exeName are the SWAP's business now (see swapInBundle); this function keeps only
+  // what its own two jobs need — starting the download, and undoing whatever the swap got through.
+  const { remoteVersion, asset, sums } = resolved
+  const { exePath, exeName, installDir, staging, rename } = ctx
   const output: string[] = []
 
   // Staged renames-aside, tracked so a mid-swap failure can roll them back.
@@ -889,67 +1004,19 @@ export async function applyUpdate(deps: ApplyUpdateDeps = {}): Promise<UpdateApp
   const componentAsides: ComponentAside[] = []
 
   try {
-    const prepared = await doDownloadAndVerifyUpdate(
+    const prepared = await ctx.doDownloadAndVerifyUpdate(
       asset,
       sums,
       remoteVersion,
       staging,
-      bundledExeName,
+      ctx.bundledExeName,
       exeName,
       output,
     )
     if (!('newExe' in prepared)) return prepared
-    const { newExe, bundleDirPath } = prepared
-    const bundleDir = bundleDirPath ?? staging
-    setUpdatePhase('installing', `Installing v${remoteVersion}…`)
-
-    // A toolbox script mid-run executes out of orchestrator/; replacing that folder under it
-    // is not an update, it is a crash with a good excuse. Refuse and let the next tick retry.
-    if (isOrchestratorBusy())
-      return fail(
-        'an orchestrator script is running through this daemon; the update would replace the code it is executing - retry when it finishes',
-      )
-
-    // --- 1. swap-strategy components (orchestrator/), each rollbackable ---
-    for (const comp of RELEASE_COMPONENTS) {
-      if (comp.strategy !== 'swap') continue
-      const aside = swapComponent(bundleDir, installDir, comp, stamp, remoteVersion, output)
-      if (aside) componentAsides.push(aside)
-    }
-
-    // --- 2. swap the exe (rename-aside is allowed on a running Windows image) ---
-    exeMovedAside = join(installDir, `${exeName}.old-${stamp}`)
-    rename(exePath, exeMovedAside)
-    move(newExe, exePath)
-    if (process.platform !== 'win32') {
-      try {
-        await run('chmod', ['+x', exePath])
-      } catch {
-        /* best-effort; the bundle already ships it executable */
-      }
-    }
-    output.push(`installed v${remoteVersion}`)
-
-    // --- 3. reconcile-strategy components (misc/), best-effort and last: nothing below can fail
-    //        the update, and everything above it is already consistent. ---
-    for (const comp of RELEASE_COMPONENTS) {
-      if (comp.strategy !== 'reconcile') continue
-      reconcileComponent(bundleDir, installDir, comp, remoteVersion, output)
-    }
-
-    // The previous component copies are only garbage once the whole update has landed.
-    for (const { aside } of componentAsides) rmSync(aside, { recursive: true, force: true })
-    rmSync(staging, { recursive: true, force: true })
-    cached = null // force the next check to re-read the (now-current) version
-    finishUpdateProgress(true, `Updated to v${remoteVersion}. Restarting…`)
-
-    return {
-      ok: true,
-      message: `Updated to v${remoteVersion}. Restarting…`,
-      restartRequired: true,
-      status: baseStatus({ currentVersion: remoteVersion, updateAvailable: false }),
-      output,
-    }
+    return await swapInBundle(prepared, resolved, ctx, output, componentAsides, (aside) => {
+      exeMovedAside = aside
+    })
   } catch (e) {
     // Roll back anything we moved aside so the install is never left half-swapped: the
     // executable, then the components that were swapped before it (newest first).
@@ -964,6 +1031,33 @@ export async function applyUpdate(deps: ApplyUpdateDeps = {}): Promise<UpdateApp
     rollbackComponents(installDir, componentAsides)
     return fail(`update failed: ${e instanceof Error ? e.message : String(e)}`)
   }
+}
+
+export async function applyUpdate(deps: ApplyUpdateDeps = {}): Promise<UpdateApplyResult> {
+  const doCheckForUpdate = deps.checkForUpdate ?? checkForUpdate
+  const doFetchLatestRelease = deps.fetchLatestRelease ?? fetchLatestRelease
+  const doDownloadAndVerifyUpdate = deps.downloadAndVerifyUpdate ?? downloadAndVerifyUpdate
+  const isOrchestratorBusy = deps.orchestratorBusy ?? orchestratorBusy
+  const rename = deps.rename ?? renameSync
+  const move = deps.move ?? ((from: string, to: string) => moveInto(from, to, rename))
+
+  const resolved = await resolveUpdateToApply(doCheckForUpdate, doFetchLatestRelease)
+  // A refusal is already a finished result; only a ResolvedUpdate carries a version to install.
+  if (!('remoteVersion' in resolved)) return resolved
+
+  const exePath = deps.exePath ?? process.execPath
+  const installDir = deps.installDir ?? APP_ROOT
+  return installVerifiedUpdate(resolved, {
+    exePath,
+    exeName: basename(exePath),
+    bundledExeName: process.platform === 'win32' ? 'AgentHydra.exe' : 'agenthydra',
+    installDir,
+    staging: join(installDir, '.update-staging'),
+    doDownloadAndVerifyUpdate,
+    isOrchestratorBusy,
+    rename,
+    move,
+  })
 }
 
 /** Delete leftover `*.old-*` swap artifacts + a stale staging dir. Best-effort, run at boot. */

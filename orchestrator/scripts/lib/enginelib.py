@@ -257,6 +257,56 @@ def _blocks_text(ev: dict) -> list[tuple[str, str]]:
     return out
 
 
+def _locate_transcript(match: dict, transcript_path: str | None) -> tuple[str | None, dict | None]:
+    """Decide which transcript to scan, or hand back the scanned=False result if none exists."""
+    if transcript_path is None:
+        try:
+            transcript_path = gatelib.transcript_for_match(match, hydralib.session_row)
+        except hydralib.DaemonError as err:
+            return None, {"scanned": False, "outstanding": [], "launched": 0, "notified": 0,
+                    "why": f"could not locate the transcript ({err})"}
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None, {"scanned": False, "outstanding": [], "launched": 0, "notified": 0,
+                "why": "no transcript on disk to scan"}
+    return transcript_path, None
+
+
+def _record_background_event(ev: dict, engine_started, launched: dict, notified: set) -> int:
+    """Fold one transcript event into launched/notified; returns 1 for an unparsed job, else 0."""
+    unparsed = 0
+    for kind, text in _blocks_text(ev):
+        for nid in _BG_NOTIFIED.findall(text):
+            notified.add(nid)
+        if kind != "tool_result":
+            continue
+        is_job = bool(_BG_LAUNCH_WORD.search(text))
+        is_agent = bool(_BG_AGENT_WORKING.search(text)) and bool(_BG_AGENT_ID.search(text))
+        if not (is_job or is_agent):
+            continue
+        if gatelib._predates({"ts": ev.get("timestamp")}, engine_started):
+            continue  # a job of a previous engine: dead, not outstanding
+        ids = (_BG_LAUNCH_ID.findall(text) if is_job else []) + \
+              (_BG_AGENT_ID.findall(text) if is_agent else [])
+        if ids:
+            for lid in ids:
+                launched[lid] = True
+        else:
+            unparsed += 1
+    return unparsed
+
+
+def _summarize_background_scan(launched: dict, notified: set, unparsed: int) -> dict:
+    """Turn collected launch/notify state into the scanned=True result, ids and prose alike."""
+    outstanding = sorted(i for i in launched if i not in notified)
+    if unparsed:
+        outstanding.append(f"unparsed x{unparsed}")
+    why = ("no background job outstanding" if not outstanding else
+           f"{len(outstanding)} background job(s) launched and not yet reported back: "
+           + ", ".join(outstanding[:5]))
+    return {"scanned": True, "outstanding": outstanding, "launched": len(launched),
+            "notified": len(notified), "why": why}
+
+
 def background_work(match: dict, transcript_path: str | None = None) -> dict:
     """Is this chat's engine waiting on a background job it launched?
 
@@ -265,15 +315,9 @@ def background_work(match: dict, transcript_path: str | None = None) -> dict:
     treat it as "no background work". Launches recorded BEFORE the live engine started are
     dead (a resume boots a fresh process; the old jobs' notifications will never arrive) and
     are not counted, the same rule gatelib applies to a pending tool call."""
-    if transcript_path is None:
-        try:
-            transcript_path = gatelib.transcript_for_match(match, hydralib.session_row)
-        except hydralib.DaemonError as err:
-            return {"scanned": False, "outstanding": [], "launched": 0, "notified": 0,
-                    "why": f"could not locate the transcript ({err})"}
-    if not transcript_path or not os.path.exists(transcript_path):
-        return {"scanned": False, "outstanding": [], "launched": 0, "notified": 0,
-                "why": "no transcript on disk to scan"}
+    transcript_path, early_result = _locate_transcript(match, transcript_path)
+    if early_result is not None:
+        return early_result
     live = match.get("live") or {}
     engine_started = gatelib._epoch_s(live.get("startedAt") or live.get("startedAtMs"))
     launched: dict[str, bool] = {}   # id -> still outstanding
@@ -294,32 +338,8 @@ def background_work(match: dict, transcript_path: str | None = None) -> dict:
                     continue
                 if not isinstance(ev, dict) or ev.get("isSidechain") is True:
                     continue
-                for kind, text in _blocks_text(ev):
-                    for nid in _BG_NOTIFIED.findall(text):
-                        notified.add(nid)
-                    if kind != "tool_result":
-                        continue
-                    is_job = bool(_BG_LAUNCH_WORD.search(text))
-                    is_agent = bool(_BG_AGENT_WORKING.search(text)) and bool(_BG_AGENT_ID.search(text))
-                    if not (is_job or is_agent):
-                        continue
-                    if gatelib._predates({"ts": ev.get("timestamp")}, engine_started):
-                        continue  # a job of a previous engine: dead, not outstanding
-                    ids = (_BG_LAUNCH_ID.findall(text) if is_job else []) + \
-                          (_BG_AGENT_ID.findall(text) if is_agent else [])
-                    if ids:
-                        for lid in ids:
-                            launched[lid] = True
-                    else:
-                        unparsed += 1
+                unparsed += _record_background_event(ev, engine_started, launched, notified)
     except OSError as err:
         return {"scanned": False, "outstanding": [], "launched": 0, "notified": 0,
                 "why": f"transcript unreadable ({err})"}
-    outstanding = sorted(i for i in launched if i not in notified)
-    if unparsed:
-        outstanding.append(f"unparsed x{unparsed}")
-    why = ("no background job outstanding" if not outstanding else
-           f"{len(outstanding)} background job(s) launched and not yet reported back: "
-           + ", ".join(outstanding[:5]))
-    return {"scanned": True, "outstanding": outstanding, "launched": len(launched),
-            "notified": len(notified), "why": why}
+    return _summarize_background_scan(launched, notified, unparsed)

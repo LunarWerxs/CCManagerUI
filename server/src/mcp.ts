@@ -1877,7 +1877,7 @@ export const TOOLS: McpEngineTool[] = [
   {
     name: 'orchestrator_menu',
     description:
-      "READ-ONLY: the orchestrator's own menu - every script it has, grouped OBSERVE (reads only) / ACT (behind the rails) / the loop / the tray switch - plus where the toolbox lives and whether python answers. Read this once before orchestrator_run; the script names here are the only ones it accepts.",
+      "READ-ONLY: the orchestrator's own menu - every script it has, grouped OBSERVE (reads only) / ACT (behind the rails) / the loop / the tray switch - plus where the toolbox lives and whether python answers. Read this once before orchestrator_run; the script names here are the only ones it accepts. PREFER `actions` OVER `menu`: it is the same list as DATA, one row per script with its kind (observe/mutate), summary, guards and what its exit codes mean, so nothing has to parse the prose. `actions: null` means it could NOT be read, and `actionsError` says why - it never means the toolbox has no scripts.",
     inputSchema: S(),
     run: () => api('/api/orchestrator'),
   },

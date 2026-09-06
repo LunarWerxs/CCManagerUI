@@ -331,6 +331,10 @@ app.post('/api/settings', async (c) => {
     codexCliEnabled: typeof body.codexCliEnabled === 'boolean' ? body.codexCliEnabled : undefined,
     chatGptHandoffEnabled:
       typeof body.chatGptHandoffEnabled === 'boolean' ? body.chatGptHandoffEnabled : undefined,
+    keepaliveEnabled:
+      typeof body.keepaliveEnabled === 'boolean' ? body.keepaliveEnabled : undefined,
+    keepaliveWeeklyFloorPct:
+      typeof body.keepaliveWeeklyFloorPct === 'number' ? body.keepaliveWeeklyFloorPct : undefined,
   })
   // Notifications: whitelisted field by field, same as the blocks above. setNotificationSettings
   // ignores anything absent, so a patch touching one toggle leaves the rest (and the stored SMTP

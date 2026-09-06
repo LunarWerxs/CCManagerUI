@@ -229,6 +229,17 @@ function copyInstanceNumber(num: number) {
   navigator.clipboard?.writeText(String(num)).catch(() => {})
   toast.success(t('instances.toastNumberCopied', { num }))
 }
+
+/** Copy the ChatGPT address this CODEX_HOME is signed in with — the same click the Claude table's
+ *  account column has, so "click the account, get the address" is one habit across the whole tab
+ *  rather than a Claude-only trick. Silent no-op with nothing resolved; the cell is only a button
+ *  when there is an address behind it. */
+function copyAccountEmail(instance: CodexInstance) {
+  const email = instance.account?.email?.trim()
+  if (!email) return
+  navigator.clipboard?.writeText(email).catch(() => {})
+  toast.success(t('instances.toastEmailCopied', { email }))
+}
 async function onQuitDesktop(instance: CodexInstance) {
   const result = await quitDesktop(instance.id)
   if (result?.ok) toast.success(t('codexInstances.toastDesktopQuit'))
@@ -381,9 +392,29 @@ onUnmounted(stopPolling)
                first paint with no per-row request. -->
           <TableCell class="max-w-[16rem] text-xs">
             <template v-if="instance.account?.email || instance.account?.name">
-              <div class="truncate font-medium">
+              <!-- A button only when there IS an address to copy: with a name and no email the
+                   cell is text, because a control that silently does nothing is worse than none. -->
+              <component
+                :is="instance.account.email ? 'button' : 'div'"
+                :type="instance.account.email ? 'button' : undefined"
+                class="block w-full truncate text-left font-medium"
+                :class="
+                  instance.account.email
+                    ? 'cursor-pointer transition-colors hover:text-primary'
+                    : undefined
+                "
+                :title="
+                  instance.account.email ? $t('instances.accountCopyHint') : undefined
+                "
+                :aria-label="
+                  instance.account.email
+                    ? $t('instances.copyAccountEmailAria', { email: instance.account.email })
+                    : undefined
+                "
+                @click="copyAccountEmail(instance)"
+              >
                 {{ instance.account.name ?? instance.account.email }}
-              </div>
+              </component>
               <div
                 v-if="instance.account.name && instance.account.email"
                 class="truncate text-[0.625rem] text-muted-foreground"
@@ -445,7 +476,16 @@ onUnmounted(stopPolling)
                 :disabled="isBusy(instance)"
                 @click="onFocusDesktop(instance)"
               >
-                <AppWindow /> {{ $t('codexInstances.focusDesktop') }}
+                <!-- Same running dot as the Claude table's Focus button, for the same reason: this
+                     button only exists while the desktop app is up, and the dot says so where the
+                     eye already is. -->
+                <span class="relative inline-flex">
+                  <AppWindow />
+                  <span
+                    class="absolute -right-1 -top-1 size-1.5 rounded-full bg-success ring-2 ring-background animate-pulse"
+                  />
+                </span>
+                {{ $t('codexInstances.focusDesktop') }}
               </Button>
               <Button
                 v-else-if="cliEnabled"

@@ -78,6 +78,9 @@ export const PREF_KEYS = [
   // Auto-resume monitor: its TUNING travels, its master switch does not (see NEVER_SYNCED).
   'monitor_max_attempts',
   'monitor_resume_buffer_min',
+  // Keepalive TUNING travels while its master switch does not — the same split as the monitor
+  // above. "Leave an account alone above 80% weekly" is a judgement about how you like to work.
+  'keepalive_weekly_floor',
   // New-chat defaults (owner rule 2026-08-30: every automated new chat starts "Opus 5 Ultra
   // code" = model opus + the ultracode keyword). A doctrine about how chats start, identical
   // on every machine - it travels.
@@ -141,6 +144,10 @@ export const NEVER_SYNCED = [
   // rather than quietly narrowed, because taking away sync someone already relies on is its own
   // surprise. Worth an explicit decision rather than a drive-by one.
   'monitor_enabled',
+  // The 5-hour keepalive's master switch. The clearest case this list has: it SPENDS QUOTA on idle
+  // accounts with nobody watching, and the accounts on one machine are not the accounts on another.
+  // Turning it on here must never turn it on somewhere its owner has not looked.
+  'keepalive_enabled',
   // Whether consoles appear on THIS screen. About this machine's desktop, not about a person.
   'terminal_windows_visible',
   // Whether this install has already said it has no tray icon. A fact about THIS COPY's packaging

@@ -14,11 +14,31 @@ export default {
   rescanPartial: 'Scanned {n} session(s), then stopped on time. Run it again to continue.',
   rescanFailed: "Couldn't rescan.",
   rescanFailedSome: "Couldn't read {n} transcript(s). They will be retried next time.",
+  // --- the unit switch ---
+  // Money answers "what would this have cost on the API"; tokens answer "how much did I actually
+  // use". Several panels could only ever say the first, which made the second unanswerable on a
+  // tab named Analytics. One switch, whole tab — see composables/useAnalyticsPrefs.ts.
+  unitMoney: 'Money',
+  unitTokens: 'Tokens',
+  showTokens: 'Show tokens instead of money',
+  showMoney: 'Show money instead of tokens',
+  unitToggleHint: 'Switches every chart on this tab between dollars and raw token counts.',
+  // Blank bars and "you spent nothing" look identical, so a chart that CANNOT answer in this unit
+  // has to say so. Per-day/project/account token splits are newer than the rest of the tab, so a
+  // daemon running older code serves buckets with a cost and no token figures at all.
+  noTokenData:
+    'This build has no token figures for this chart yet — restart AgentHydra to pick them up, or switch back to money.',
   // --- headline numbers ---
   totalCost: 'Cost',
+  totalTokens: 'Tokens',
+  // Why the two token tiles disagree, said where they disagree. Raw is everything sent and
+  // received; weighted discounts cache reads and multiplies output to approximate cost, so the
+  // raw figure is routinely several times the weighted one and neither is wrong.
+  totalTokensNote: 'Everything sent and received, uncounted by price.',
   sessions: 'Sessions',
   agentHours: 'Agent hours',
   tokens: 'Weighted tokens',
+  tokensNote: 'Cache reads ×0.1, output ×5 — a cost-shaped total, not a raw count.',
   // --- token split ---
   tokenSplit: 'Where the tokens went',
   tokenSplitNote:
@@ -32,10 +52,15 @@ export default {
   // --- charts ---
   costByDay: 'Cost by day',
   costByMonth: 'Cost by month',
+  tokensByDay: 'Tokens by day',
+  tokensByMonth: 'Tokens by month',
   grainDay: 'Daily',
   grainMonth: 'Monthly',
   costByModel: 'Cost by model',
   costByProject: 'Cost by project',
+  tokensByModel: 'Tokens by model',
+  tokensByProject: 'Tokens by project',
+  tokensByAccount: 'Tokens by account',
   unpricedNote:
     'No published price for these, so their tokens are counted but their cost is not. Showing tokens instead of a dollar figure, because zero would be a claim that they were free.',
   toolsFound: 'Coding tools on this machine',
@@ -62,6 +87,7 @@ export default {
   tipDayTotal: '{day} total',
   tipHourTotal: '{hour}:00 total',
   tipCost: 'Cost',
+  tipTokens: 'Tokens',
   tipShareOfWindow: 'Share of window',
   tipBusiestMonth: 'Busiest month',
   tipBusiestDay: 'Busiest day',
@@ -70,6 +96,12 @@ export default {
   tipPeak: 'Peak',
   whenYouWork: 'When the work happens',
   hourNote: 'Replies by hour of the week, darker where there were more.',
+  // Two grains, two questions. The hour grid answers "what time of day do I work" and throws the
+  // calendar away to do it, so it could never answer "which weeks was I actually working" — which
+  // over a window of months is the one people open this panel for.
+  grainCalendar: 'Calendar',
+  grainHour: 'Hour of week',
+  calendarNote: 'One square per day, darker where more went through. Gaps are days with nothing.',
   concurrency: 'Sessions running at once',
   concurrencyNote: 'How many sessions were alive in each window.',
   toolMix: 'Tool mix',

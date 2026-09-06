@@ -92,6 +92,7 @@ import { useDoneMarks } from '@/composables/useDoneMarks'
 import { useMultiSelect } from '@/composables/useMultiSelect'
 import { useOpenSession } from '@/composables/useOpenSession'
 import { useResumeInTerminal } from '@/composables/useResumeInTerminal'
+import { useSessionAccount } from '@/composables/useSessionAccount'
 import { useSessionFileActions } from '@/composables/useSessionFileActions'
 import { useSessionFilters } from '@/composables/useSessionFilters'
 import { useSessionJump } from '@/composables/useSessionJump'
@@ -375,6 +376,10 @@ const {
     checkedIds.value = new Set()
   },
 })
+
+// --- which ACCOUNT the open chat is talking to ---------------------------------------------------
+const { sessionAccount, openingInstance, openSessionInstance, copySessionAccountEmail } =
+  useSessionAccount({ selected, instanceLabelFor })
 
 // --- advanced (body) search: server-side, streams every transcript's raw content ------------------
 const {
@@ -1235,6 +1240,28 @@ function onComposerSent(mode: 'now' | 'queued') {
                 >
                   {{ rowSourceLabel(selected) }}
                 </Badge>
+                <!-- Which account is having this conversation. Read-only here on purpose: the
+                     acts (open it, copy its address) live in the ⋯ menu, so a metadata line stays
+                     a metadata line. The hover carries the full address, because the chip shows
+                     the handle and two accounts on different domains share a handle. -->
+                <!-- Two different reasons there is no address, and they are not interchangeable:
+                     the instance is not in the list at all, or it IS and has no resolved identity
+                     (signed out, or still resolving). Saying the first when it is the second sends
+                     you looking for a missing instance that is sitting right there. -->
+                <IconTooltip
+                  v-if="sessionAccount"
+                  :label="$t('sessions.accountLabel')"
+                  :description="
+                    sessionAccount.email ??
+                    (sessionAccount.instance
+                      ? $t('sessions.accountAddressUnknown')
+                      : $t('sessions.accountUnresolved'))
+                  "
+                >
+                  <span class="inline-flex items-center gap-1">
+                    <UserRound class="size-3" />{{ sessionAccount.name }}
+                  </span>
+                </IconTooltip>
                 <span class="inline-flex items-center gap-1"><FolderGit2 class="size-3" />{{ selected.cwd }}</span>
                 <span class="inline-flex items-center gap-1">
                   <MessagesSquare class="size-3" />{{ tail?.events.length ?? 0 }} {{ $t('sessions.turnsShown') }}
@@ -1330,6 +1357,46 @@ function onComposerSent(mode: 'now' | 'queued') {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" class="max-w-72">
+                      <!-- The menu leads with WHICH ACCOUNT this chat is talking to, and the two
+                           things you want from that answer: its app, or its address. Every instance
+                           runs a different Anthropic login, and until now the open transcript named
+                           none of them — you had to go to the Instances tab and match by folder.
+                           Same reason the instance tables' kebabs lead with the instance number:
+                           an open menu detached from the thing it acts on is a menu you hesitate
+                           over. -->
+                      <template v-if="sessionAccount">
+                        <DropdownMenuLabel class="flex items-center gap-2 py-1">
+                          <UserRound class="size-3.5 shrink-0" />
+                          <span class="truncate">{{ sessionAccount.name }}</span>
+                        </DropdownMenuLabel>
+                        <!-- Unresolvable is a real state, not a blank: the instance folder may be
+                             gone, or the regular non-isolated install may simply not be running (it
+                             only appears in the list while a process for it does). Say so rather
+                             than offering two controls that cannot work. -->
+                        <DropdownMenuItem v-if="!sessionAccount.instance" disabled>
+                          <Boxes class="size-3.5" />{{ $t('sessions.accountUnresolved') }}
+                        </DropdownMenuItem>
+                        <template v-else>
+                          <DropdownMenuItem
+                            :disabled="openingInstance"
+                            @select="openSessionInstance()"
+                          >
+                            <Boxes class="size-3.5" />
+                            {{
+                              sessionAccount.instance.isRunning
+                                ? $t('sessions.focusAccountInstance')
+                                : $t('sessions.openAccountInstance')
+                            }}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            :disabled="!sessionAccount.email"
+                            @select="copySessionAccountEmail()"
+                          >
+                            <Copy class="size-3.5" />{{ $t('sessions.copyAccountEmail') }}
+                          </DropdownMenuItem>
+                        </template>
+                        <DropdownMenuSeparator />
+                      </template>
                       <DropdownMenuLabel class="flex items-center gap-2">
                         <SlidersHorizontal class="size-3.5" />{{ $t('sessions.displayControls') }}
                       </DropdownMenuLabel>

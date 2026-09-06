@@ -21,6 +21,7 @@ import { detectDesktopInstall } from './desktop-install'
 import { readInstanceMetaMap } from './instance-meta'
 import { instanceNumbers, instanceRef } from './instance-numbers'
 import {
+  currentPlatform,
   defaultClaudeDir,
   instancesRoot,
   isPathInside,
@@ -244,6 +245,40 @@ export async function listInstances(options: ListInstancesOptions = {}): Promise
   return results
 }
 
+/**
+ * Is this dir the regular, NON-ISOLATED Claude Desktop profile (`claudeUserDataDir()`)?
+ *
+ * One answer, THREE callers, and they must never disagree: `removeInstance` refuses to delete that
+ * profile (core/lifecycle.ts Guard 1), `quitInstance` refuses to kill it without confirmation, and
+ * `buildInstanceRow` stamps `CMInstance.isDefault`, which is how a session labelled `'default'`
+ * finds its account. A UI calling a row "the default install" while a guard called the same row an
+ * ordinary instance would be lying in one of the places, and the lie you notice is the dangerous
+ * one. Each of the three used to inline its own copy of this comparison.
+ *
+ * ⛔ CASE IS FOLDED ONLY ON WINDOWS, matching normalizePath's own rule — POSIX paths are
+ * case-sensitive, so `~/.config/Claude` and `~/.config/claude` are two different directories there.
+ * The inlined copies lowercased unconditionally, which on Linux/macOS quietly made a differently
+ * cased isolated instance look like the default profile. That was merely over-cautious in the two
+ * guards (they refuse more than they must); it is not survivable in `isDefault`, where a false
+ * positive puts one account's address against another account's chat. The fold is kept explicit
+ * rather than trusting normalizePath alone so a future change there cannot silently make the
+ * Windows comparison case-sensitive.
+ *
+ * `dir` must already be normalized. Never throws: an unresolvable default dir means "not the
+ * default", never an error out of a list.
+ */
+export function isDefaultClaudeDir(dir: string): boolean {
+  let defaultDir = ''
+  try {
+    defaultDir = normalizePath(defaultClaudeDir())
+  } catch {
+    return false
+  }
+  if (!defaultDir) return false
+  const fold = (p: string) => (currentPlatform() === 'win32' ? p.toLowerCase() : p)
+  return fold(dir) === fold(defaultDir)
+}
+
 /** Builds one row of listInstances's result from its already-gathered per-dir inputs. */
 async function buildInstanceRow(
   meta: DiscoveredMeta,
@@ -281,6 +316,7 @@ async function buildInstanceRow(
     account,
     loginUuid: readLoginUuid(meta.dir),
     isExternal: meta.isExternal,
+    isDefault: isDefaultClaudeDir(meta.dir),
     label: ui?.label ?? null,
     icon: ui?.icon ?? null,
     color: ui?.color ?? null,
@@ -519,19 +555,9 @@ export async function quitInstance(
   // that dir is the user's REAL, externally-managed Claude Desktop, not an isolated instance this
   // app created, and may have a real conversation in progress. Checked (and refused) BEFORE any
   // process enumeration, so an unconfirmed quit of the default dir never even lists processes.
-  let defaultDir = ''
-  try {
-    defaultDir = normalizePath(defaultClaudeDir())
-  } catch {
-    defaultDir = ''
-  }
-  // normalizePath() already lowercases, but compare defensively via .toLowerCase() too, matching
-  // removeInstance()'s exact idiom — belt-and-suspenders against any future normalizePath change.
-  if (
-    defaultDir &&
-    normDir.toLowerCase() === defaultDir.toLowerCase() &&
-    options.confirmExternal !== true
-  ) {
+  // Shared with the row builder's `isDefault` flag, so the guard and the UI can never disagree
+  // about which row IS the regular install — see isDefaultClaudeDir.
+  if (isDefaultClaudeDir(normDir) && options.confirmExternal !== true) {
     return {
       ok: false,
       action: 'quit',

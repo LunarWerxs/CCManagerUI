@@ -20,6 +20,11 @@ const showCliInstances = ref(true)
 const codexDesktopEnabled = ref(true)
 const codexCliEnabled = ref(true)
 const chatGptHandoffEnabled = ref(false)
+// The 5-hour keepalive. Mirrors the server's defaults (provider-settings.ts): OFF, and a floor that
+// leaves an account alone once 80% of its weekly cap is gone. It is the one setting on this screen
+// that spends quota, so the default has to be the safe one.
+const keepaliveEnabled = ref(false)
+const keepaliveWeeklyFloorPct = ref(80)
 // Reset notifications (server/src/reset-watch.ts). Defaults mirror getNotificationSettings():
 // announcing a rollover is on, the intrusive channels (persistent repeats, email) are opt-in.
 const notifyEnabled = ref(true)
@@ -57,6 +62,8 @@ function absorb(s: api.AppSettings): void {
   codexDesktopEnabled.value = s.codexDesktopEnabled
   codexCliEnabled.value = s.codexCliEnabled
   chatGptHandoffEnabled.value = s.chatGptHandoffEnabled
+  keepaliveEnabled.value = s.keepaliveEnabled
+  keepaliveWeeklyFloorPct.value = s.keepaliveWeeklyFloorPct
   transcriptEditor.value = s.transcriptEditor
   transcriptEditorResolved.value = s.transcriptEditorResolved
   notifyEnabled.value = s.notifyEnabled
@@ -109,6 +116,8 @@ export function useAppSettings() {
     codexDesktopEnabled,
     codexCliEnabled,
     chatGptHandoffEnabled,
+    keepaliveEnabled,
+    keepaliveWeeklyFloorPct,
     transcriptEditor,
     transcriptEditorResolved,
     notifyEnabled,

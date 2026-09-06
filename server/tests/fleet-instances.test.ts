@@ -17,6 +17,7 @@ function inst(over: Partial<CMInstance> & { num: number; dir: string }): CMInsta
     account: null,
     loginUuid: null,
     isExternal: false,
+    isDefault: false,
     label: null,
     icon: null,
     color: null,

@@ -18,11 +18,13 @@
 // .NET Framework's csc.exe, which every Windows box (dev machine or GitHub's windows-latest
 // runner) has carried since .NET Framework 4 — no extra install, no network.
 //
-// -Force is passed on every install.ps1 invocation below. None of the required scenarios is "does
-// it refuse under a running instance" (that guard has no dedicated test here), and passing it
-// removes a real, environment-dependent failure mode: if a developer happens to have the actual
-// AgentHydra tray open while running `bun test`, the process-name check would otherwise see a
-// genuine 'AgentHydra' or 'lunarwerx-tray' process and refuse every scenario in this file.
+// -Force is passed on every invocation in the FIRST describe below. None of its scenarios is
+// about refusing under a running instance, and passing it removes a real, environment-dependent
+// failure mode: if a developer happens to have the actual AgentHydra tray open while running
+// `bun test`, the process-name check would otherwise see a genuine 'AgentHydra' or
+// 'lunarwerx-tray' process and refuse every scenario there. The running-instance guard itself is
+// covered by the SECOND describe (added 2026-09-06 — it had no test at all until then), which
+// drives it through the isolatable runtime-pointer half; see its own header for why.
 
 import { describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
@@ -131,11 +133,12 @@ interface RunResult {
   stderr: string
 }
 
-function runInstall(args: string[]): RunResult {
+function runInstall(args: string[], env?: Record<string, string>): RunResult {
   try {
     const stdout = execFileSync('pwsh', ['-NoProfile', '-File', INSTALL_PS1, ...args], {
       timeout: 60_000,
       encoding: 'utf8',
+      env: env ? { ...process.env, ...env } : process.env,
     })
     return { status: 0, stdout, stderr: '' }
   } catch (e) {
@@ -374,4 +377,155 @@ describe.skipIf(!win || !CSC)('install.ps1 transactional swap (AH-40)', () => {
     expect(exeVersion(join(installDir, 'AgentHydra.exe'))).toBe('0.22.0')
     expect(leftoverArtifacts(installDir)).toEqual([])
   }, 30_000)
+})
+
+// ── the running-instance refusal (AH-40, guard (c)) ──────────────────────────────────────────
+//
+// The block above passes -Force on every invocation, which is what makes those tests survive a
+// developer running `bun test` with the real tray open. The cost of that was a guard with NO test
+// at all: install.ps1 refuses to swap under a running AgentHydra because a live exe or tray host
+// holds files open mid-copy, and nothing here proved either that it refuses or that -Force is
+// still the documented way past it. This block closes that.
+//
+// It drives the guard through the RUNTIME POINTER half rather than the process-name half.
+// `Get-Process -Name AgentHydra,lunarwerx-tray` reads the whole machine and cannot be isolated -
+// a test written against it would pass or fail on whether the owner happened to have the tray up.
+// The pointer half is the same `if ($runningProcs -or $liveFromPointer)` branch and IS isolatable:
+// $env:AGENTHYDRA_HOME picks the config dir, so a temp runtime.json naming a pid that is certainly
+// alive (this test process) makes the guard see a live instance no matter what else is running.
+describe.skipIf(!win || !CSC)('install.ps1 refuses under a running instance (AH-40)', () => {
+  /** A config dir whose runtime.json points at `pid`, as the daemon writes it. */
+  function fakeHome(baseDir: string, pid: number): string {
+    const home = join(baseDir, 'agenthydra-home')
+    mkdirSync(home, { recursive: true })
+    writeFileSync(join(home, 'runtime.json'), JSON.stringify({ pid, port: 7789 }))
+    return home
+  }
+
+  test('a live runtime pointer stops the install before anything on disk is touched', () => {
+    const work = mkdtempSync(join(tmpdir(), 'ah-install-running-'))
+    const installDir = join(work, 'install')
+
+    // An install that is already there, so "untouched" is something we can actually measure.
+    expect(
+      runInstall([
+        '-FromZip',
+        buildReleaseZip(work, '0.23.0'),
+        '-InstallDir',
+        installDir,
+        '-NoShortcut',
+        '-NoLaunch',
+        '-Force',
+      ]).status,
+    ).toBe(0)
+
+    // process.pid is alive by definition for as long as this test runs, so the guard cannot miss.
+    const result = runInstall(
+      [
+        '-FromZip',
+        buildReleaseZip(work, '0.23.1'),
+        '-InstallDir',
+        installDir,
+        '-NoShortcut',
+        '-NoLaunch',
+      ],
+      { AGENTHYDRA_HOME: fakeHome(work, process.pid) },
+    )
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr + result.stdout).toMatch(/appears to be running/i)
+    // "before anything on disk is touched" is the half that matters: the refusal is worthless if
+    // it fires after the swap has already begun.
+    expect(exeVersion(join(installDir, 'AgentHydra.exe'))).toBe('0.23.0')
+    expect(leftoverArtifacts(installDir)).toEqual([])
+  }, 60_000)
+
+  test('-Force is still the way past it, and it installs for real', () => {
+    const work = mkdtempSync(join(tmpdir(), 'ah-install-running-force-'))
+    const installDir = join(work, 'install')
+    const home = fakeHome(work, process.pid)
+
+    expect(
+      runInstall(
+        [
+          '-FromZip',
+          buildReleaseZip(work, '0.24.0'),
+          '-InstallDir',
+          installDir,
+          '-NoShortcut',
+          '-NoLaunch',
+          '-Force',
+        ],
+        { AGENTHYDRA_HOME: home },
+      ).status,
+    ).toBe(0)
+    expect(exeVersion(join(installDir, 'AgentHydra.exe'))).toBe('0.24.0')
+  }, 60_000)
+
+  test('a runtime pointer whose pid is gone is not a running instance', () => {
+    // The other half of a trustworthy guard: one that refuses unconditionally is as useless as
+    // one that never refuses. This is the only case here that the machine's own state can spoil -
+    // a REAL AgentHydra or tray process satisfies the process-name half of the same `or`, and no
+    // env var can hide it - so it is skipped, loudly, rather than left to fail on the owner's box.
+    const running = execFileSync(
+      'pwsh',
+      [
+        '-NoProfile',
+        '-Command',
+        "@(Get-Process -Name 'AgentHydra','lunarwerx-tray' -ErrorAction SilentlyContinue).Count",
+      ],
+      { timeout: 20_000, encoding: 'utf8' },
+    ).trim()
+    if (running !== '0') {
+      console.log(`SKIPPED (a real AgentHydra/tray process is running: ${running}) - the "a dead
+        pointer does not refuse" case cannot be isolated from the process-name check.`)
+      return
+    }
+
+    const work = mkdtempSync(join(tmpdir(), 'ah-install-dead-pid-'))
+    const installDir = join(work, 'install')
+
+    // A pid that has certainly exited: spawn, wait for it, then confirm it is gone rather than
+    // assume (Windows recycles pids, and a recycled one would make this test refuse for a real
+    // reason and read as a regression).
+    const deadPid = Number(
+      execFileSync(
+        'pwsh',
+        [
+          '-NoProfile',
+          '-Command',
+          '$p = Start-Process cmd -ArgumentList "/c","exit" -PassThru; $p.WaitForExit(); $p.Id',
+        ],
+        { timeout: 20_000, encoding: 'utf8' },
+      ).trim(),
+    )
+    const stillThere = execFileSync(
+      'pwsh',
+      [
+        '-NoProfile',
+        '-Command',
+        `@(Get-Process -Id ${deadPid} -ErrorAction SilentlyContinue).Count`,
+      ],
+      { timeout: 20_000, encoding: 'utf8' },
+    ).trim()
+    if (stillThere !== '0') {
+      console.log(`SKIPPED (pid ${deadPid} was recycled before it could be used as a dead one)`)
+      return
+    }
+
+    const result = runInstall(
+      [
+        '-FromZip',
+        buildReleaseZip(work, '0.25.0'),
+        '-InstallDir',
+        installDir,
+        '-NoShortcut',
+        '-NoLaunch',
+      ],
+      { AGENTHYDRA_HOME: fakeHome(work, deadPid) },
+    )
+    expect(result.stderr + result.stdout).not.toMatch(/appears to be running/i)
+    expect(result.status).toBe(0)
+    expect(exeVersion(join(installDir, 'AgentHydra.exe'))).toBe('0.25.0')
+  }, 60_000)
 })

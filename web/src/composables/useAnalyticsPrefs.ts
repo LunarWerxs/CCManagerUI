@@ -20,6 +20,28 @@ const PERIODS: readonly SessionPeriod[] = ['24h', '7d', '30d', 'all']
 const analyticsPeriod = useStorage<SessionPeriod>('agenthydra.analytics.period', '30d')
 registerSharedPref('agenthydra.analytics.period', analyticsPeriod, PERIODS)
 
+/**
+ * Show the whole tab in TOKENS rather than dollars.
+ *
+ * A MODE, not a per-panel choice, for the same reason the instances table's usage mode is one (see
+ * useUsageMode): the unit is the question you are asking, and it applies to every panel at once.
+ * Half the tab in dollars and half in tokens is how you end up comparing a cost bar against a token
+ * bar and drawing a conclusion from neither.
+ *
+ * Off by default, because the dollar figure is the comparison most people want — these are
+ * subscription accounts, so it answers "what would this have cost on the API". The switch is for
+ * the other question, which a heavy user asks constantly and the tab could not answer: how many
+ * tokens actually went where.
+ */
+const analyticsTokenMode = useStorage('agenthydra.analytics.tokenMode', false)
+registerSharedPref('agenthydra.analytics.tokenMode', analyticsTokenMode)
+
 export function useAnalyticsPrefs() {
-  return { analyticsPeriod }
+  return {
+    analyticsPeriod,
+    analyticsTokenMode,
+    toggleTokenMode: () => {
+      analyticsTokenMode.value = !analyticsTokenMode.value
+    },
+  }
 }

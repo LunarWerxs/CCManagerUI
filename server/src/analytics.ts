@@ -21,9 +21,20 @@
 // exact. For one spanning midnight it splits the session's own total the same way the tokens split,
 // which is the closest thing to the truth that a per-model price table can give without storing a
 // price-weighted figure per day per model.
+//
+// AND THAT APPROXIMATION IS NOW WHAT SCOPES A TIME PERIOD TOO (see windowShare). It used to be
+// applied per SESSION, on `last_ts`, so a session whose final turn landed inside the window
+// contributed its whole life and one that ended a day earlier contributed nothing — not even the
+// part that WAS inside. Every panel now takes the same day-proportioned slice, so the headline, the
+// per-model split and the day chart cannot disagree about how much of a session belongs in view.
+// The residual limit is resolution: a stored row knows which DAY its tokens were spent on and not
+// which hour, so a sub-day window ("last 24 hours") is answered at day granularity — it covers the
+// days those 24 hours touch. No arrangement of this data can do better; the old rule was not more
+// precise, only differently wrong.
 
 import { db } from './db'
 import { readHermesUsage } from './hermes-sessions'
+import { instanceSessionMap } from './instance-sessions'
 import { readOpenCodeUsage } from './opencode-sessions'
 import { priceSource, pricesAsOf, priceTokens } from './pricing'
 import { streamLines } from './session-search'
@@ -114,6 +125,13 @@ export interface SessionAnalytics {
    *  actually stuck, which a raw count of scattered failures is not. */
   toolErrorStreak: number
   editCount: number
+  /** Lines the session ADDED and REMOVED across its edits, counted off the tool inputs. A rough but
+   *  honest measure of how much code a chat actually moved — "40 edits" says nothing about whether
+   *  they were typo fixes or a rewrite. Both are zero for a session that only read. */
+  linesAdded: number
+  linesRemoved: number
+  /** Distinct files the session touched, which `editCount` (a count of EDIT CALLS) is not. */
+  filesTouched: Set<string>
   edits: SessionEdit[]
   compactions: number
   /** Engaged time, in milliseconds. See ACTIVE_GAP_CAP_MS. */
@@ -133,6 +151,9 @@ function emptyAnalytics(): SessionAnalytics {
     toolErrors: 0,
     toolErrorStreak: 0,
     editCount: 0,
+    linesAdded: 0,
+    linesRemoved: 0,
+    filesTouched: new Set<string>(),
     edits: [],
     compactions: 0,
     activeMs: 0,
@@ -155,6 +176,26 @@ function dayKey(ms: number): string {
 function hourKey(ms: number): number {
   const d = new Date(ms)
   return d.getDay() * 24 + d.getHours()
+}
+
+/**
+ * Lines an edit added and removed, off the tool's own input.
+ *
+ * The edit tools carry the text they are replacing: `old_string`/`new_string` for Edit,
+ * `content` for Write, `new_source` for a notebook cell. Counting newlines in each is a cheap,
+ * local approximation of a diff — it cannot know that a rewritten line is one removed and one
+ * added rather than a change, so treat these as a MAGNITUDE of churn rather than as `git diff`.
+ * Nothing is read from disk and no diff is computed; this is arithmetic on strings already in
+ * the transcript.
+ */
+function countEditLines(input: unknown, out: SessionAnalytics): void {
+  if (!input || typeof input !== 'object') return
+  const rec = input as Record<string, unknown>
+  const lines = (v: unknown) => (typeof v === 'string' && v ? v.split('\n').length : 0)
+  // A whole-file write has no "old" side in the input, so it counts as pure addition — which is
+  // what it is from the transcript's point of view.
+  out.linesRemoved += lines(rec.old_string)
+  out.linesAdded += lines(rec.new_string) + lines(rec.content) + lines(rec.new_source)
 }
 
 function firstPath(input: unknown): string | null {
@@ -279,6 +320,8 @@ function foldContentBlock(
       const p = firstPath(b.input)
       if (p) {
         out.editCount++
+        out.filesTouched.add(p)
+        countEditLines(b.input, out)
         if (out.edits.length < MAX_EDITS_PER_SESSION)
           out.edits.push({ path: p, turn: nextTurn, ts: atMs })
       }
@@ -553,6 +596,8 @@ function recordCodexToolCall(
   const p = firstPath(input)
   if (p) {
     out.editCount++
+    out.filesTouched.add(p)
+    countEditLines(input, out)
     if (out.edits.length < MAX_EDITS_PER_SESSION) out.edits.push({ path: p, turn, ts: lastTs })
   }
 }
@@ -671,6 +716,64 @@ const selectRows = db.query<AnalyticsRow, []>(
     'where analytics_at is not null',
 )
 
+/**
+ * The permanent per-session record (db.ts session_stats). Upsert on a stable session key, never a
+ * file key: one row per conversation for its whole life.
+ *
+ * `first_seen_at` is written only on INSERT (the excluded value is ignored on conflict), so it keeps
+ * meaning "when this machine first saw this chat" rather than drifting forward on every rescan.
+ */
+const upsertPermanentStats = db.query(
+  'insert into session_stats (session_key, session_id, source, tool, project, cwd, title, ' +
+    'instance, first_ts, last_ts, turns, input_tokens, cache_read, cache_write, output_tokens, ' +
+    'weighted, cost_usd, active_ms, tool_calls, tool_errors, compactions, edit_count, ' +
+    'files_touched, lines_added, lines_removed, size_bytes, tokens_json, days_json, ' +
+    'first_seen_at, last_scanned_at, gone_at) ' +
+    'values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null) ' +
+    'on conflict(session_key) do update set ' +
+    'tool = excluded.tool, project = excluded.project, cwd = excluded.cwd, title = excluded.title, ' +
+    'instance = coalesce(excluded.instance, session_stats.instance), ' +
+    'first_ts = excluded.first_ts, last_ts = excluded.last_ts, turns = excluded.turns, ' +
+    'input_tokens = excluded.input_tokens, cache_read = excluded.cache_read, ' +
+    'cache_write = excluded.cache_write, output_tokens = excluded.output_tokens, ' +
+    'weighted = excluded.weighted, cost_usd = excluded.cost_usd, active_ms = excluded.active_ms, ' +
+    'tool_calls = excluded.tool_calls, tool_errors = excluded.tool_errors, ' +
+    'compactions = excluded.compactions, edit_count = excluded.edit_count, ' +
+    'files_touched = excluded.files_touched, lines_added = excluded.lines_added, ' +
+    'lines_removed = excluded.lines_removed, size_bytes = excluded.size_bytes, ' +
+    'tokens_json = excluded.tokens_json, days_json = excluded.days_json, ' +
+    'last_scanned_at = excluded.last_scanned_at, gone_at = null',
+)
+
+/** The permanent rows whose transcript is gone — the history the cache can no longer hold. Read
+ *  back into spendReport so a total does not shrink when a file is deleted. */
+const selectGoneStats = db.query<
+  {
+    session_key: string
+    session_id: string
+    source: string
+    project: string | null
+    cwd: string | null
+    tokens_json: string | null
+    days_json: string | null
+    edit_count: number | null
+    active_ms: number | null
+    first_ts: number | null
+    last_ts: number | null
+    last_scanned_at: number | null
+  },
+  []
+>(
+  'select session_key, session_id, source, project, cwd, tokens_json, days_json, edit_count, ' +
+    'active_ms, first_ts, last_ts, last_scanned_at from session_stats where gone_at is not null',
+)
+
+/** Stamp a session as no longer on disk, keeping every number it ever had. Called by the prune in
+ *  sessions.ts INSTEAD of forgetting the chat. */
+export const markSessionGone = db.query(
+  'update session_stats set gone_at = ? where session_key = ? and gone_at is null',
+)
+
 const upsertAnalytics = db.query(
   'update session_scan_cache set analytics_at = ?, analytics_version = ?, ' +
     'analytics_mtime_ms = ?, analytics_size_bytes = ?, provider_cost_usd = ?, session_id = ?, ' +
@@ -771,7 +874,65 @@ function persist(tf: TranscriptFile, a: SessionAnalytics): void {
         e.turn,
         e.ts,
       )
+    recordPermanentStats(tf, a)
   })()
+}
+
+/**
+ * Mirror this scan into the PERMANENT record (see the session_stats table in db.ts).
+ *
+ * The row above is a cache keyed to a file revision and is deleted the moment the transcript is —
+ * which, with Claude Code's 30-day cleanup, is how a year of history became one month of it. This
+ * write is the copy that survives. It is an upsert on a stable per-session key rather than on the
+ * file's cache key, so a session that gains turns updates its own row instead of accumulating one
+ * per revision, and `first_seen_at` records when this machine FIRST saw the chat even after the
+ * transcript is long gone.
+ *
+ * `gone_at` is explicitly cleared here: a transcript that comes back (restored from an archive, or
+ * a store remounted) is present again, and a row still flagged as gone would keep saying otherwise.
+ */
+function recordPermanentStats(tf: TranscriptFile, a: SessionAnalytics): void {
+  const totals = emptyTokens()
+  for (const spend of Object.values(a.tokens)) addTokens(totals, spend)
+  const weighted = Object.values(a.tokens).reduce((n, m) => n + m.weighted, 0)
+  const turns = Object.values(a.tokens).reduce((n, m) => n + m.turns, 0)
+  const priced = priceTokens(a.tokens, a.lastTs ?? Date.now())
+  const cost = a.providerCostUsd ?? priced.costUsd
+  const toolCalls = Object.values(a.tools).reduce((n, v) => n + v, 0)
+  upsertPermanentStats.run(
+    `${tf.source}:${tf.session_id}`,
+    tf.session_id,
+    tf.source,
+    tf.tool ?? null,
+    tf.project ?? null,
+    tf.cwd || decodeProjectKey(tf.project),
+    tf.title ?? null,
+    // Which desktop instance (and therefore which ACCOUNT) ran it. The single most perishable fact
+    // here: once the transcript is gone nothing else on this machine remembers who paid for it.
+    instanceSessionMap().get(tf.session_id) ?? null,
+    a.firstTs,
+    a.lastTs,
+    turns,
+    totals.input,
+    totals.cacheRead,
+    totals.cacheWrite,
+    totals.output,
+    weighted,
+    cost,
+    a.activeMs,
+    toolCalls,
+    a.toolErrors,
+    a.compactions,
+    a.editCount,
+    a.filesTouched.size,
+    a.linesAdded,
+    a.linesRemoved,
+    tf.size_bytes ?? null,
+    JSON.stringify(a.tokens),
+    JSON.stringify(a.days),
+    Date.now(),
+    Date.now(),
+  )
 }
 
 /**
@@ -955,7 +1116,16 @@ function projectKeyOf(path: string): string {
   return key
 }
 
-function addTo(map: Map<string, SpendBucket>, key: string, weighted: number, cost: number | null) {
+function addTo(
+  map: Map<string, SpendBucket>,
+  key: string,
+  weighted: number,
+  cost: number | null,
+  /** Raw four-way split to fold in as well. Supplied by every caller that has one, so the UI's
+   *  money/tokens switch can redraw the same chart in either unit instead of some panels going
+   *  blank in one of the two modes. */
+  tokens?: TokenBreakdown,
+) {
   const b = map.get(key) ?? {
     key,
     weighted: 0,
@@ -965,8 +1135,84 @@ function addTo(map: Map<string, SpendBucket>, key: string, weighted: number, cos
   }
   b.weighted += weighted
   if (cost !== null && b.costUsd !== null) b.costUsd += cost
+  if (tokens) {
+    if (!b.tokens) b.tokens = emptyTokens()
+    const into = b.tokens
+    into.input += tokens.input
+    into.cacheRead += tokens.cacheRead
+    into.cacheWrite += tokens.cacheWrite
+    into.output += tokens.output
+    into.total += tokens.total
+  }
   map.set(key, b)
   return b
+}
+
+/**
+ * How much of a session's work falls inside the requested window, as a fraction of its weighted
+ * tokens.
+ *
+ * ⛔ WHY THIS EXISTS. The window used to be applied per SESSION, on `last_ts`: a session whose last
+ * turn landed inside the window contributed its ENTIRE life to the totals, and one that ended a day
+ * before it contributed nothing at all — including the part that WAS inside. So "last 7 days" on a
+ * machine that runs marathon sessions was neither the last 7 days nor anything else you could name,
+ * and it silently disagreed with the day chart drawn right below it, which was always day-accurate.
+ *
+ * The per-day weighted map is the only per-day fact a stored row has, so it is what scopes the
+ * window: the share of a session's weighted tokens spent on days inside it. That is the SAME
+ * approximation the day chart has always used for cost (documented at the top of this file), now
+ * applied consistently instead of only in one panel.
+ *
+ * Returns null when the row carries no day data at all — an old row, or one whose turns had no
+ * timestamps. Null means "cannot answer from days", and the caller falls back to the `last_ts` test
+ * rather than dropping the session, because silently omitting real spend is worse than including a
+ * little of it at the wrong end of a boundary.
+ */
+export function windowShare(days: Record<string, number>, sinceDay: string | null): number | null {
+  if (sinceDay === null) return 1
+  let total = 0
+  let inWindow = 0
+  for (const [day, weighted] of Object.entries(days)) {
+    total += weighted
+    if (day >= sinceDay) inWindow += weighted
+  }
+  if (total <= 0) return null
+  return inWindow / total
+}
+
+/** One model's counts scaled by `share`. Turns are rounded because a turn is a count; the token
+ *  figures are left fractional here and rounded once, at the point they are reported. */
+export function scaleModelSpend(
+  tokens: Record<string, ModelSpend>,
+  share: number,
+): Record<string, ModelSpend> {
+  if (share >= 1) return tokens
+  const out: Record<string, ModelSpend> = {}
+  for (const [model, m] of Object.entries(tokens)) {
+    out[model] = {
+      weighted: m.weighted * share,
+      output: m.output * share,
+      turns: Math.round(m.turns * share),
+      input: m.input * share,
+      cacheRead: m.cacheRead * share,
+      cacheCreation5m: m.cacheCreation5m * share,
+      cacheCreation1h: m.cacheCreation1h * share,
+    }
+  }
+  return out
+}
+
+/** Every category of one breakdown scaled by `share`, for the per-day apportionment. Rounded,
+ *  because a token count is a count: the day rows are an approximation of WHEN the tokens were
+ *  spent (see foldDaySpend), not a licence to report 1.7 of one. */
+function scaleTokens(t: TokenBreakdown, share: number): TokenBreakdown {
+  return {
+    input: Math.round(t.input * share),
+    cacheRead: Math.round(t.cacheRead * share),
+    cacheWrite: Math.round(t.cacheWrite * share),
+    output: Math.round(t.output * share),
+    total: Math.round(t.total * share),
+  }
 }
 
 /** The four categories, zeroed. */
@@ -1084,12 +1330,23 @@ function foldProviderSpend(
 function foldDaySpend(
   days: Record<string, number>,
   sessionCost: number | null,
+  sessionTokens: TokenBreakdown,
   acc: SpendAccumulator,
 ): void {
   const dayTotal = Object.values(days).reduce((n, v) => n + v, 0)
   for (const [day, weighted] of Object.entries(days)) {
     const share = dayTotal > 0 ? weighted / dayTotal : 0
-    const db_ = addTo(acc.byDay, day, weighted, sessionCost === null ? null : sessionCost * share)
+    // Raw tokens ride on the SAME share as the cost, for the same reason and with the same caveat:
+    // a transcript records what a session spent, not what each of its days spent, so both are an
+    // apportionment by the one thing that IS known per day (weighted tokens). Splitting them
+    // differently would let the two series on one chart disagree about the same session.
+    const db_ = addTo(
+      acc.byDay,
+      day,
+      weighted,
+      sessionCost === null ? null : sessionCost * share,
+      scaleTokens(sessionTokens, share),
+    )
     db_.sessions++
     if (acc.from === null || day < acc.from) acc.from = day
     if (acc.to === null || day > acc.to) acc.to = day
@@ -1104,13 +1361,33 @@ function foldDaySpend(
 function foldSpendRow(
   row: AnalyticsRow,
   since: number | null,
+  sinceDay: string | null,
   accounts: Map<string, string>,
   acc: SpendAccumulator,
 ): void {
   if (row.analytics_version !== ANALYTICS_VERSION) return
-  if (since !== null && (row.last_ts ?? 0) < since) return
-  const tokens = withoutNonModels(parseJson<Record<string, ModelSpend>>(row.tokens_json, {}))
-  const days = parseJson<Record<string, number>>(row.days_json, {})
+  const allDays = parseJson<Record<string, number>>(row.days_json, {})
+
+  // Scope the session to the window BEFORE anything is folded, by scaling its own token counts.
+  // One multiplication point rather than one per panel: cost, weighted, the raw split, per model,
+  // per provider, per project and per account all derive from `tokens` below, so they cannot end up
+  // disagreeing about how much of this session belongs in the window. See windowShare.
+  const share = windowShare(allDays, sinceDay)
+  if (share === null) {
+    // No day data to scope by — fall back to the old whole-session test rather than dropping it.
+    if (since !== null && (row.last_ts ?? 0) < since) return
+  } else if (share <= 0) {
+    return
+  }
+  const scale = share ?? 1
+  const tokens = scaleModelSpend(
+    withoutNonModels(parseJson<Record<string, ModelSpend>>(row.tokens_json, {})),
+    scale,
+  )
+  const days =
+    sinceDay === null
+      ? allDays
+      : Object.fromEntries(Object.entries(allDays).filter(([day]) => day >= sinceDay))
   const modelKeys = Object.keys(tokens)
   if (modelKeys.length === 0) return
   acc.sessions++
@@ -1122,10 +1399,11 @@ function foldSpendRow(
   // A cost the provider computed itself wins over our table: OpenCode routes to models this repo
   // has no prices for, and its own figure is the real one rather than a gap we would report as
   // unpriced. Only its models are then left out of the unpriced list, since they ARE priced.
+  // Scaled by the same share as the tokens — it is a whole-session figure like they are.
   const ownCost = row.provider_cost_usd
   const hasOwnCost = typeof ownCost === 'number' && Number.isFinite(ownCost)
   if (!hasOwnCost) for (const m of priced.unpriced) acc.unpriced.add(m)
-  const sessionCost = hasOwnCost ? ownCost : priced.costUsd
+  const sessionCost = hasOwnCost ? (ownCost as number) * scale : priced.costUsd
   if (sessionCost !== null) {
     acc.totalCost += sessionCost
     acc.anyPriced = true
@@ -1143,16 +1421,27 @@ function foldSpendRow(
   // the SAME project on the chart twice under two spellings — caught on real data, and the kind of
   // error a chart states with total confidence.
   const project = row.cwd || (row.project ? decodeProjectKey(row.project) : '') || 'unknown'
-  const pb = addTo(acc.byProject, projectKeyOf(project), sessionWeighted, sessionCost)
+  // The session's own four-way split, folded into every bucket it belongs to so the money/tokens
+  // switch can redraw project and account the same way it redraws model.
+  const sessionTokens = emptyTokens()
+  for (const spend of Object.values(tokens)) addTokens(sessionTokens, spend)
+
+  const pb = addTo(
+    acc.byProject,
+    projectKeyOf(project),
+    sessionWeighted,
+    sessionCost,
+    sessionTokens,
+  )
   pb.sessions++
 
   const account = accounts.get(row.session_id)
   if (account) {
-    const ab = addTo(acc.byAccount, account, sessionWeighted, sessionCost)
+    const ab = addTo(acc.byAccount, account, sessionWeighted, sessionCost, sessionTokens)
     ab.sessions++
   }
 
-  foldDaySpend(days, sessionCost, acc)
+  foldDaySpend(days, sessionCost, sessionTokens, acc)
 }
 
 export function spendReport(opts: { sinceMs?: number | null } = {}): SpendReport {
@@ -1180,7 +1469,46 @@ export function spendReport(opts: { sinceMs?: number | null } = {}): SpendReport
     to: null,
   }
 
-  for (const row of rows) foldSpendRow(row, since, accounts, acc)
+  // The window as a LOCAL day key, because that is the resolution a stored row records (dayKey()).
+  // Same clock the day buckets were written on, so the comparison is apples to apples.
+  const sinceDay = since === null ? null : dayKey(since)
+  for (const row of rows) foldSpendRow(row, since, sinceDay, accounts, acc)
+
+  // …and the chats whose transcripts are GONE. Their cache rows were deleted with the files, so
+  // without this the totals silently shrink as Claude Code's 30-day cleanup runs and "all time"
+  // quietly becomes "the last month". The permanent record keeps their numbers (db.ts
+  // session_stats); `gone_at is not null` is what makes double counting impossible, since the
+  // prune stamps that flag and deletes the cache row in ONE transaction — a session is in exactly
+  // one of the two sets, never both.
+  for (const g of selectGoneStats.all()) {
+    foldSpendRow(
+      {
+        cache_key: g.session_key,
+        session_id: g.session_id,
+        source: g.source,
+        project: g.project ?? '',
+        cwd: g.cwd ?? '',
+        analytics_at: g.last_scanned_at,
+        analytics_version: ANALYTICS_VERSION,
+        tokens_json: g.tokens_json,
+        days_json: g.days_json,
+        hours_json: null,
+        tools_json: null,
+        tool_errors: 0,
+        tool_error_streak: 0,
+        edit_count: g.edit_count,
+        compactions: 0,
+        active_ms: g.active_ms,
+        first_ts: g.first_ts,
+        last_ts: g.last_ts,
+        provider_cost_usd: null,
+      },
+      since,
+      sinceDay,
+      accounts,
+      acc,
+    )
+  }
 
   return {
     from: acc.from,

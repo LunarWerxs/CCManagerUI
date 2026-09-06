@@ -4,8 +4,8 @@
 // extensions to match this repo's convention).
 //
 // Depends on:
-//   core/paths.ts     — instancesRoot(), defaultClaudeDir(), normalizePath()
-//   core/instances.ts — openInstance(dir)
+//   core/paths.ts     — instancesRoot(), normalizePath()
+//   core/instances.ts — openInstance(dir), isDefaultClaudeDir(dir)
 //   core/process.ts   — listClaudeProcesses()
 //   core/shared.ts     — CMActionResult DTO
 //
@@ -17,8 +17,8 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { basename } from 'node:path'
 import { linkCliInstanceToDesktop, listCliInstances } from './cli-instances'
 import { deleteInstanceMeta } from './instance-meta'
-import { openInstance } from './instances'
-import { defaultClaudeDir, instancesRoot, isPathInside, normalizePath } from './paths'
+import { isDefaultClaudeDir, openInstance } from './instances'
+import { instancesRoot, isPathInside, normalizePath } from './paths'
 import { type ClaudeProcessScan, scanClaudeProcesses } from './process'
 import type { CMActionResult } from './shared'
 
@@ -50,6 +50,24 @@ const RESERVED_WINDOWS_NAMES = new Set([
   'LPT8',
   'LPT9',
 ])
+
+/**
+ * Names this app has already spent on something else, so a folder may not take them.
+ *
+ * `SessionSummary.instance` carries an instance folder NAME — except for two words that mean
+ * something other than a folder. `'default'` is the regular non-isolated Claude Desktop
+ * (server/src/instance-sessions.ts scanAll stamps its chats with the literal string), and
+ * `'other'` is the sessions filter's "plain CLI / no desktop instance" scope
+ * (server/src/sessions.ts, and the same two words in the MCP tool descriptions).
+ *
+ * A folder taking one of those words does not fail loudly, which is exactly why it has to be
+ * refused here. An instance called "default" makes its chats indistinguishable from the regular
+ * install's — nothing downstream can then say which account held a given conversation, so the
+ * Sessions view either names the wrong account or gives up on both. One called "other" can never
+ * be picked in the instance filter, because that value already means "the ones with no instance".
+ * Neither is recoverable after the fact, and neither is a name anyone wants on purpose.
+ */
+const RESERVED_INSTANCE_LABELS = new Set(['default', 'other'])
 
 interface NameValidation {
   valid: boolean
@@ -99,6 +117,19 @@ function validateInstanceName(name: string): NameValidation {
     return {
       valid: false,
       reason: `Name '${trimmed}' is a reserved Windows device name.`,
+      sanitized: trimmed,
+    }
+  }
+
+  // Case-insensitively, because the collision is with a WORD the rest of the app matches on, and
+  // a folder called "Default" stamps its sessions "Default" — which is not the sentinel on POSIX
+  // but is on Windows, so the same folder would break in one place and not the other. Refusing
+  // both spellings everywhere is the only version of this rule that means the same thing on every
+  // machine. See RESERVED_INSTANCE_LABELS.
+  if (RESERVED_INSTANCE_LABELS.has(trimmed.toLowerCase())) {
+    return {
+      valid: false,
+      reason: `Name '${trimmed}' is reserved: AgentHydra already uses it to mean something other than a folder ('default' is the regular non-isolated Claude Desktop, 'other' is the sessions filter's no-instance scope). An instance with that name could not be told apart from it. Pick another name.`,
       sanitized: trimmed,
     }
   }
@@ -293,13 +324,10 @@ export async function removeInstance(
   }
 
   // --- Guard 1: default Claude data dir is never deletable. ---
-  let defaultDir: string
-  try {
-    defaultDir = normalizePath(defaultClaudeDir())
-  } catch {
-    defaultDir = ''
-  }
-  if (defaultDir && normDir.toLowerCase() === defaultDir.toLowerCase()) {
+  // Shared with quitInstance's guard and with CMInstance.isDefault, so all three agree about which
+  // dir IS the regular install — see isDefaultClaudeDir, which also explains why the case fold it
+  // replaced here was wrong on POSIX.
+  if (isDefaultClaudeDir(normDir)) {
     return {
       ok: false,
       action: 'remove',

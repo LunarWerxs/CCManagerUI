@@ -7,7 +7,7 @@
 // of the interpreter (skipped where none is installed) proving the argv actually lands unquoted.
 
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -239,20 +239,97 @@ describe('runOrchestrator - argv in, verdict out', () => {
     expect('error' in r && r.error).toContain('ENOENT')
   })
 
-  test('status reads the menu through the same spawn', async () => {
+  // A fake driver answering all three probes: --version, the bare menu, and --catalog. `catalog`
+  // is exactly what `orch.py --catalog` prints, so a test can hand it malformed output.
+  const fakeDriver =
+    (catalog: { code?: number; stdout: string; stderr?: string }) => async (command: string[]) => {
+      if (command[1] === '--version')
+        return { code: 0, stdout: 'Python 3.14.0\n', stderr: '', timedOut: false }
+      if (command[2] === '--catalog')
+        return {
+          code: catalog.code ?? 0,
+          stdout: catalog.stdout,
+          stderr: catalog.stderr ?? '',
+          timedOut: false,
+        }
+      return { code: 0, stdout: '  OBSERVE\n    chats  ...\n', stderr: '', timedOut: false }
+    }
+
+  const CATALOG_JSON = JSON.stringify({
+    chats: { kind: 'observe', summary: 'OBSERVE: every chat.', invocation: 'direct' },
+    archive_chat: { kind: 'mutate', summary: 'ACT: archive ONE chat.', guards: ['hold', 'force'] },
+  })
+
+  test('status reads the menu AND the action catalog through the same spawn', async () => {
     const dir = fakeToolbox()
     const s = await orchestratorStatus({
       dir,
       python: 'py-fake',
-      spawn: async (command) =>
-        command[1] === '--version'
-          ? { code: 0, stdout: 'Python 3.14.0\n', stderr: '', timedOut: false }
-          : { code: 0, stdout: '  OBSERVE\n    chats  ...\n', stderr: '', timedOut: false },
+      spawn: fakeDriver({ stdout: CATALOG_JSON }),
     })
     expect(s.present).toBe(true)
     expect(s.pythonVersion).toBe('Python 3.14.0')
     expect(s.menu).toContain('chats')
     expect(s.error).toBeNull()
+    // AH-25: the same list as DATA, so no consumer has to parse the prose above.
+    expect(s.actionsError).toBeNull()
+    expect(Object.keys(s.actions ?? {}).sort()).toEqual(['archive_chat', 'chats'])
+    expect(s.actions?.archive_chat?.kind).toBe('mutate')
+    expect(s.actions?.archive_chat?.guards).toEqual(['hold', 'force'])
+  })
+
+  // The three ways --catalog can fail to answer. In every one of them the toolbox is HEALTHY: the
+  // prose menu came back, so `error` must stay null and only `actionsError` may fill in. Folding
+  // these into `error` would make an older-but-working driver read as a broken install.
+  const catalogFailures = [
+    [
+      'a driver too old to know --catalog',
+      { code: 2, stdout: '', stderr: 'unknown option' },
+      /exited 2/,
+    ],
+    [
+      'output that is not JSON at all',
+      { stdout: 'orchestrator - one entry point.\n' },
+      /did not print JSON/,
+    ],
+    ['JSON that is not an object', { stdout: '["chats","archive_chat"]' }, /not an object/],
+  ] as const
+
+  for (const [name, catalog, expected] of catalogFailures) {
+    test(`${name} leaves the toolbox healthy and says WHY the catalog is missing`, async () => {
+      const s = await orchestratorStatus({
+        dir: fakeToolbox(),
+        python: 'py-fake',
+        spawn: fakeDriver(catalog),
+      })
+      expect(s.menu).toContain('chats')
+      expect(s.error).toBeNull()
+      expect(s.actions).toBeNull()
+      expect(s.actionsError).toMatch(expected)
+    })
+  }
+
+  test('an unread toolbox reports WHY, so "not read" never reads as "it has no actions"', async () => {
+    const s = await orchestratorStatus({
+      dir: join(tmpdir(), 'agenthydra-orch-absent-on-purpose'),
+      python: 'py-fake',
+      spawn: async () => ({ code: 0, stdout: '', stderr: '', timedOut: false }),
+    })
+    expect(s.present).toBe(false)
+    expect(s.actions).toBeNull()
+    expect(s.actionsError).toContain('no orch.py under')
+  })
+
+  test('the catalog is not a dispatch allowlist: a script missing from it still runs', async () => {
+    // orch.py resolves a script name against the FILES under scripts/ on purpose, so a new script
+    // works before its catalog row exists. If the daemon ever starts gating on `actions`, this
+    // test is what says so.
+    const dir = fakeToolbox()
+    const r = await runOrchestrator(
+      { script: 'brand_new_script' },
+      { dir, spawn: async () => ({ code: 0, stdout: 'ok', stderr: '', timedOut: false }) },
+    )
+    expect('ok' in r && r.ok).toBe(true)
   })
 })
 
@@ -286,4 +363,26 @@ test.skipIf(!hasPython)(
     expect('ok' in r && r.ok).toBe(true)
   },
   20_000,
+)
+
+// AH-25, against the REAL driver rather than a fake. Every test above proves the daemon handles
+// whatever `--catalog` prints; only this one proves the driver in this repo actually prints it.
+// A fake-spawn suite alone would stay green through a rename of the flag, a driver that lost the
+// subcommand, or a catalog that stopped being JSON - the whole failure this closes.
+test.skipIf(!hasPython || !existsSync(join(orchestratorDir(), 'orch.py')))(
+  'the real orch.py --catalog parses, and every row carries a kind and a summary',
+  async () => {
+    const s = await orchestratorStatus({})
+    expect(s.actionsError).toBeNull()
+    const actions = s.actions ?? {}
+    expect(Object.keys(actions).length).toBeGreaterThan(5)
+    for (const [name, row] of Object.entries(actions)) {
+      expect(['observe', 'mutate']).toContain(row.kind)
+      expect(typeof row.summary === 'string' && row.summary.length > 0).toBe(true)
+      // The prose menu and the data must describe the same toolbox, or a consumer that moved off
+      // the text is reading a different fleet from the one a person sees.
+      expect(s.menu).toContain(name)
+    }
+  },
+  60_000,
 )

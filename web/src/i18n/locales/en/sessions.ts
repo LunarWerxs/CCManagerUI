@@ -21,7 +21,22 @@ export default {
   // Items in here carry no explanatory second line. The labels are full sentences already, and a
   // menu that explains every row is a menu you read instead of aim at.
   chatOptions: 'More actions',
-  chatOptionsHint: 'What the transcript shows, plus the session file and terminal actions',
+  chatOptionsHint:
+    'The account, what the transcript shows, and the session file and terminal actions',
+  // --- which account this chat is talking to ---
+  // Named on the transcript itself because every instance runs a DIFFERENT Anthropic login, and
+  // that decides whether the chat is worth resuming at all (is the account out of quota?) and
+  // whose weekly limit a long run is spending. The chip shows the handle; the address is one
+  // click away, in the ⋯ menu.
+  accountLabel: 'Account',
+  // Two different absences. The instance is missing from the list entirely (deleted, or the
+  // regular install is not running so it has no row) — or it is right there and has no resolved
+  // identity yet. Telling you the first when it is the second sends you hunting for nothing.
+  accountUnresolved: 'This account is not in the instance list right now',
+  accountAddressUnknown: 'No address resolved for this account yet — it may be signed out',
+  openAccountInstance: 'Open this account',
+  focusAccountInstance: 'Bring this account to the front',
+  copyAccountEmail: 'Copy the account address',
   displayControlsActive: 'Part of this transcript is hidden by a display filter',
   fileActions: 'Session file',
   openFile: 'Open session file',

@@ -24,6 +24,7 @@ import {
   Trash2,
   TriangleAlert,
   Unlink,
+  UserRound,
 } from '@lucide/vue'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -89,10 +90,13 @@ import {
 } from '@/lib/api'
 import { formatBytes, formatUptime } from '@/lib/format'
 import {
+  accountDisplayName,
+  accountEmail,
   accountHandle,
   colorValue,
   displayName,
   iconComponent,
+  labelDisagreesWithAccount,
   resolveColorKey,
   resolveIconKey,
 } from '@/lib/instance-appearance'
@@ -251,16 +255,37 @@ function accountCellName(inst: CMInstance): string | null {
 }
 
 // The hover reveal: the full address, plus the Anthropic profile name when the account has one and
-// it isn't just the handle again. This is where the friendly name went — it is still one hover
-// away, it just no longer competes with the handle for the same slot, which is what made the
-// column unreadable (some rows a person's name, some rows an email fragment, no way to tell).
+// it isn't just the handle again, and the line saying the cell copies. This is where the friendly
+// name went — it is still one hover away, it just no longer competes with the handle for the same
+// slot, which is what made the column unreadable (some rows a person's name, some rows an email
+// fragment, no way to tell).
 function accountTitle(inst: CMInstance): string | undefined {
-  const email = inst.account?.email?.trim()
+  const email = accountEmail(inst.account)
   if (!email) return undefined
   const profile = inst.account?.name?.trim()
-  return profile && profile !== accountHandle(inst.account)
-    ? t('instances.accountTitleWithProfile', { email, profile })
-    : email
+  const head =
+    profile && profile !== accountHandle(inst.account)
+      ? t('instances.accountTitleWithProfile', { email, profile })
+      : email
+  return `${head}\n${t('instances.accountCopyHint')}`
+}
+
+/**
+ * Copy the account's FULL address, not the handle the cell shows.
+ *
+ * The handle is a display compromise — it fits the column — but it is not an identifier you can
+ * paste anywhere: two accounts on different domains render the same chip. So the cell shows the
+ * short form and hands over the long one, the same split the tooltip already made.
+ *
+ * A row with no resolved email is not clickable at all (see the template), so there is no silent
+ * no-op: a signed-out account's label ("(not logged in)") must never reach the clipboard looking
+ * like an address.
+ */
+function copyAccountEmail(inst: CMInstance) {
+  const email = accountEmail(inst.account)
+  if (!email) return
+  navigator.clipboard?.writeText(email).catch(() => {})
+  toast.success(t('instances.toastEmailCopied', { email }))
 }
 
 function accountBadgeVariant(inst: CMInstance) {
@@ -548,6 +573,26 @@ async function onCreateSubmit(name: string) {
   } finally {
     creating.value = false
   }
+}
+
+/**
+ * Clear the stored label so the row is named after the account again.
+ *
+ * `setAppearance` with `label: null` is exactly what the edit dialog sends for an empty field, so
+ * this is the same write, just without making the user open a dialog to delete text. Icon and
+ * colour are passed through unchanged: they are a separate choice and clearing the name is not a
+ * reason to lose the glyph.
+ */
+async function onUseAccountName(inst: CMInstance) {
+  const next = accountDisplayName(inst.account)
+  if (!next) return
+  const result = await setAppearance(inst.dir, {
+    label: null,
+    icon: inst.icon,
+    color: inst.color,
+  })
+  if (result?.ok) toast.success(t('instances.toastUsingAccountName', { name: next }))
+  else toast.error(result?.message ?? t('instances.toastSaveFailed'))
 }
 
 function openEditDialog(inst: CMInstance) {
@@ -1139,6 +1184,28 @@ onUnmounted(() => {
                   <span v-else class="cursor-default">{{ displayName(inst) }}</span>
                 </IconTooltip>
                 <Badge v-if="inst.isExternal" variant="outline">{{ $t('instances.external') }}</Badge>
+                <!-- The name you typed no longer matches the account this profile is signed into.
+                     A label overrides everything and nothing ever re-checked one, so a row goes on
+                     being named after an account it left — which is how a folder called `4claude`
+                     ends up labelled "3claude". The marker only reports the disagreement; the ⋯
+                     menu is where you resolve it, because the override is still yours to keep. -->
+                <IconTooltip
+                  v-if="labelDisagreesWithAccount(inst)"
+                  :label="$t('instances.labelStale')"
+                  :description="
+                    $t('instances.labelStaleHint', {
+                      label: inst.label ?? '',
+                      account: accountDisplayName(inst.account) ?? '',
+                    })
+                  "
+                >
+                  <span
+                    class="inline-flex items-center"
+                    :aria-label="$t('instances.labelStale')"
+                  >
+                    <TriangleAlert class="size-3.5 text-warning" />
+                  </span>
+                </IconTooltip>
                 <!-- A linked CLI login used to be visible NOWHERE on the row — its only trace was
                      the "CLI instances (0 of 1)" shortfall in the table below, which reads as
                      something hiding a row rather than as "it moved up here". An icon costs no row
@@ -1179,12 +1246,31 @@ onUnmounted(() => {
                    row, so this column can be compared down the table; the full address and the
                    Anthropic profile name are one hover away, and the plan/tier is its own column.
                    A logged-out instance still lands here as a badge — its account.label reads
-                   "(not logged in)". -->
+                   "(not logged in)".
+
+                   Clicking it copies the FULL address (the cell only has room for the handle, and
+                   the handle is not something you can paste at anything). Only a row with a
+                   resolved email becomes a button: a signed-out row has a badge to show and
+                   nothing to copy, and a button that does nothing is worse than plain text. -->
               <Badge
                 v-if="accountCellName(inst)"
+                :as="accountEmail(inst.account) ? 'button' : undefined"
+                :type="accountEmail(inst.account) ? 'button' : undefined"
                 :variant="accountBadgeVariant(inst)"
                 :title="accountTitle(inst)"
-                :class="accountTitle(inst) ? 'cursor-help' : undefined"
+                :aria-label="
+                  accountEmail(inst.account)
+                    ? $t('instances.copyAccountEmailAria', { email: accountEmail(inst.account) })
+                    : undefined
+                "
+                :class="
+                  accountEmail(inst.account)
+                    ? 'cursor-pointer transition-colors hover:brightness-110'
+                    : accountTitle(inst)
+                      ? 'cursor-help'
+                      : undefined
+                "
+                @click="copyAccountEmail(inst)"
               >
                 {{ accountCellName(inst) }}
               </Badge>
@@ -1264,8 +1350,19 @@ onUnmounted(() => {
                 </Button>
                 <!-- running: the primary action is Focus (bring the window forward); Quit moves
                      under the kebab so the common action is one click and the destructive one is deliberate -->
+                <!-- The same pulsing green dot the status glyph carries, on the button that only
+                     exists while the instance is running. The Actions column is where the eye ends
+                     up (it is where you click), and "Open" vs "Focus" is a quiet way to encode
+                     running-ness — the dot says it the same way the left of the row already does,
+                     so the two cannot be read as different states. -->
                 <Button v-else variant="outline" size="sm" :disabled="isBusy(inst)" @click="onFocus(inst)">
-                  <AppWindow /> {{ $t('instances.focusShort') }}
+                  <span class="relative inline-flex">
+                    <AppWindow />
+                    <span
+                      class="absolute -right-1 -top-1 size-1.5 rounded-full bg-success ring-2 ring-background animate-pulse"
+                    />
+                  </span>
+                  {{ $t('instances.focusShort') }}
                 </Button>
 
                 <DropdownMenu
@@ -1384,6 +1481,17 @@ onUnmounted(() => {
                     <DropdownMenuSeparator />
                     <!-- Edit (name + icon + color) is pure UI metadata, so it stays enabled even
                          while the instance runs (unlike Delete, which touches the folder) -->
+                    <!-- Drop the typed name and let the row be called after the account again.
+                         Offered on every labelled row, not only the mismatched ones, because "go
+                         back to the account name" is a thing you want on purpose — but it is the
+                         mismatched rows the warning marker sends here. -->
+                    <DropdownMenuItem
+                      v-if="inst.label"
+                      :disabled="isBusy(inst) || !accountDisplayName(inst.account)"
+                      @click="onUseAccountName(inst)"
+                    >
+                      <UserRound /> {{ $t('instances.useAccountName') }}
+                    </DropdownMenuItem>
                     <DropdownMenuItem
                       :disabled="isBusy(inst)"
                       @click="openEditDialog(inst)"
@@ -1474,9 +1582,13 @@ onUnmounted(() => {
       :submitting="quittingExternal"
       @confirm="onQuitExternalConfirm"
     />
+    <!-- instance-name is the placeholder for an empty name field, so it shows the ACCOUNT name
+         where there is one rather than the folder: an empty field means "name it after the
+         account" (displayName), and the placeholder should show what leaving it empty
+         actually gets you. The folder name is the fallback, same as displayName's. -->
     <EditInstanceDialog
       v-model:open="editOpen"
-      :instance-name="editTarget?.name ?? null"
+      :instance-name="accountDisplayName(editTarget?.account) ?? editTarget?.name ?? null"
       :dir="editTarget?.dir ?? null"
       :current-label="editTarget?.label ?? null"
       :current-icon="editTarget?.icon ?? null"

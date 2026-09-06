@@ -1215,8 +1215,16 @@ defineExpose({ save })
       </ExpandTransition>
     </SettingsGroup>
 
-    <!-- updates -->
-    <SettingsGroup :label="$t('settings.updates')">
+    <!-- updates.
+         Deep-linkable, because the blue dot on the header's settings button is the only thing that
+         says a new version exists and the dot itself explains nothing: clicking it now scrolls
+         here and pulses this card, so the answer to "why is there a dot?" is the first thing you
+         see instead of something you have to go hunting for down a long page. -->
+    <SettingsGroup
+      :ref="(el: unknown) => setSectionEl('updates', el)"
+      :class="flashSection === 'updates' ? 'settings-flash' : ''"
+      :label="$t('settings.updates')"
+    >
       <!-- The version number IS the status indicator + control now (owner request): green = up to
            date, amber = update available (click to apply & restart), red = blocked / no update
            source. Hover spells out the exact state; clicking re-checks, or applies a waiting update.

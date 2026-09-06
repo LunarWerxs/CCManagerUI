@@ -284,6 +284,22 @@ async function act(
   }
 }
 
+// Click the account address to copy it — the same act the full manager's Instances tab offers on
+// its account column, so "click the account, get the address" is one habit wherever the accounts
+// are listed. This window has no toast layer at all (it is deliberately minimal, see the
+// English-only note on the template), so the confirmation is the label turning into "Copied" for a
+// moment — the same trick InstanceNumber uses for the number chip.
+const copiedEmailDir = ref<string | null>(null)
+let copiedEmailTimer: number | undefined
+function copyEmail(dir: string, email: string): void {
+  navigator.clipboard?.writeText(email).catch(() => {})
+  copiedEmailDir.value = dir
+  window.clearTimeout(copiedEmailTimer)
+  copiedEmailTimer = window.setTimeout(() => {
+    copiedEmailDir.value = null
+  }, 1200)
+}
+
 function openClaude(instance: CMInstance): void {
   const key = `claude:${instance.dir}`
   void act(key, instance.isRunning ? 'Focus' : 'Start', () =>
@@ -358,6 +374,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (pollTimer !== null) window.clearInterval(pollTimer)
+  window.clearTimeout(copiedEmailTimer)
   lifetime?.close()
 })
 </script>
@@ -496,11 +513,17 @@ onBeforeUnmount(() => {
                   {{ instance.account.planLabel }}
                 </Badge>
               </div>
-              <p
-                class="truncate text-xs text-muted-foreground"
-                :title="instance.account?.email ?? undefined"
-              >
-                <template v-if="instance.account?.email">{{ instance.account.email }} · </template>
+              <p class="truncate text-xs text-muted-foreground">
+                <template v-if="instance.account?.email">
+                  <button
+                    type="button"
+                    class="cursor-pointer underline-offset-2 transition-colors hover:text-foreground hover:underline"
+                    :title="`Click to copy ${instance.account.email}`"
+                    :aria-label="`Copy the account address ${instance.account.email}`"
+                    @click="copyEmail(instance.dir, instance.account.email)"
+                  >{{ copiedEmailDir === instance.dir ? 'Copied' : instance.account.email }}</button>
+                  ·
+                </template>
                 <template v-else-if="resolvingAccounts.has(instance.dir)">Account resolving… · </template>
                 <template v-else>Account unavailable · </template>
                 {{ instance.isRunning ? `Running · PID ${instance.pid ?? '—'}` : 'Stopped' }}

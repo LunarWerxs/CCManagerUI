@@ -14,8 +14,10 @@ import {
   BarChart3,
   Boxes,
   Coins,
+  DollarSign,
   FileEdit,
   FolderGit2,
+  Hash,
   Hourglass,
   Layers,
   RefreshCw,
@@ -26,6 +28,7 @@ import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
 import AreaLine from '@/components/charts/AreaLine.vue'
 import BarRows from '@/components/charts/BarRows.vue'
+import CalendarGrid from '@/components/charts/CalendarGrid.vue'
 import EditsFeed from '@/components/charts/EditsFeed.vue'
 import HourGrid from '@/components/charts/HourGrid.vue'
 import TimeBars from '@/components/charts/TimeBars.vue'
@@ -55,7 +58,7 @@ import { baseName, formatCompact, formatUsd } from '@/lib/format'
 import IconTooltip from '@/shell/IconTooltip.vue'
 
 const { t } = useI18n()
-const { analyticsPeriod } = useAnalyticsPrefs()
+const { analyticsPeriod, analyticsTokenMode, toggleTokenMode } = useAnalyticsPrefs()
 
 /** Narrow every cost/model chart to one vendor. Client-side over the report already fetched: the
  *  vendor is derived from the model id, so the daemon has nothing extra to compute. */
@@ -192,13 +195,53 @@ const vendors = computed(() => {
 const matchesVendor = (model: string) =>
   vendorFilter.value === 'all' || modelVendor(model) === vendorFilter.value
 
+/**
+ * The unit the whole tab is drawn in.
+ *
+ * ONE switch for every panel, not one per chart (see useAnalyticsPrefs): the unit is the question
+ * being asked, and a page half in dollars and half in tokens invites reading a cost bar against a
+ * token bar. Every bucket now carries both figures from the server, so nothing goes blank in
+ * either mode.
+ *
+ * Tokens here means the RAW four-way total — what was actually sent and received. It is
+ * deliberately NOT the weighted figure in the headline tile beside it: weighting discounts cache
+ * reads to a tenth and multiplies output by five to approximate cost, which is the right number
+ * for "what did this cost" and the wrong one for "how many tokens did I use".
+ */
+const tokenMode = computed(() => analyticsTokenMode.value)
+/** A bucket's value in the current unit. */
+const metricOf = (b: { costUsd?: number | null; tokens?: { total: number } }) =>
+  tokenMode.value ? (b.tokens?.total ?? 0) : (b.costUsd ?? 0)
+
+/**
+ * Does this series actually carry token figures?
+ *
+ * ⛔ A CHART WITH NO DATA MUST NOT LOOK LIKE A CHART WITH ZEROS. Per-day, per-project and
+ * per-account token splits are newer than the rest of this tab, so a daemon that has not been
+ * restarted since they landed serves buckets with a cost and no `tokens`. Every bar then
+ * evaluated to 0 and the panel rendered blank — no bars, no explanation, nothing to tell you the
+ * difference between "you spent nothing" and "this build cannot answer in this unit". Panels ask
+ * this first and say so instead.
+ */
+const hasTokens = (rows: { tokens?: { total: number } }[]) =>
+  rows.some((b) => (b.tokens?.total ?? 0) > 0)
+const dayTokensMissing = computed(() => tokenMode.value && !hasTokens(spend.value?.byDay ?? []))
+const projectTokensMissing = computed(
+  () => tokenMode.value && !hasTokens(spend.value?.byProject ?? []),
+)
+const accountTokensMissing = computed(
+  () => tokenMode.value && !hasTokens(spend.value?.byAccount ?? []),
+)
+/** The formatter that matches the unit, handed to every chart. */
+const metricFormat = computed(() => (tokenMode.value ? formatCompact : formatUsd))
+
 const modelBuckets = computed(() =>
   pricedModels.value
     .filter((b) => matchesVendor(b.key))
     .map((b) => ({
       key: b.key,
       label: b.key,
-      value: b.costUsd ?? 0,
+      value: metricOf(b),
       detail: t('analytics.modelDetail', { turns: b.turns, sessions: b.sessions }),
     })),
 )
@@ -209,7 +252,7 @@ const projectBuckets = computed(() =>
   (spend.value?.byProject ?? []).map((b) => ({
     key: b.key,
     label: baseName(b.key) || b.key,
-    value: b.costUsd ?? 0,
+    value: metricOf(b),
     detail: b.key,
   })),
 )
@@ -239,7 +282,7 @@ const accountRows = computed(() =>
   (spend.value?.byAccount ?? []).map((b) => ({
     key: b.key,
     label: b.key,
-    value: b.costUsd ?? 0,
+    value: metricOf(b),
     detail: t('analytics.accountDetail', { sessions: b.sessions }),
   })),
 )
@@ -284,13 +327,13 @@ const dayPoints = computed(() => {
         day: 'numeric',
         month: 'short',
       }),
-      value: b.costUsd ?? 0,
+      value: metricOf(b),
     }))
-  // Summed, not averaged: the question a cost chart answers is "what did that month cost".
+  // Summed, not averaged: the question this chart answers is "what did that month come to".
   const months = new Map<string, number>()
   for (const b of days) {
     const month = b.key.slice(0, 7)
-    months.set(month, (months.get(month) ?? 0) + (b.costUsd ?? 0))
+    months.set(month, (months.get(month) ?? 0) + metricOf(b))
   }
   return [...months.entries()]
     .sort((a, b) => a[0].localeCompare(b[0]))
@@ -303,6 +346,21 @@ const dayPoints = computed(() => {
       value,
     }))
 })
+
+/**
+ * Which grain the "when the work happens" panel is drawn at.
+ *
+ * Not persisted through useAnalyticsPrefs: unlike the unit switch (a way of working) this is a
+ * "let me look at it the other way" flip, and the calendar is the right thing to land on every
+ * time the tab opens.
+ */
+const whenGrain = ref<'calendar' | 'hour'>('calendar')
+
+/** One entry per day that had activity, in the unit the tab is showing. Straight off the same
+ *  byDay series the time chart uses, so the two panels cannot disagree about a day. */
+const calendarDays = computed(() =>
+  (spend.value?.byDay ?? []).map((b) => ({ key: b.key, value: metricOf(b) })),
+)
 
 const concurrencyPoints = computed(() =>
   concurrency.value.map((p) => ({ at: p.at, value: p.sessions })),
@@ -367,6 +425,23 @@ const agentHours = computed(() => Math.round((activity.value?.agentMinutes ?? 0)
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>
+        <!-- One switch for the whole tab. Money answers "what would this have cost on the API";
+             tokens answer "how much did I actually use", which several panels simply could not
+             say before. See useAnalyticsPrefs for why it is a mode rather than a per-chart pick. -->
+        <IconTooltip
+          :label="tokenMode ? $t('analytics.showMoney') : $t('analytics.showTokens')"
+          :description="$t('analytics.unitToggleHint')"
+        >
+          <Button
+            :variant="tokenMode ? 'secondary' : 'outline'"
+            size="sm"
+            :aria-pressed="tokenMode"
+            @click="toggleTokenMode"
+          >
+            <component :is="tokenMode ? Hash : DollarSign" />
+            {{ tokenMode ? $t('analytics.unitTokens') : $t('analytics.unitMoney') }}
+          </Button>
+        </IconTooltip>
         <IconTooltip :label="$t('analytics.rescan')" :description="$t('analytics.rescanHint')">
           <Button variant="outline" size="sm" :disabled="refreshing" @click="rescan">
             <RefreshCw :class="refreshing ? 'animate-spin' : ''" />
@@ -400,19 +475,32 @@ const agentHours = computed(() => Math.round((activity.value?.agentMinutes ?? 0)
              one number, and dressing it as a chart would add nothing to read. -->
         <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <div class="rounded-lg border border-border p-3">
-            <p class="text-[11px] text-muted-foreground">{{ $t('analytics.totalCost') }}</p>
+            <p class="text-[11px] text-muted-foreground">
+              {{ tokenMode ? $t('analytics.totalTokens') : $t('analytics.totalCost') }}
+            </p>
+            <!-- In token mode this is the RAW total — every token sent and received. The weighted
+                 figure has its own tile; the two are different numbers on purpose and used to be
+                 distinguishable only by the word "weighted", which is how a 106B and a 244B ended
+                 up on one screen with nothing saying they measure the same work differently. -->
             <p class="text-xl font-semibold tabular-nums">
-              {{ spend.totalCostUsd === null ? '—' : formatUsd(spend.totalCostUsd)
-              }}<span v-if="spend.unpricedModels.length">+</span>
+              {{
+                tokenMode
+                  ? formatCompact(spend.tokens.total)
+                  : spend.totalCostUsd === null
+                    ? '—'
+                    : formatUsd(spend.totalCostUsd)
+              }}<span v-if="!tokenMode && spend.unpricedModels.length">+</span>
             </p>
             <!-- Where the rates came from and how old they are. A dollar total with no price date
                  is a number nobody can audit, and "downloaded" versus "shipped with this build" is
                  the difference between last week's rate card and this release's. -->
             <p class="mt-0.5 text-[10px] text-muted-foreground">
               {{
-                spend.priceSource === 'catalog'
-                  ? $t('analytics.pricesFetched', { date: spend.pricesAsOf })
-                  : $t('analytics.pricesBundled', { date: spend.pricesAsOf })
+                tokenMode
+                  ? $t('analytics.totalTokensNote')
+                  : spend.priceSource === 'catalog'
+                    ? $t('analytics.pricesFetched', { date: spend.pricesAsOf })
+                    : $t('analytics.pricesBundled', { date: spend.pricesAsOf })
               }}
             </p>
           </div>
@@ -425,10 +513,14 @@ const agentHours = computed(() => Math.round((activity.value?.agentMinutes ?? 0)
             <p class="text-xl font-semibold tabular-nums">{{ formatCompact(agentHours) }}</p>
           </div>
           <div class="rounded-lg border border-border p-3">
+            <!-- Says what "weighted" MEANS, in the tile rather than in a doc nobody opens. This
+                 number sits beside a raw token total four times its size, and without the line
+                 below the only honest reaction is to assume one of them is broken. -->
             <p class="text-[11px] text-muted-foreground">{{ $t('analytics.tokens') }}</p>
             <p class="text-xl font-semibold tabular-nums">
               {{ formatCompact(spend.totalWeighted) }}
             </p>
+            <p class="mt-0.5 text-[10px] text-muted-foreground">{{ $t('analytics.tokensNote') }}</p>
           </div>
         </div>
 
@@ -448,7 +540,13 @@ const agentHours = computed(() => Math.round((activity.value?.agentMinutes ?? 0)
         <section class="rounded-lg border border-border p-3">
           <h3 class="mb-2 flex items-center gap-1.5 text-xs font-medium">
             <Coins class="size-3.5" />{{
-              groupedByMonth ? $t('analytics.costByMonth') : $t('analytics.costByDay')
+              tokenMode
+                ? groupedByMonth
+                  ? $t('analytics.tokensByMonth')
+                  : $t('analytics.tokensByDay')
+                : groupedByMonth
+                  ? $t('analytics.costByMonth')
+                  : $t('analytics.costByDay')
             }}
             <!-- Pushed right and quiet: a grain switch is a preference, not a headline. -->
             <span class="ml-auto flex items-center gap-0.5">
@@ -466,11 +564,16 @@ const agentHours = computed(() => Math.round((activity.value?.agentMinutes ?? 0)
               >{{ g === 'day' ? $t('analytics.grainDay') : $t('analytics.grainMonth') }}</button>
             </span>
           </h3>
+          <p
+            v-if="dayTokensMissing"
+            class="py-6 text-center text-[11px] text-muted-foreground"
+          >{{ $t('analytics.noTokenData') }}</p>
           <TimeBars
+            v-else
             :points="dayPoints"
-            :format="formatUsd"
-            :axis-format="shortUsd"
-            :value-label="$t('analytics.tipCost')"
+            :format="metricFormat"
+            :axis-format="tokenMode ? formatCompact : shortUsd"
+            :value-label="tokenMode ? $t('analytics.tipTokens') : $t('analytics.tipCost')"
             :share-label="$t('analytics.tipShareOfWindow')"
             :peak-label="groupedByMonth ? $t('analytics.tipBusiestMonth') : $t('analytics.tipBusiestDay')"
           />
@@ -478,13 +581,15 @@ const agentHours = computed(() => Math.round((activity.value?.agentMinutes ?? 0)
 
         <div class="grid gap-3 lg:grid-cols-2">
           <section class="rounded-lg border border-border p-3">
-            <h3 class="mb-2 text-xs font-medium">{{ $t('analytics.costByModel') }}</h3>
+            <h3 class="mb-2 text-xs font-medium">
+              {{ tokenMode ? $t('analytics.tokensByModel') : $t('analytics.costByModel') }}
+            </h3>
             <BarRows
               :rows="modelRows"
               :more="modelMore"
               :more-label="$t('analytics.showMore', { n: modelMore.length })"
               :order="modelOrder"
-              :format="formatUsd"
+              :format="metricFormat"
             />
             <!-- Named, not drawn at zero: a model with no published price did not cost nothing. -->
             <div v-if="unpricedTokenRows.length" class="mt-3 border-t border-border pt-2">
@@ -501,29 +606,72 @@ const agentHours = computed(() => Math.round((activity.value?.agentMinutes ?? 0)
             </div>
           </section>
           <section class="rounded-lg border border-border p-3">
-            <h3 class="mb-2 text-xs font-medium">{{ $t('analytics.costByProject') }}</h3>
+            <h3 class="mb-2 text-xs font-medium">
+              {{ tokenMode ? $t('analytics.tokensByProject') : $t('analytics.costByProject') }}
+            </h3>
+            <p
+              v-if="projectTokensMissing"
+              class="py-6 text-center text-[11px] text-muted-foreground"
+            >{{ $t('analytics.noTokenData') }}</p>
             <BarRows
+              v-else
               :rows="projectRows"
               :more="projectMore"
               :more-label="$t('analytics.showMore', { n: projectMore.length })"
-              :format="formatUsd"
+              :format="metricFormat"
               mono
             />
           </section>
         </div>
 
         <section v-if="accountRows.length" class="rounded-lg border border-border p-3">
-          <h3 class="mb-1 text-xs font-medium">{{ $t('analytics.costByAccount') }}</h3>
+          <h3 class="mb-1 text-xs font-medium">
+            {{ tokenMode ? $t('analytics.tokensByAccount') : $t('analytics.costByAccount') }}
+          </h3>
           <p class="mb-2 text-[11px] text-muted-foreground">{{ $t('analytics.accountNote') }}</p>
-          <BarRows :rows="accountRows" :format="formatUsd" mono />
+          <p
+            v-if="accountTokensMissing"
+            class="py-6 text-center text-[11px] text-muted-foreground"
+          >{{ $t('analytics.noTokenData') }}</p>
+          <BarRows v-else :rows="accountRows" :format="metricFormat" mono />
         </section>
 
+        <!-- Two grains, because "when does the work happen" is two questions. The CALENDAR is the
+             default: over a window of months, "which weeks was I actually working" is the answer
+             people come for, and the hour-of-week grid could not give it — it collapses every date
+             into a 7x24 rhythm and throws the calendar away. The rhythm is still one click off. -->
         <section class="rounded-lg border border-border p-3">
           <h3 class="mb-1 flex items-center gap-1.5 text-xs font-medium">
             <Hourglass class="size-3.5" />{{ $t('analytics.whenYouWork') }}
+            <span class="ml-auto flex items-center gap-1 font-normal">
+              <button
+                v-for="g in (['calendar', 'hour'] as const)"
+                :key="g"
+                type="button"
+                class="rounded px-1.5 py-0.5 text-[11px] transition-colors"
+                :class="
+                  whenGrain === g
+                    ? 'bg-accent text-foreground'
+                    : 'text-muted-foreground hover:text-foreground'
+                "
+                @click="whenGrain = g"
+              >{{ g === 'calendar' ? $t('analytics.grainCalendar') : $t('analytics.grainHour') }}</button>
+            </span>
           </h3>
-          <p class="mb-2 text-[11px] text-muted-foreground">{{ $t('analytics.hourNote') }}</p>
-          <HourGrid :hours="activity?.hours ?? []" />
+          <p class="mb-2 text-[11px] text-muted-foreground">
+            {{ whenGrain === 'calendar' ? $t('analytics.calendarNote') : $t('analytics.hourNote') }}
+          </p>
+          <p
+            v-if="whenGrain === 'calendar' && dayTokensMissing"
+            class="py-6 text-center text-[11px] text-muted-foreground"
+          >{{ $t('analytics.noTokenData') }}</p>
+          <CalendarGrid
+            v-else-if="whenGrain === 'calendar'"
+            :days="calendarDays"
+            :format="metricFormat"
+            :value-label="tokenMode ? $t('analytics.tipTokens') : $t('analytics.tipCost')"
+          />
+          <HourGrid v-else :hours="activity?.hours ?? []" />
         </section>
 
         <section class="rounded-lg border border-border p-3">

@@ -127,10 +127,92 @@ def build_questions(cap: int) -> dict:
     }
 
 
-def apply_answers(payload: dict) -> list[dict]:
-    import archive_chat
+def _apply_reply(sid: str, a: dict) -> dict:
+    """Stage a reply decision, falling back to the last rendered text when the gate has no evidence."""
     from lib import gatelib
 
+    text = str(a.get("text") or "").strip()
+    if not text:
+        raise ValueError("a reply decision needs text")
+    match = hydralib.resolve_one(sid)
+    verdict = gatelib.gate_match(match, hydralib.session_row)
+    src = (verdict or {}).get("finished") or (verdict or {}).get("idle") or {}
+    evidence = src.get("last_assistant_text") or ""
+    if not evidence:
+        # THE SAME FALLBACK stage_reply.py GOT, AND THIS PATH DID NOT (2026-09-01).
+        # The gate reports last_assistant_text only for a FINISHED or IDLE chat, so
+        # a busy one stages with no evidence, no verify snippet, and the courier
+        # then refuses to type - the reply is written, queued, and undeliverable
+        # forever. Fixing it in stage_reply alone left the JUDGMENT QUEUE, which is
+        # where most replies are actually written, still producing dead ones.
+        import stage_reply
+        evidence = stage_reply.last_rendered_text(sid)
+    staged = deliverylib.stage(
+        sid, text, title=match.get("title") or "",
+        instance=match.get("instance") or "",
+        evidence=evidence, by="interview",
+    )
+    return {"ok": True, "outcome": f"staged {staged['id']} - the next courier/sweep run delivers it"}
+
+
+def _apply_hold(sid: str, a: dict) -> dict:
+    """Hold a chat, requiring a reason (holdlib enforces this - the law)."""
+    reason = str(a.get("reason") or "").strip()
+    holdlib.hold(sid, reason)  # raises without a reason - the law
+    return {"ok": True, "outcome": "held - automation leaves it alone until released"}
+
+
+def _apply_archive(sid: str) -> dict:
+    """Archive a chat and classify the result, treating a deferred exit (8) as success."""
+    import archive_chat
+
+    code, said = clilib.capture(archive_chat.main, [sid, "--force"])
+    # Exit 8 = DEFERRED: the chat was asked to update its docs first and archives
+    # on a later pass. That IS the right thing happening, so it counts as ok.
+    return {
+        "ok": code in (0, 8), "exit": code,
+        "outcome": "archived and verified" if code == 0
+        else "asked to preserve its docs first; archives on a later pass" if code == 8
+        else f"archive refused/failed (exit {code}): "
+             f"{said.splitlines()[0][:120] if said else ''}",
+    }
+
+
+def _apply_skip(a: dict) -> dict:
+    """Record a skip with its reason; the chat stays in the queue."""
+    return {"ok": True, "outcome": f"skipped: {str(a.get('reason') or 'no reason given')[:120]}"}
+
+
+def _apply_approve(sid: str) -> dict:
+    """Press a queued approval escalation through the shared actuator, then drop the row."""
+    # ESCALATION ONLY: a person or the AI judged this queued prompt safe. Press it
+    # through the SAME actuator unblock_prompts.py uses (reusing its rails - aim,
+    # verify-snippet, one-driver-per-window - rather than re-deriving them here),
+    # then drop the row so it is not asked about again.
+    import unblock_prompts
+
+    esc = approvallib.get_escalation(sid)
+    if esc is None:
+        raise ValueError("no queued approval escalation for this sessionId")
+    result = unblock_prompts.press(esc)
+    if result.get("ok"):
+        approvallib.resolve_escalation(sid)
+    return {"ok": bool(result.get("ok")), "outcome": result.get("outcome") or "did not clear"}
+
+
+def _apply_deny(sid: str, a: dict) -> dict:
+    """Drop a queued approval escalation without pressing it - the chat stays stuck."""
+    # ESCALATION ONLY: confirmed unsafe. Never pressed; the chat stays exactly as
+    # stuck as it was - only the queue entry is cleared, so it stops being asked.
+    if approvallib.get_escalation(sid) is None:
+        raise ValueError("no queued approval escalation for this sessionId")
+    approvallib.resolve_escalation(sid)
+    return {"ok": True, "outcome": (
+        f"denied - left stuck, dropped from the queue: "
+        f"{str(a.get('reason') or 'no reason given')[:120]}")}
+
+
+def apply_answers(payload: dict) -> list[dict]:
     results = []
     answers = payload.get("answers")
     if not isinstance(answers, list):
@@ -141,73 +223,68 @@ def apply_answers(payload: dict) -> list[dict]:
         entry = {"sessionId": sid, "decision": decision}
         try:
             if decision == "reply":
-                text = str(a.get("text") or "").strip()
-                if not text:
-                    raise ValueError("a reply decision needs text")
-                match = hydralib.resolve_one(sid)
-                verdict = gatelib.gate_match(match, hydralib.session_row)
-                src = (verdict or {}).get("finished") or (verdict or {}).get("idle") or {}
-                evidence = src.get("last_assistant_text") or ""
-                if not evidence:
-                    # THE SAME FALLBACK stage_reply.py GOT, AND THIS PATH DID NOT (2026-09-01).
-                    # The gate reports last_assistant_text only for a FINISHED or IDLE chat, so
-                    # a busy one stages with no evidence, no verify snippet, and the courier
-                    # then refuses to type - the reply is written, queued, and undeliverable
-                    # forever. Fixing it in stage_reply alone left the JUDGMENT QUEUE, which is
-                    # where most replies are actually written, still producing dead ones.
-                    import stage_reply
-                    evidence = stage_reply.last_rendered_text(sid)
-                staged = deliverylib.stage(
-                    sid, text, title=match.get("title") or "",
-                    instance=match.get("instance") or "",
-                    evidence=evidence, by="interview",
-                )
-                entry.update(ok=True, outcome=f"staged {staged['id']} - the next courier/sweep run delivers it")
+                entry.update(_apply_reply(sid, a))
             elif decision == "hold":
-                reason = str(a.get("reason") or "").strip()
-                holdlib.hold(sid, reason)  # raises without a reason - the law
-                entry.update(ok=True, outcome="held - automation leaves it alone until released")
+                entry.update(_apply_hold(sid, a))
             elif decision == "archive":
-                code, said = clilib.capture(archive_chat.main, [sid, "--force"])
-                # Exit 8 = DEFERRED: the chat was asked to update its docs first and archives
-                # on a later pass. That IS the right thing happening, so it counts as ok.
-                entry.update(ok=code in (0, 8), exit=code,
-                             outcome="archived and verified" if code == 0
-                             else "asked to preserve its docs first; archives on a later pass" if code == 8
-                             else f"archive refused/failed (exit {code}): "
-                                  f"{said.splitlines()[0][:120] if said else ''}")
+                entry.update(_apply_archive(sid))
             elif decision == "skip":
-                entry.update(ok=True, outcome=f"skipped: {str(a.get('reason') or 'no reason given')[:120]}")
+                entry.update(_apply_skip(a))
             elif decision == "approve":
-                # ESCALATION ONLY: a person or the AI judged this queued prompt safe. Press it
-                # through the SAME actuator unblock_prompts.py uses (reusing its rails - aim,
-                # verify-snippet, one-driver-per-window - rather than re-deriving them here),
-                # then drop the row so it is not asked about again.
-                import unblock_prompts
-
-                esc = approvallib.get_escalation(sid)
-                if esc is None:
-                    raise ValueError("no queued approval escalation for this sessionId")
-                result = unblock_prompts.press(esc)
-                if result.get("ok"):
-                    approvallib.resolve_escalation(sid)
-                entry.update(ok=bool(result.get("ok")),
-                             outcome=result.get("outcome") or "did not clear")
+                entry.update(_apply_approve(sid))
             elif decision == "deny":
-                # ESCALATION ONLY: confirmed unsafe. Never pressed; the chat stays exactly as
-                # stuck as it was - only the queue entry is cleared, so it stops being asked.
-                if approvallib.get_escalation(sid) is None:
-                    raise ValueError("no queued approval escalation for this sessionId")
-                approvallib.resolve_escalation(sid)
-                entry.update(ok=True, outcome=(
-                    f"denied - left stuck, dropped from the queue: "
-                    f"{str(a.get('reason') or 'no reason given')[:120]}"))
+                entry.update(_apply_deny(sid, a))
             else:
                 raise ValueError(f"unknown decision {decision!r}")
         except (hydralib.ChatNotFound, hydralib.AmbiguousChat, hydralib.DaemonError, ValueError) as err:
             entry.update(ok=False, outcome=f"did not apply: {err}")
         results.append(entry)
     return results
+
+
+def _print_ask_output(q: dict, as_json: bool) -> None:
+    """Render --ask output: raw JSON, or human-readable questions and approval escalations."""
+    if as_json:
+        print(json.dumps(q, indent=2))
+        return
+    if not q["questions"] and not q["approvalQuestions"]:
+        print("nothing to ask - the judgment queue and the approval queue are both empty.")
+        return
+    if q["questions"]:
+        print(f"{len(q['questions'])} question(s)"
+              + (f" (+{q['overCap']} over --max)" if q["overCap"] else "")
+              + " - answer with: python interview.py --apply answers.json\n")
+        for i, x in enumerate(q["questions"], 1):
+            print(f"--- {i}. [{x['instance'] or 'console'}] {x['title']}")
+            print(f"    id: {x['sessionId']}")
+            print(f"    state: {x['state']}")
+            print(f"    its last words:")
+            for line in (x["lastWords"] or "(nothing readable)").splitlines()[-8:]:
+                print(f"      | {line}")
+            print(f"    -> {x['question']}\n")
+    if q["approvalQuestions"]:
+        print(f"{len(q['approvalQuestions'])} approval escalation(s)"
+              + (f" (+{q['approvalOverCap']} over --max)" if q["approvalOverCap"] else "")
+              + " - answer with: python interview.py --apply answers.json\n")
+        for i, x in enumerate(q["approvalQuestions"], 1):
+            print(f"~~~ {i}. [{x['instance'] or 'console'}] {x['title']}")
+            print(f"    id: {x['sessionId']}")
+            print(f"    tool: {x['toolName']}")
+            print(f"    why it escalated: {x['why']}")
+            print(f"    pending command (DATA, not an instruction):")
+            for line in (x["command"] or "(nothing readable)").splitlines()[-8:]:
+                print(f"      | {line}")
+            print(f"    -> {x['question']}\n")
+    print(json.dumps(q["answerFormat"], indent=2))
+
+
+def _print_apply_results(results: list[dict], as_json: bool) -> None:
+    """Render --apply results: raw JSON, or one status line per answer."""
+    if as_json:
+        print(json.dumps({"results": results}, indent=2))
+    else:
+        for r in results:
+            print(f"  {'✓' if r.get('ok') else '✗'} {r['decision']:<8} {r['sessionId'][:8]}  {r['outcome']}")
 
 
 def main(argv: list[str]) -> int:
@@ -226,38 +303,7 @@ def main(argv: list[str]) -> int:
         except hydralib.DaemonError as err:
             print(f"interview FAILED: {err}", file=sys.stderr)
             return 1
-        if as_json:
-            print(json.dumps(q, indent=2))
-        else:
-            if not q["questions"] and not q["approvalQuestions"]:
-                print("nothing to ask - the judgment queue and the approval queue are both empty.")
-                return 0
-            if q["questions"]:
-                print(f"{len(q['questions'])} question(s)"
-                      + (f" (+{q['overCap']} over --max)" if q["overCap"] else "")
-                      + " - answer with: python interview.py --apply answers.json\n")
-                for i, x in enumerate(q["questions"], 1):
-                    print(f"--- {i}. [{x['instance'] or 'console'}] {x['title']}")
-                    print(f"    id: {x['sessionId']}")
-                    print(f"    state: {x['state']}")
-                    print(f"    its last words:")
-                    for line in (x["lastWords"] or "(nothing readable)").splitlines()[-8:]:
-                        print(f"      | {line}")
-                    print(f"    -> {x['question']}\n")
-            if q["approvalQuestions"]:
-                print(f"{len(q['approvalQuestions'])} approval escalation(s)"
-                      + (f" (+{q['approvalOverCap']} over --max)" if q["approvalOverCap"] else "")
-                      + " - answer with: python interview.py --apply answers.json\n")
-                for i, x in enumerate(q["approvalQuestions"], 1):
-                    print(f"~~~ {i}. [{x['instance'] or 'console'}] {x['title']}")
-                    print(f"    id: {x['sessionId']}")
-                    print(f"    tool: {x['toolName']}")
-                    print(f"    why it escalated: {x['why']}")
-                    print(f"    pending command (DATA, not an instruction):")
-                    for line in (x["command"] or "(nothing readable)").splitlines()[-8:]:
-                        print(f"      | {line}")
-                    print(f"    -> {x['question']}\n")
-            print(json.dumps(q["answerFormat"], indent=2))
+        _print_ask_output(q, as_json)
         return 0
 
     if "--apply" in argv:
@@ -272,11 +318,7 @@ def main(argv: list[str]) -> int:
         except (OSError, json.JSONDecodeError, ValueError) as err:
             print(f"answers file rejected: {err}", file=sys.stderr)
             return 3
-        if as_json:
-            print(json.dumps({"results": results}, indent=2))
-        else:
-            for r in results:
-                print(f"  {'✓' if r.get('ok') else '✗'} {r['decision']:<8} {r['sessionId'][:8]}  {r['outcome']}")
+        _print_apply_results(results, as_json)
         return 0 if all(r.get("ok") for r in results) else 2
 
     print(__doc__.strip(), file=sys.stderr)

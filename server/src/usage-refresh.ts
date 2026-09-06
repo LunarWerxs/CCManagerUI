@@ -19,6 +19,8 @@
 import { listCliInstances } from './core/cli-instances'
 import { listInstances } from './core/instances'
 import { getSetting, setSetting } from './db'
+import { getProviderSettings } from './provider-settings'
+import { runKeepaliveSweep } from './session-keepalive'
 import type { UsageSettings } from './types'
 import { checkUsageForCliInstance, checkUsageForDesktop, desktopIsCheckable } from './usage-service'
 
@@ -118,6 +120,31 @@ export async function sweepUsage(): Promise<number> {
       await sleep(STAGGER_MS)
     }
     lastSweepAt = new Date().toISOString()
+
+    // The keepalive rides on the BACK of this sweep, deliberately: its decision is made from the
+    // quota readings the loops above just refreshed, so it acts on numbers seconds old rather than
+    // on whatever was cached hours ago. It is a no-op unless switched on (see provider-settings),
+    // and it declines on its own terms besides — session-keepalive.ts.
+    //
+    // CLI logins only. The nudge is a `claude -p` spawn pointed at a CLAUDE_CONFIG_DIR, which is
+    // what a CLI instance IS; a desktop profile keeps its credential somewhere that spawn cannot
+    // read, so a desktop-only account is reached through its linked CLI login or not at all.
+    try {
+      const provider = getProviderSettings()
+      const result = await runKeepaliveSweep({
+        enabled: provider.keepaliveEnabled,
+        weeklyFloorPct: provider.keepaliveWeeklyFloorPct,
+        targets: listCliInstances()
+          .filter((c) => c.loggedIn)
+          .map((c) => ({ label: c.name, configDir: c.configDir, usageKey: `cli:${c.id}` })),
+      })
+      // Logged, not silent: this is the one loop here that SPENDS, so what it did (and what it
+      // declined to do, with the reason) has to be answerable after the fact.
+      if (result.nudged.length)
+        console.log(`[keepalive] started the 5-hour window on: ${result.nudged.join(', ')}`)
+    } catch (err) {
+      console.error('[keepalive] sweep failed:', err)
+    }
   } finally {
     sweeping = false
   }

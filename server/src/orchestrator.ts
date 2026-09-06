@@ -337,6 +337,21 @@ export interface OrchestratorRun {
   stderr: string
 }
 
+/** One row of `lib/actionlib.CATALOG`, as `orch.py --catalog` prints it. Deliberately loose: the
+ *  Python catalog is the source of truth and gains fields as scripts gain rails, and a daemon that
+ *  rejected a key it had not been taught would turn a catalog addition into an outage here. */
+export interface OrchestratorAction {
+  /** `observe` (reads only) or `mutate` (changes something, behind the rails). */
+  kind: string
+  summary: string
+  invocation?: string
+  platforms?: string
+  guards?: string[]
+  result?: string
+  availability?: string
+  [extra: string]: unknown
+}
+
 export interface OrchestratorStatus {
   dir: string
   present: boolean
@@ -345,6 +360,11 @@ export interface OrchestratorStatus {
   /** The driver's own menu (`python orch.py` with no arguments), when the tree is present and
    *  python answers - the one place every script and what it does is listed. */
   menu: string | null
+  /** The same list as DATA (`orch.py --catalog`, i.e. lib/actionlib.CATALOG), so a caller reads
+   *  the actions instead of parsing `menu`'s prose (audit AH-25). null means NOT READ, never "it
+   *  has no actions" - `actionsError` says which, so the two can never look alike. */
+  actions: Record<string, OrchestratorAction> | null
+  actionsError: string | null
   error: string | null
 }
 
@@ -652,7 +672,54 @@ async function probeMenu(
   }
 }
 
-/** Is the toolbox there and does python answer - and if so, the menu. Read-only. */
+/** `python orch.py --catalog`, i.e. lib/actionlib.CATALOG as JSON (audit AH-25). Until this
+ *  existed the only machine-readable view of the action list was the printed menu's prose, so
+ *  every consumer - mcp.ts's orchestrator_menu among them - was a text parser over a layout
+ *  nobody had promised to keep.
+ *
+ *  Its failure is deliberately NOT folded into OrchestratorStatus.error. The prose menu is the
+ *  older surface and still the one a person reads; a driver too old to know `--catalog`, or a
+ *  catalog that will not parse, is a missing convenience rather than an unhealthy toolbox, and
+ *  reporting it as `error` would make a perfectly working install read as broken.
+ *
+ *  It is also NOT a dispatch allowlist, and must never become one. orch.py resolves a script name
+ *  against the FILES under scripts/ on purpose (see `_scripts_on_disk` there), so a brand-new
+ *  script is runnable the moment it lands, before anyone has written its catalog row -
+ *  tests/test_actionlib.py is what catches a missing row, not a refusal to run. Gating runs on
+ *  this list would turn that documented grace period into an outage. */
+async function probeCatalog(
+  spawn: NonNullable<SpawnDeps['spawn']>,
+  python: string,
+  dir: string,
+): Promise<{ actions: Record<string, OrchestratorAction> | null; error: string | null }> {
+  try {
+    const c = await spawn([python, 'orch.py', '--catalog'], dir, 60_000)
+    if (c.code !== 0)
+      return {
+        actions: null,
+        error: `orch.py --catalog exited ${c.code}: ${`${c.stderr}${c.stdout}`.trim()}`,
+      }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(c.stdout)
+    } catch (e) {
+      return {
+        actions: null,
+        error: `orch.py --catalog did not print JSON: ${e instanceof Error ? e.message : String(e)}`,
+      }
+    }
+    // An array or a bare string parses fine and would then read as a catalog with no rows, which
+    // is the one answer this field must never give by accident.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      return { actions: null, error: 'orch.py --catalog printed JSON that is not an object' }
+    return { actions: parsed as Record<string, OrchestratorAction>, error: null }
+  } catch (e) {
+    return { actions: null, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/** Is the toolbox there and does python answer - and if so, the menu and the action catalog.
+ *  Read-only. */
 export async function orchestratorStatus(
   deps: SpawnDeps & { dir?: string; python?: string } = {},
 ): Promise<OrchestratorStatus> {
@@ -668,10 +735,21 @@ export async function orchestratorStatus(
   )
   error = error ?? versionError
   let menu: string | null = null
+  let actions: Record<string, OrchestratorAction> | null = null
+  // Never left as a bare null: a status read that could not look must say so, or "not read" and
+  // "read, and there is nothing" become the same answer.
+  let actionsError: string | null = error ?? 'the toolbox was not read'
   if (present && pythonVersion) {
-    const { menu: m, error: menuError } = await probeMenu(spawn, python, dir)
-    menu = m
-    error = error ?? menuError
+    // Two spawns of the same driver with nothing between them, so a status read costs one round
+    // trip rather than two sequential 60s ceilings.
+    const [m, c] = await Promise.all([
+      probeMenu(spawn, python, dir),
+      probeCatalog(spawn, python, dir),
+    ])
+    menu = m.menu
+    error = error ?? m.error
+    actions = c.actions
+    actionsError = c.error
   }
-  return { dir, present, python, pythonVersion, menu, error }
+  return { dir, present, python, pythonVersion, menu, actions, actionsError, error }
 }

@@ -239,6 +239,23 @@ export interface CMInstance {
   /** True when discovered from a running process whose --user-data-dir isn't under
    *  the instances root. */
   isExternal: boolean
+  /**
+   * True when this row IS the regular, non-isolated Claude Desktop — its dir is
+   * `claudeUserDataDir()` rather than anything under the instances root.
+   *
+   * The one fact that lets a caller join a SESSION to this row. A session carries an instance
+   * LABEL (`SessionSummary.instance`): a dir name for an isolated instance, or the literal
+   * `'default'` for the non-isolated install (server/src/instance-sessions.ts scanAll). A dir name
+   * matches `name` directly; `'default'` never can, because this row's `name` is the basename of
+   * the default user-data dir ("Claude" on Windows) and nothing here is ever called "default".
+   * Without this flag the web had to guess — and guessing here means showing one account's email
+   * against another account's chat, which is the single thing the identity code is most careful
+   * about (see `loginChanged`).
+   *
+   * Note this row still only EXISTS while the default install is running: it is discovered from a
+   * process, never seeded (see listInstances). False on every isolated instance.
+   */
+  isDefault: boolean
   /** User display label overriding the folder `name` (null = show `name`). Pure UI metadata
    *  (instance-meta.json under appDataDir()), so it can be changed while the instance runs —
    *  unlike the folder, which Claude Desktop holds open. */
