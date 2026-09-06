@@ -362,6 +362,15 @@ def main(argv: list[str], runner=None) -> int:
         return emit(Outcome(f"compact FAILED: {err}", 1), as_json)
 
     row, outcome = resolve_target_row(rows, args[0])
+    if row is None:
+        # THE SEVEN-DAY LIST IS A SEARCH, NOT A CENSUS (audit AH-07): a target older than the
+        # window is still a real, compactable chat. Widen to the whole census once before
+        # refusing, so an explicit id or title resolves however old it is.
+        try:
+            rows = hydralib.sessions_all()
+        except hydralib.DaemonError as err:
+            return emit(Outcome(f"compact FAILED: {err}", 1), as_json)
+        row, outcome = resolve_target_row(rows, args[0])
     if outcome:
         return emit(outcome, as_json)
     sid = row.get("session_id") or ""

@@ -100,33 +100,47 @@ class WrapperTest(unittest.TestCase):
         # daemon-down exit strand the lock forever, wedging every later tick. The old test
         # only checked both guards EXIST - this pins that the daemon check runs FIRST, so a
         # skip can never leave a lock behind.
+        #
+        # AH-16: the lock's mkdir/rmdir no longer lives in this wrapper's text at all - it
+        # moved into lib/joblocklib.py, invoked via run_locked.py - so what this test pins is
+        # now "the daemon guard runs before run_locked.py is even called".
         for job, spec in schedule_jobs.JOBS.items():
             if not (spec["needs_daemon"] and spec.get("lock")):
                 continue
             body = schedule_jobs.write_wrapper(job, spec).read_text(encoding="utf-8")
-            self.assertIn("mkdir", body, f"{job} lost its lock guard")
-            self.assertLess(body.index("7787/api/health"), body.index("mkdir"),
+            self.assertIn("run_locked.py", body, f"{job} lost its lock guard")
+            self.assertLess(body.index("7787/api/health"), body.index("run_locked.py"),
                             f"{job}: the daemon guard must run BEFORE the lock is taken")
+
+    def _assert_no_parens_in_if_blocks(self, job: str, label: str, body: str) -> None:
+        depth = 0
+        for n, line in enumerate(body.splitlines(), 1):
+            s = line.strip()
+            if depth == 0:
+                if s.startswith("if ") and s.endswith("("):
+                    depth = 1
+                continue
+            if s == ")":
+                depth = 0
+                continue
+            self.assertNotIn("(", line, f"{label} line {n} has '(' inside an if-block: {s}")
+            self.assertNotIn(")", line, f"{label} line {n} has ')' inside an if-block: {s}")
 
     def test_no_wrapper_puts_a_parenthesis_inside_a_cmd_if_block(self):
         # 2026-09-01: the icon guard's echo said "(python orch.py arm)" inside `if ( ... )`.
         # cmd parses the whole block before running either branch, the ')' closed it early,
         # every lane logged "nothing was unexpected at this time." and exited 255 BEFORE its
         # script ran - for an hour, on every tick, while looking like a quiet fleet.
+        #
+        # AH-16: this now also covers the .work.cmd a lock-carrying job's lines land in - the
+        # redesign moved the LOCK's if-block out entirely (into Python), but it must not have
+        # relocated the hazard into the split-off work file instead.
         for job, spec in schedule_jobs.JOBS.items():
             body = schedule_jobs.write_wrapper(job, spec).read_text(encoding="utf-8")
-            depth = 0
-            for n, line in enumerate(body.splitlines(), 1):
-                s = line.strip()
-                if depth == 0:
-                    if s.startswith("if ") and s.endswith("("):
-                        depth = 1
-                    continue
-                if s == ")":
-                    depth = 0
-                    continue
-                self.assertNotIn("(", line, f"{job}.cmd line {n} has '(' inside an if-block: {s}")
-                self.assertNotIn(")", line, f"{job}.cmd line {n} has ')' inside an if-block: {s}")
+            self._assert_no_parens_in_if_blocks(job, f"{job}.cmd", body)
+            if spec.get("lock"):
+                work = schedule_jobs.work_path(job).read_text(encoding="utf-8")
+                self._assert_no_parens_in_if_blocks(job, f"{job}.work.cmd", work)
 
     def test_every_acting_job_carries_the_icon_guard_and_the_ungated_ones_do_not(self):
         # The tray icon is the switch (owner order, 2026-09-01): every acting lane asks
@@ -161,17 +175,21 @@ class WrapperTest(unittest.TestCase):
         self.assertIn("dashboard.py", body)
 
     def test_reconcile_job_never_retries_unattended(self):
-        body = schedule_jobs.write_wrapper("reconcile", schedule_jobs.JOBS["reconcile"]).read_text(encoding="utf-8")
-        self.assertIn("reconcile.py", body)
-        self.assertNotIn("--retry", body)  # an unattended retry is what v1/v2 died of
+        # AH-16: a lock-carrying job's own command now lives in its .work.cmd (run_locked.py
+        # runs that file while holding the job lock); the main wrapper only names that path.
+        schedule_jobs.write_wrapper("reconcile", schedule_jobs.JOBS["reconcile"])
+        work = schedule_jobs.work_path("reconcile").read_text(encoding="utf-8")
+        self.assertIn("reconcile.py", work)
+        self.assertNotIn("--retry", work)  # an unattended retry is what v1/v2 died of
 
     def test_todo_sweep_runs_odin_and_never_commits(self):
-        body = schedule_jobs.write_wrapper("todo-sweep", schedule_jobs.JOBS["todo-sweep"]).read_text(encoding="utf-8")
-        self.assertIn("odin.py", body)
-        self.assertIn("discover", body)
-        self.assertIn("loki --file --apply", body)
+        schedule_jobs.write_wrapper("todo-sweep", schedule_jobs.JOBS["todo-sweep"])
+        work = schedule_jobs.work_path("todo-sweep").read_text(encoding="utf-8")
+        self.assertIn("odin.py", work)
+        self.assertIn("discover", work)
+        self.assertIn("loki --file --apply", work)
         for forbidden in ("git commit", "git push", "git add"):
-            self.assertNotIn(forbidden, body)
+            self.assertNotIn(forbidden, work)
 
     def test_task_names_are_namespaced(self):
         for job, spec in schedule_jobs.JOBS.items():
@@ -231,6 +249,33 @@ class WrapperExecutionTest(unittest.TestCase):
         self.assertNotIn("still going", body)
         self.assertTrue(lock.exists(), "the lock must never be taken (or released) when the "
                                        "daemon guard exits first")
+
+    @unittest.skipUnless(sys.platform == "win32", "the generated wrappers are cmd.exe batch files")
+    def test_a_lock_carrying_wrapper_actually_runs_its_work_and_releases_the_lock(self):
+        # AH-16 end to end: a fabricated lock-carrying job (no daemon/arm gating, so this is a
+        # pure exercise of write_work + run_locked.py + lib/joblocklib.py) really executes its
+        # work through cmd, and the job lock is gone again afterward - proving the redesigned
+        # lock does not simply look right in the generated text (the exact class of bug the
+        # sibling test above in this class exists to catch) but actually acquires, runs under,
+        # and releases cleanly for a real, successful run.
+        # "dashboard" is used only because it is UNGATED (no armed-icon check to satisfy in
+        # this test) - its own real spec is overridden here entirely with a synthetic one.
+        job = "dashboard"
+        marker = Path(self._tmp.name) / "marker.txt"
+        spec = {
+            "what": "AH-16 smoke test",
+            "schedule": schedule_jobs.EVERY_5_MIN,
+            "lines": [f'echo ran > "{marker}"'],
+            "needs_daemon": False,
+            "lock": True,
+        }
+        wrapper = schedule_jobs.write_wrapper(job, spec)
+        result = subprocess.run(["cmd", "/c", str(wrapper)],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(marker.exists(), "the job's own line never ran under the lock")
+        lock_dir = schedule_jobs._state() / "locks" / job
+        self.assertFalse(lock_dir.exists(), "the lock must be released after a clean run")
 
 
 class RegistrationTest(unittest.TestCase):

@@ -19,6 +19,11 @@ export function useOpenSession(deps: {
 }) {
   const selectedId = ref<string | null>(null)
   const selectedSource = ref<SessionSource | null>(null)
+  // The exact row select() was given, not re-derived: two products sharing a format can hold the
+  // same session id (audit AH-35), so `source` alone cannot always tell the daemon which one this
+  // is. Null for a selection made before locators existed (a stale bookmark, a test) — the tail
+  // call below falls back to source+id exactly as it always did.
+  const selectedLocator = ref<string | null>(null)
   const tail = ref<TailResult | null>(null)
   const tailLoading = ref(false)
   const chatEl = ref<HTMLElement | null>(null)
@@ -92,6 +97,7 @@ export function useOpenSession(deps: {
   async function loadTail(opts: { silent?: boolean } = {}) {
     const id = selectedId.value
     const source = selectedSource.value
+    const locator = selectedLocator.value ?? undefined
     if (!id || !source) return
     if (opts.silent && tailInFlight > 0) return
     // measured BEFORE the fetch: whether the reader was already at the conversation's end
@@ -103,12 +109,17 @@ export function useOpenSession(deps: {
     if (!opts.silent) tailLoading.value = true
     tailInFlight++
     try {
-      const r = await api.getTail(id, source, {
-        limit: 40,
-        textOnly: !deps.showTools.value,
-        thinking: deps.showThinking.value,
-        humanOnly: deps.humanOnly.value,
-      })
+      const r = await api.getTail(
+        id,
+        source,
+        {
+          limit: 40,
+          textOnly: !deps.showTools.value,
+          thinking: deps.showThinking.value,
+          humanOnly: deps.humanOnly.value,
+        },
+        locator,
+      )
       if (stale()) return
       tail.value = r
     } catch {
@@ -134,6 +145,7 @@ export function useOpenSession(deps: {
   function select(s: SessionSummary) {
     selectedId.value = s.session_id
     selectedSource.value = s.source
+    selectedLocator.value = s.locator ?? null
     loadTail()
   }
 
@@ -161,6 +173,7 @@ export function useOpenSession(deps: {
   return {
     selectedId,
     selectedSource,
+    selectedLocator,
     tail,
     tailLoading,
     chatEl,

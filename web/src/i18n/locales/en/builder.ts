@@ -39,5 +39,11 @@ export default {
   accountDeletedInstance: 'Deleted instance (was: {ref})',
   forkLabel: 'Fork into a new session id instead of continuing in place',
   cancel: 'Cancel',
+  close: 'Close',
   addToQueue: 'Add to queue',
+  // AH-12: headless queueing is permanently off (server/src/headless-policy.ts) — creating a new
+  // run always fails, so this replaces the create form instead of leaving a dialog that 409s.
+  createUnavailableTitle: "AgentHydra doesn't run chats you can't see",
+  createUnavailableBody:
+    'Queuing or scheduling a new claude run is disabled by policy, so this dialog can only edit an existing item now. To get work done: reply straight into the session’s own desktop chat, spread tasks across accounts with an MCP client’s fan_out, or import this session into a desktop app.',
 }

@@ -69,7 +69,7 @@ import {
   writeInstanceInfo,
 } from './instance'
 import { initFileLogging } from './log-file.mjs'
-import { isLoopbackOrigin, loopbackGuard } from './loopback-guard.mjs'
+import { createLoopbackGuard, isLoopbackOrigin } from './loopback-guard.mjs'
 import { startMonitor } from './monitor'
 import { sendOsNotification } from './notify-os'
 import {
@@ -140,14 +140,49 @@ function setHideTrayIcon(value: boolean): void {
   updateInstanceInfo({ hideTrayIcon: value })
 }
 
-// CORS narrowed to loopback origins (defense-in-depth for cross-origin READABILITY); the actual
-// cross-site protection is loopbackGuard below, which rejects the REQUEST — see loopback-guard.ts
-// for why a CORS allowlist alone is insufficient (the "simple request" write-CSRF bypasses it).
-app.use('/api/*', cors({ origin: (origin) => (origin && isLoopbackOrigin(origin) ? origin : '') }))
-// Reject browser cross-site requests to the loopback API (drive-by CSRF → RCE). Runs after cors so
-// preflight OPTIONS is answered by cors; applies to every /api/* verb. NOT applied to /oauth/*
-// (those are legitimate cross-site top-level navigations returning from the OAuth provider).
-app.use('/api/*', loopbackGuard)
+// AH-11: the loopback API holds session-scoped data and mutating routes, so the plain
+// any-loopback-port check both isLoopbackOrigin() and the guard's default mode use is too loose —
+// per the Fetch spec a page on ANY local port is "same-site" (a site ignores the port), so a dev
+// server, a preview, or another local daemon's page qualifies too. allowedApiOrigins is the exact
+// allowlist: this daemon's own origin (both host spellings, since browsers treat 127.0.0.1 and
+// localhost as different origins on the same port) plus AGENTHYDRA_DEV_ORIGINS. It starts empty
+// and is populated once boundPort is known (below, well before Bun.serve starts accepting
+// requests); both callbacks below read it lazily per-request via the closure/thunk, never a value
+// captured at wiring time.
+let allowedApiOrigins: string[] = []
+function computeAllowedApiOrigins(port: number): string[] {
+  const own = readInstanceInfo()?.url ?? `http://127.0.0.1:${port}`
+  const origins = new Set<string>([own])
+  try {
+    const u = new URL(own)
+    if (u.hostname === '127.0.0.1')
+      origins.add(`${u.protocol}//localhost${u.port ? `:${u.port}` : ''}`)
+    else if (u.hostname === 'localhost')
+      origins.add(`${u.protocol}//127.0.0.1${u.port ? `:${u.port}` : ''}`)
+  } catch {
+    // own origin unparseable (shouldn't happen) — skip the alt-host spelling
+  }
+  for (const dev of (process.env.AGENTHYDRA_DEV_ORIGINS ?? '').split(',')) {
+    const trimmed = dev.trim()
+    if (trimmed) origins.add(trimmed)
+  }
+  return [...origins]
+}
+
+// CORS narrowed to the exact allowlist above (defense-in-depth for cross-origin READABILITY); the
+// actual cross-site protection is loopbackGuard below, which rejects the REQUEST — see
+// loopback-guard.mjs for why a CORS allowlist alone is insufficient (the "simple request"
+// write-CSRF bypasses it).
+app.use(
+  '/api/*',
+  cors({ origin: (origin) => (origin && allowedApiOrigins.includes(origin) ? origin : '') }),
+)
+// Reject browser cross-site requests to the loopback API (drive-by CSRF → RCE), in the opt-in
+// exact-origin mode (AH-11): a present Origin must be in allowedApiOrigins, not merely loopback.
+// Runs after cors so preflight OPTIONS is answered by cors; applies to every /api/* verb. NOT
+// applied to /oauth/* (those are legitimate cross-site top-level navigations returning from the
+// OAuth provider).
+app.use('/api/*', createLoopbackGuard({ allowedOrigins: () => allowedApiOrigins }))
 // No API route needs a multi-megabyte body. Bound parser memory even for a deliberate local/MCP
 // misuse; the provenance guard runs first so a rejected browser origin is never allowed to stream.
 app.use(
@@ -692,6 +727,11 @@ writeInstanceInfo(boundPort, {
 // port, not the configured one, so a hop off a busy 7787 does not leave the Python side talking
 // to whatever answers there. See orchestratorChildEnv.
 setOrchestratorDaemonUrl(readInstanceInfo()?.url ?? `http://127.0.0.1:${boundPort}`)
+// AH-11: now that boundPort (and the runtime pointer) are known, resolve the exact-origin
+// allowlist the cors() and loopbackGuard() callbacks above read on every request. This runs well
+// before Bun.serve() starts accepting connections, so no request can observe the empty initial []
+// declared above.
+allowedApiOrigins = computeAllowedApiOrigins(boundPort)
 // Say ONCE that this build has no tray icon. The single-file .exe carries no misc\ sidecar, so
 // misc\lunarwerx-tray.exe cannot exist and no tray icon can ever appear whatever the in-app
 // setting says (release.yml's asset table states this, but only on the Releases page - the .exe

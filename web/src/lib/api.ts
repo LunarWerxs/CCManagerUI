@@ -214,15 +214,26 @@ export const getSessions = (
   )
 /** Every folder with conversations in it, for a "where has work happened" overview. */
 export const getSessionProjects = () => j<ProjectSummary[]>('/api/sessions/projects')
-export const getSession = (id: string, source: SessionSource) =>
-  j<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}${sourceQuery(source)}`)
+export const getSession = (id: string, source: SessionSource, locator?: string) =>
+  j<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}${sourceQuery(source, locator)}`)
 /** Set the user's own "done" mark on a session (distinct from Claude Desktop's read-only
  *  `archived` flag). Mark only: never affects which sessions getSessions() returns. */
-const sourceQuery = (source: SessionSource) => `?source=${source}`
+// `locator` (audit AH-35), alongside `source`: two products sharing a format (Kilo/MiMo Code,
+// both `opencode`; two Hermes profiles) can hold the same session id, and `source` alone cannot
+// tell the server which one a caller means. Every function below takes it optionally — a row
+// without one (an older cache, a synthetic test fixture) falls back to source+id exactly as
+// before, which is what the server-side route does too.
+const sourceQuery = (source: SessionSource, locator?: string) =>
+  `?source=${source}${locator ? `&locator=${encodeURIComponent(locator)}` : ''}`
 
-export const setSessionDone = (id: string, source: SessionSource, done: boolean) =>
+export const setSessionDone = (
+  id: string,
+  source: SessionSource,
+  done: boolean,
+  locator?: string,
+) =>
   j<{ session_id: string; source: SessionSource; done: boolean }>(
-    `/api/sessions/${encodeURIComponent(id)}/done${sourceQuery(source)}`,
+    `/api/sessions/${encodeURIComponent(id)}/done${sourceQuery(source, locator)}`,
     {
       method: 'POST',
       body: JSON.stringify({ done }),
@@ -231,22 +242,25 @@ export const setSessionDone = (id: string, source: SessionSource, done: boolean)
 /** Browser download URL for the raw transcript (save-as copy). API_BASE prefix: this
  *  URL lands in a plain <a href>, which unlike j() would otherwise resolve against the
  *  Vite dev origin instead of the daemon. */
-export const sessionFileUrl = (id: string, source: SessionSource) =>
-  `${API_BASE}/api/sessions/${encodeURIComponent(id)}/file${sourceQuery(source)}`
+export const sessionFileUrl = (id: string, source: SessionSource, locator?: string) =>
+  `${API_BASE}/api/sessions/${encodeURIComponent(id)}/file${sourceQuery(source, locator)}`
 /** Get the original transcript's absolute path on the daemon's machine. */
-export const getSessionFileLocation = (id: string, source: SessionSource) =>
-  j<{ path: string }>(`/api/sessions/${encodeURIComponent(id)}/file-location${sourceQuery(source)}`)
+export const getSessionFileLocation = (id: string, source: SessionSource, locator?: string) =>
+  j<{ path: string }>(
+    `/api/sessions/${encodeURIComponent(id)}/file-location${sourceQuery(source, locator)}`,
+  )
 /** Open the transcript on the daemon's machine with the OS default handler. */
-export const openSessionFile = (id: string, source: SessionSource) =>
-  j<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}/open-file${sourceQuery(source)}`, {
-    method: 'POST',
-  })
+export const openSessionFile = (id: string, source: SessionSource, locator?: string) =>
+  j<{ ok: boolean }>(
+    `/api/sessions/${encodeURIComponent(id)}/open-file${sourceQuery(source, locator)}`,
+    { method: 'POST' },
+  )
 /** Put the transcript FILE (not its text) on the clipboard of the daemon's machine, named after the
  *  session. The browser cannot do this — no ClipboardItem type maps to a native file-drop — so it's
  *  a daemon round-trip. `reason: 'unsupported'` comes back on Linux, which has no such convention. */
-export const copySessionFile = (id: string, source: SessionSource) =>
+export const copySessionFile = (id: string, source: SessionSource, locator?: string) =>
   j<{ ok: boolean; filename?: string; reason?: string }>(
-    `/api/sessions/${encodeURIComponent(id)}/copy-file${sourceQuery(source)}`,
+    `/api/sessions/${encodeURIComponent(id)}/copy-file${sourceQuery(source, locator)}`,
     { method: 'POST' },
   )
 /** Download URL for a readable export. A plain <a href> like sessionFileUrl above, so it carries
@@ -256,34 +270,39 @@ export const sessionExportUrl = (
   source: SessionSource,
   format: 'markdown' | 'html',
   thinking = false,
+  locator?: string,
 ) =>
   `${API_BASE}/api/sessions/${encodeURIComponent(id)}/export?source=${source}&format=${format}` +
-  `${thinking ? '&thinking=1' : ''}`
+  `${thinking ? '&thinking=1' : ''}${locator ? `&locator=${encodeURIComponent(locator)}` : ''}`
 /** Open a terminal sitting in this session (`claude --resume <id>`). Always returns the command
  *  line, working launch or not, so the copy fallback is never unavailable. */
-export const resumeSessionInTerminal = (id: string, source: SessionSource) =>
+export const resumeSessionInTerminal = (id: string, source: SessionSource, locator?: string) =>
   j<{ ok: boolean; command: string; reason?: string }>(
-    `/api/sessions/${encodeURIComponent(id)}/resume-terminal${sourceQuery(source)}`,
+    `/api/sessions/${encodeURIComponent(id)}/resume-terminal${sourceQuery(source, locator)}`,
     { method: 'POST' },
   )
 /** What credentials this session printed, as a count and a REDACTED list. There is no reveal
  *  parameter on the daemon and there should not be one — see server/src/session-export.ts. */
-export const getSessionSecrets = (id: string, source: SessionSource) =>
-  j<SessionSecretScan>(`/api/sessions/${encodeURIComponent(id)}/secrets${sourceQuery(source)}`)
+export const getSessionSecrets = (id: string, source: SessionSource, locator?: string) =>
+  j<SessionSecretScan>(
+    `/api/sessions/${encodeURIComponent(id)}/secrets${sourceQuery(source, locator)}`,
+  )
 /** Token totals and a dollar cost for one session, computed on demand from its transcript.
  *  Never throws for an unsupported provider — the result carries a `status` saying why it is
  *  empty, which the UI shows instead of an unexplained zero. */
-export const getSessionUsage = (id: string, source: SessionSource) =>
-  j<SessionUsage>(`/api/sessions/${encodeURIComponent(id)}/usage${sourceQuery(source)}`)
+export const getSessionUsage = (id: string, source: SessionSource, locator?: string) =>
+  j<SessionUsage>(`/api/sessions/${encodeURIComponent(id)}/usage${sourceQuery(source, locator)}`)
 export const getTail = (
   id: string,
   source: SessionSource,
   opts: { limit?: number; textOnly?: boolean; thinking?: boolean; humanOnly?: boolean } = {},
+  locator?: string,
 ) => {
   const flag = (on: boolean | undefined) => (on ? '1' : '0')
   return j<TailResult>(
     `/api/sessions/${id}/tail?limit=${opts.limit ?? 40}&textOnly=${flag(opts.textOnly)}` +
-      `&thinking=${flag(opts.thinking)}&humanOnly=${flag(opts.humanOnly)}&source=${source}`,
+      `&thinking=${flag(opts.thinking)}&humanOnly=${flag(opts.humanOnly)}&source=${source}` +
+      `${locator ? `&locator=${encodeURIComponent(locator)}` : ''}`,
   )
 }
 /** Advanced BODY search: streams every transcript's raw content server-side (substring or
@@ -366,6 +385,23 @@ export const cancelQueueItem = (id: string) =>
   j<{ ok: boolean }>(`/api/queue/${id}/cancel`, { method: 'POST' })
 export const getRunEvents = (id: string) => j<RunEvent[]>(`/api/queue/${id}/events`)
 export const streamUrl = (id: string) => `${API_BASE}/api/queue/${id}/stream`
+
+// --- session messaging (server/src/routes/session-message.ts) ---------------
+/** AH-12: the one path left that actually delivers text into a session — types it into the
+ *  chat's own desktop app (or the native peer pipe, when live) and confirms from the transcript.
+ *  This is what SessionComposer sends through now that queueing a run is permanently refused; it
+ *  is also what the MCP `fan_out_send` tool uses server-side. Throws with the server's own reason
+ *  on ANY failure, busy included (the route itself refuses a busy chat rather than degrading to a
+ *  queue add) — including the soft "typed, but the transcript did not grow" case, which the route
+ *  reports as `ok:false` on an HTTP 200, so it would not otherwise surface as a thrown Error. */
+export const sendSessionMessage = async (id: string, text: string): Promise<{ detail: string }> => {
+  const r = await j<{ ok: boolean; detail?: string; error?: string }>(
+    `/api/sessions/${encodeURIComponent(id)}/message`,
+    { method: 'POST', body: JSON.stringify({ text }) },
+  )
+  if (!r.ok) throw new Error(r.error || r.detail || 'Failed to deliver the message.')
+  return { detail: r.detail ?? '' }
+}
 
 // --- incidents (server/src/incidents.ts) -------------------------------------
 // Repeated queue-run failures, grouped and deduped so a night of the same error doesn't read as a

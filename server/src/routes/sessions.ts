@@ -16,6 +16,7 @@ import {
   isExportRefused,
   scanSessionSecrets,
 } from '../session-export'
+import { makeLocator } from '../session-locator'
 import { resumeSessionInTerminal } from '../session-resume'
 import { searchSessionBodies } from '../session-search'
 import { sessionUsage } from '../session-usage'
@@ -182,7 +183,12 @@ app.get('/api/sessions/live', (c) => {
 app.get('/api/sessions/:id', async (c) => {
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const s = await getSession(c.req.param('id'), source)
+  // `?locator=` (audit AH-35), alongside the older `?source=`: two products sharing a format
+  // (Kilo/MiMo Code, both `opencode`; two Hermes profiles) can hold the same session id, and only a
+  // locator names the exact row rather than "the newest match for that id+source". Ignored when it
+  // doesn't parse or resolves to nothing in the current index — see pickSession in transcript.ts.
+  const locator = c.req.query('locator') || undefined
+  const s = await getSession(c.req.param('id'), source, locator)
   return s ? c.json(s) : c.json({ error: 'session not found' }, 404)
 })
 // The user's own mark (distinct from Claude Desktop's read-only isArchived, surfaced via
@@ -191,12 +197,19 @@ app.post('/api/sessions/:id/done', async (c) => {
   const id = c.req.param('id')
   const rawSource = c.req.query('source')
   const source: SessionSource = isSessionSource(rawSource) ? rawSource : 'claude'
+  const locator = c.req.query('locator') || undefined
   const body = await jsonBody(c)
   const done = body.done === true
+  // Resolved so the mark keys on the SAME product+store a locator (or source+id) actually named:
+  // two products sharing a format can hold the same session id (audit AH-35), and marking "done" by
+  // source+id alone would toggle whichever one that id happened to resolve to. A row this app has
+  // never indexed (already deleted, or a locator from elsewhere) still gets marked, under the plain
+  // source+id key — exactly the pre-locator behavior — because sessionMarkKey's `tool` is optional.
+  const tf = await findTranscriptAsync(id, source, locator)
   db.query(
     'insert into session_marks (session_id, done, updated_at) values (?, ?, ?) ' +
       'on conflict(session_id) do update set done = ?, updated_at = ?',
-  ).run(sessionMarkKey(source, id), done ? 1 : 0, Date.now(), done ? 1 : 0, Date.now())
+  ).run(sessionMarkKey(source, id, tf?.tool), done ? 1 : 0, Date.now(), done ? 1 : 0, Date.now())
   return c.json({ session_id: id, source, done })
 })
 // Download a copy of the raw transcript (browser save-as; works over remote too). The filename is
@@ -208,14 +221,17 @@ app.get('/api/sessions/:id/file', async (c) => {
   const id = c.req.param('id')
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const tf = await findTranscriptAsync(id, source)
+  const locator = c.req.query('locator') || undefined
+  const tf = await findTranscriptAsync(id, source, locator)
   if (!tf) return c.json({ error: 'session not found' }, 404)
   if (tf.source === 'opencode' || tf.source === 'hermes')
     return c.json(
       { error: 'OpenCode and Hermes sessions are stored in a shared database, not a raw file' },
       409,
     )
-  const session = await getSession(id, tf.source)
+  // tf's own locator, not the raw query param: this pins the title lookup to the EXACT row just
+  // resolved (source+id alone could resolve to a different product's session — audit AH-35).
+  const session = await getSession(id, tf.source, makeLocator(tf))
   const filename = safeTranscriptFilename(session?.title, tf.session_id)
   return new Response(Bun.file(tf.path), {
     headers: {
@@ -231,17 +247,26 @@ app.get('/api/sessions/:id/file', async (c) => {
 app.get('/api/sessions/:id/export', async (c) => {
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
+  const locator = c.req.query('locator') || undefined
   const format: ExportFormat = c.req.query('format') === 'html' ? 'html' : 'markdown'
   const thinking = c.req.query('thinking') === '1' || c.req.query('thinking') === 'true'
   const id = c.req.param('id')
+  // Resolved ONCE and re-expressed as its own locator for both calls below, so the title lookup and
+  // the render cannot land on two different products' sessions sharing this id (audit AH-35) — a
+  // real risk here specifically, since the two calls used to repeat the source+id resolution
+  // independently.
+  const tf = await findTranscriptAsync(id, source, locator)
+  if (!tf) return c.json({ error: 'session not found' }, 404)
+  const pinned = makeLocator(tf)
   // The transcript index carries no title for a Claude session, so without this the document is
   // headed with a uuid and the file is named after one twice. getSession derives the real title the
   // list shows (cheap: scanMeta is mtime-cached), exactly as the raw-file download does.
-  const session = await getSession(id, source)
-  const result = await exportSession(id, format, source, {
+  const session = await getSession(id, tf.source, pinned)
+  const result = await exportSession(id, format, tf.source, {
     thinking,
     title: session?.title,
     cwd: session?.cwd,
+    locator: pinned,
   })
   if (!result) return c.json({ error: 'session not found' }, 404)
   // Over the export ceiling (audit AH-37): a 413 that says why and what to do instead, rather than
@@ -267,9 +292,10 @@ app.post('/api/sessions/:id/resume-terminal', async (c) => {
   const id = c.req.param('id')
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const tf = await findTranscriptAsync(id, source)
+  const locator = c.req.query('locator') || undefined
+  const tf = await findTranscriptAsync(id, source, locator)
   if (!tf) return c.json({ error: 'session not found' }, 404)
-  const session = await getSession(id, tf.source)
+  const session = await getSession(id, tf.source, makeLocator(tf))
   return c.json(resumeSessionInTerminal(id, tf.source, session?.cwd || null))
 })
 // What secrets this session printed, as a count and a redacted list. There is deliberately no
@@ -278,7 +304,8 @@ app.post('/api/sessions/:id/resume-terminal', async (c) => {
 app.get('/api/sessions/:id/secrets', async (c) => {
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const scan = await scanSessionSecrets(c.req.param('id'), source)
+  const locator = c.req.query('locator') || undefined
+  const scan = await scanSessionSecrets(c.req.param('id'), source, locator)
   if (!scan) return c.json({ error: 'session not found' }, 404)
   return c.json(scan)
 })
@@ -288,7 +315,8 @@ app.get('/api/sessions/:id/secrets', async (c) => {
 app.get('/api/sessions/:id/file-location', async (c) => {
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const tf = await findTranscriptAsync(c.req.param('id'), source)
+  const locator = c.req.query('locator') || undefined
+  const tf = await findTranscriptAsync(c.req.param('id'), source, locator)
   if (!tf) return c.json({ error: 'session not found' }, 404)
   if (tf.source === 'opencode' || tf.source === 'hermes')
     return c.json({ error: 'OpenCode and Hermes sessions are stored in a shared database' }, 409)
@@ -301,7 +329,8 @@ app.get('/api/sessions/:id/file-location', async (c) => {
 app.post('/api/sessions/:id/open-file', async (c) => {
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const tf = await findTranscriptAsync(c.req.param('id'), source)
+  const locator = c.req.query('locator') || undefined
+  const tf = await findTranscriptAsync(c.req.param('id'), source, locator)
   if (!tf) return c.json({ error: 'session not found' }, 404)
   if (tf.source === 'opencode' || tf.source === 'hermes')
     return c.json({ error: 'OpenCode and Hermes sessions are stored in a shared database' }, 409)
@@ -337,7 +366,8 @@ app.post('/api/sessions/:id/copy-file', async (c) => {
   const id = c.req.param('id')
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const tf = await findTranscriptAsync(id, source)
+  const locator = c.req.query('locator') || undefined
+  const tf = await findTranscriptAsync(id, source, locator)
   if (!tf) return c.json({ error: 'session not found' }, 404)
   if (tf.source === 'opencode' || tf.source === 'hermes')
     return c.json({ error: 'OpenCode and Hermes sessions are stored in a shared database' }, 409)
@@ -346,7 +376,7 @@ app.post('/api/sessions/:id/copy-file', async (c) => {
     // MIME type), so there is nothing honest to spawn. Say so rather than silently no-op.
     return c.json({ ok: false, reason: 'unsupported' }, 501)
 
-  const session = await getSession(id, tf.source)
+  const session = await getSession(id, tf.source, makeLocator(tf))
   const staged = join(CLIPBOARD_DIR, safeTranscriptFilename(session?.title, tf.session_id))
   try {
     rmSync(CLIPBOARD_DIR, { recursive: true, force: true })
@@ -396,6 +426,7 @@ app.get('/api/sessions/:id/tail', async (c) => {
   const limit = c.req.query('limit')
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
+  const locator = c.req.query('locator') || undefined
   const flag = (name: string) => {
     const v = c.req.query(name)
     return v === '1' || v === 'true'
@@ -410,6 +441,7 @@ app.get('/api/sessions/:id/tail', async (c) => {
         humanOnly: flag('humanOnly'),
       },
       source,
+      locator,
     ),
   )
 })
@@ -420,7 +452,8 @@ app.get('/api/sessions/:id/tail', async (c) => {
 app.get('/api/sessions/:id/usage', async (c) => {
   const rawSource = c.req.query('source')
   const source = isSessionSource(rawSource) ? rawSource : undefined
-  const tf = await findTranscriptAsync(c.req.param('id'), source)
+  const locator = c.req.query('locator') || undefined
+  const tf = await findTranscriptAsync(c.req.param('id'), source, locator)
   if (!tf) return c.json({ error: 'session not found' }, 404)
   return c.json(await sessionUsage(tf))
 })

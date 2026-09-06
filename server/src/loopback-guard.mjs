@@ -78,19 +78,41 @@ function originIsLoopbackOrAbsent(originHeader) {
 
 /**
  * Pure decision function (exported for tests): should this request's headers be allowed?
+ *
+ * OPT-IN EXACT-ORIGIN MODE (AH-11): by default (no `options.allowedOrigins`) an Origin is
+ * accepted whenever it is LOOPBACK, any port — the long-standing behaviour every app below still
+ * gets. That is too loose for an app whose loopback API holds session-scoped data or mutating
+ * routes: per the Fetch spec, a page served from ANY local port is "same-site" (a site ignores the
+ * port), so a dev server, a preview, or another local daemon's page can carry browser-forged
+ * `Sec-Fetch-Site: same-site`/absent-Origin-style requests here too. Pass `options.allowedOrigins`
+ * (a THUNK — the caller's own origin is typically only known after it binds, so it must be read
+ * lazily, per request, not captured at wiring time) to require a PRESENT Origin to match one of
+ * those origins byte-for-byte; a request with NO Origin (curl, MCP clients, the tray) still passes
+ * as it always has, since it carries no browser provenance to check.
  * @param {{ secFetchSite?: string, origin?: string, host?: string }} headers
+ * @param {{ allowedOrigins?: () => string[] }} [options]
  * @returns {{ ok: boolean, reason?: string }}
  */
-export function evaluateRequest(headers) {
+export function evaluateRequest(headers, options = {}) {
+  const { allowedOrigins } = options;
   // 1. Sec-Fetch-Site: a modern browser's unforgeable provenance signal. Only `cross-site` is a
   //    drive-by from another origin; `same-origin`/`same-site`/`none` are our SPA (or the dev SPA,
   //    or a top-level navigation the user typed). Absent → non-browser client, allowed.
   if (headers.secFetchSite && headers.secFetchSite.toLowerCase() === "cross-site") {
     return { ok: false, reason: "cross-site request rejected" };
   }
-  // 2. Origin present but non-loopback → cross-origin write / DNS-rebinding, even without a
-  //    Sec-Fetch-Site header (older browsers) or on a "simple" no-preflight POST.
-  if (!originIsLoopbackOrAbsent(headers.origin)) {
+  if (allowedOrigins) {
+    // Exact-origin mode: a present Origin (including 'null') must match the allowlist exactly;
+    // any other loopback origin — a foreign local port included — is refused. No Origin at all
+    // (non-browser client) is unaffected and falls through to the Host check below.
+    if (headers.origin) {
+      if (headers.origin === "null" || !allowedOrigins().includes(headers.origin)) {
+        return { ok: false, reason: "origin not in allowlist" };
+      }
+    }
+  } else if (!originIsLoopbackOrAbsent(headers.origin)) {
+    // 2. Default mode: Origin present but non-loopback → cross-origin write / DNS-rebinding, even
+    //    without a Sec-Fetch-Site header (older browsers) or on a "simple" no-preflight POST.
     return { ok: false, reason: "non-loopback Origin rejected" };
   }
   // 3. A PRESENT Host must be loopback (a browser rebinding evil.com → 127.0.0.1 sends
@@ -103,19 +125,30 @@ export function evaluateRequest(headers) {
 }
 
 /**
- * Hono middleware: apply to the loopback API surface (see WIRING note in the file header). Blocks
- * browser cross-site requests with 403; lets same-origin (SPA), same-site (dev), and non-browser
- * (curl/tray/MCP) requests through.
- * @type {import("hono").MiddlewareHandler}
+ * Build a Hono middleware for the loopback API surface (see WIRING note in the file header).
+ * Blocks browser cross-site requests with 403; lets same-origin (SPA), same-site (dev), and
+ * non-browser (curl/tray/MCP) requests through. Pass `{ allowedOrigins }` for the opt-in
+ * exact-origin mode documented on `evaluateRequest` above; omit it for the long-standing
+ * any-loopback-port behaviour.
+ * @param {{ allowedOrigins?: () => string[] }} [options]
+ * @returns {import("hono").MiddlewareHandler}
  */
-export const loopbackGuard = async (c, next) => {
-  const verdict = evaluateRequest({
-    secFetchSite: c.req.header("sec-fetch-site"),
-    origin: c.req.header("origin"),
-    host: c.req.header("host"),
-  });
-  if (!verdict.ok) {
-    return c.json({ error: `forbidden: ${verdict.reason}` }, 403);
-  }
-  await next();
-};
+export function createLoopbackGuard(options = {}) {
+  return async (c, next) => {
+    const verdict = evaluateRequest(
+      {
+        secFetchSite: c.req.header("sec-fetch-site"),
+        origin: c.req.header("origin"),
+        host: c.req.header("host"),
+      },
+      options,
+    );
+    if (!verdict.ok) {
+      return c.json({ error: `forbidden: ${verdict.reason}` }, 403);
+    }
+    await next();
+  };
+}
+
+/** The default-mode guard (no exact-origin allowlist) — what every app used before AH-11. */
+export const loopbackGuard = createLoopbackGuard();

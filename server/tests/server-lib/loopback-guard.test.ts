@@ -8,6 +8,8 @@ import { describe, expect, test } from "bun:test";
 import { evaluateRequest, isLoopbackOrigin } from "../../src/loopback-guard.mjs";
 
 const LOOPBACK_HOST = "127.0.0.1:7777";
+const OWN_ORIGIN = "http://127.0.0.1:7777";
+const allowedOrigins = () => [OWN_ORIGIN, "http://localhost:5173"];
 
 describe("loopback-guard: cross-site CSRF defense (evaluateRequest)", () => {
   test("SPA same-origin request is allowed", () => {
@@ -89,5 +91,59 @@ describe("loopback-guard: cross-site CSRF defense (evaluateRequest)", () => {
     expect(isLoopbackOrigin("http://[::1]:7777")).toBe(true);
     expect(isLoopbackOrigin("https://evil.example")).toBe(false);
     expect(isLoopbackOrigin("not a url")).toBe(false);
+  });
+});
+
+describe("loopback-guard: opt-in exact-origin mode (AH-11)", () => {
+  test("no Origin at all still passes (curl / tray / MCP)", () => {
+    expect(evaluateRequest({ host: LOOPBACK_HOST }, { allowedOrigins }).ok).toBe(true);
+  });
+
+  test("the daemon's own origin passes", () => {
+    expect(
+      evaluateRequest(
+        { secFetchSite: "same-origin", origin: OWN_ORIGIN, host: LOOPBACK_HOST },
+        { allowedOrigins },
+      ).ok,
+    ).toBe(true);
+  });
+
+  test("a configured dev origin passes", () => {
+    expect(
+      evaluateRequest(
+        { secFetchSite: "same-site", origin: "http://localhost:5173", host: LOOPBACK_HOST },
+        { allowedOrigins },
+      ).ok,
+    ).toBe(true);
+  });
+
+  test("THE HOLE THIS CLOSES: an unconfigured loopback origin on another port is refused", () => {
+    // Same-site per the Fetch spec (a site ignores the port), so the default any-loopback-port
+    // mode would allow this; exact-origin mode must not.
+    const v = evaluateRequest(
+      { secFetchSite: "same-site", origin: "http://127.0.0.1:9999", host: LOOPBACK_HOST },
+      { allowedOrigins },
+    );
+    expect(v.ok).toBe(false);
+  });
+
+  test("a 'null' opaque origin is refused even in exact-origin mode", () => {
+    expect(evaluateRequest({ origin: "null", host: LOOPBACK_HOST }, { allowedOrigins }).ok).toBe(
+      false,
+    );
+  });
+
+  test("the existing non-loopback / cross-site rejections still hold", () => {
+    expect(
+      evaluateRequest(
+        { secFetchSite: "cross-site", origin: "https://evil.example", host: LOOPBACK_HOST },
+        { allowedOrigins },
+      ).ok,
+    ).toBe(false);
+    expect(
+      evaluateRequest({ origin: "https://evil.example", host: LOOPBACK_HOST }, { allowedOrigins })
+        .ok,
+    ).toBe(false);
+    expect(evaluateRequest({ host: "attacker.test" }, { allowedOrigins }).ok).toBe(false);
   });
 });

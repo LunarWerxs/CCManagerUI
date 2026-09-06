@@ -20,7 +20,7 @@ export function useSessionFileActions(deps: {
 
   async function openFile(session: SessionSummary) {
     try {
-      const r = await api.openSessionFile(session.session_id, session.source)
+      const r = await api.openSessionFile(session.session_id, session.source, session.locator)
       if (!r.ok) toast.error(t('sessions.openFileFailed'))
     } catch {
       toast.error(t('sessions.openFileFailed'))
@@ -34,7 +34,7 @@ export function useSessionFileActions(deps: {
   async function copyFile(session: SessionSummary) {
     copyingFile.value = true
     try {
-      const r = await api.copySessionFile(session.session_id, session.source)
+      const r = await api.copySessionFile(session.session_id, session.source, session.locator)
       if (r.ok) toast.success(t('sessions.copyFileDone', { name: r.filename ?? '' }))
       else if (r.reason === 'unsupported') toast.error(t('sessions.copyFileUnsupported'))
       else toast.error(t('sessions.copyFileFailed'))
@@ -47,7 +47,11 @@ export function useSessionFileActions(deps: {
 
   async function copyFileLocation(session: SessionSummary) {
     try {
-      const { path } = await api.getSessionFileLocation(session.session_id, session.source)
+      const { path } = await api.getSessionFileLocation(
+        session.session_id,
+        session.source,
+        session.locator,
+      )
       const text = composeSessionPathClipboard({
         path,
         title: session.title,

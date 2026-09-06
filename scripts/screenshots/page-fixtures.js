@@ -52,48 +52,59 @@
     ['Rate limiter backoff', 'atlas-api', 'main', 73, 1500, 'work', 'claude'],
     ['Tidy up CLI help output', 'pico-cli', 'main', 39, 2900, 'work', 'claude'],
     ['Summarize the incident channel', 'atlas-api', 'main', 27, 4200, null, 'hermes'],
-  ].map(([title, p, branch, count, mins, instance, source], i) => ({
-    session_id: `s${i}0000000-0000-4000-8000-00000000000${i}`,
-    source,
+  ].map(([title, p, branch, count, mins, instance, source], i) => {
+    const session_id = `s${i}0000000-0000-4000-8000-00000000000${i}`
     // The reader (source) and the product that wrote it (tool) coincide 1:1 for every fixture row
     // — none of these are a fork sharing another product's format — so the same string covers both.
-    tool: source === 'claude' ? 'claude-code' : source,
-    title,
-    cwd: proj(p),
-    project: projKey(p),
-    git_branch: source === 'opencode' || source === 'hermes' ? null : branch,
-    message_count: count,
-    // Span varies per row on purpose: every session sharing one duration made every shape chip
-    // read "Marathon" in the screenshot, which is a fixture artefact that looked like a bug in the
-    // classifier. The multiplier spreads them across quick/standard/deep instead.
-    created_at: ago(mins + 4 + i * 55),
-    last_activity_at: ago(mins),
-    last_role: 'assistant',
-    last_text_preview: 'Updated the module and re-ran the suite; everything passes locally.',
-    size_bytes: count * 3200,
-    transcript_path: transcriptPath(source, p, i),
-    queue_status: null,
-    instance: source === 'claude' ? instance : null,
-    archived: false,
-    done: i === 7,
-    // Two rows carry the "queued here" marker so the shape chip in the screenshot shows both the
-    // automation case and the ordinary one. Real dispatched-ness comes from a queue row (see
-    // server/src/sessions.ts); here it is simply stated.
-    dispatched: i === 3 || i === 6,
-    // Only OpenCode reports subagent counts (server/src/sessions.ts collapseSubagents); none of
-    // these rows stand for a fan-out, so zero is the honest value everywhere.
-    subagent_count: 0,
-    // None of these threads hit a rate-limit wall — a fabricated badge here would photograph a
-    // state the sample data never earned.
-    limit_stop: null,
-    // Every row's title reads as a deliberately-set label in the screenshot, not an inferred one —
-    // 'custom' is the source that means exactly that (see TitleSource in server/src/types.ts).
-    title_source: 'custom',
-    title_tag: null, // only used for title_source: 'envelope', which none of these rows are.
-    copy_index: 1,
-    copy_count: 1, // ordinary case: one transcript file per conversation, no interrupt/resume split.
-    ended_because: null, // Claude-only marker for a superseded copy; none of these are superseded.
-  }))
+    const tool = source === 'claude' ? 'claude-code' : source
+    return {
+      session_id,
+      source,
+      tool,
+      // A fake but well-shaped locator (server/src/session-locator.ts): source+tool+storeKey+id,
+      // base64url after 'v1:'. Nothing reads the storeKey back out of a fixture row, so the source
+      // string stands in for it; the real server always derives this from the actual store.
+      locator: `v1:${btoa(JSON.stringify([source, tool, source, session_id]))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '')}`,
+      title,
+      cwd: proj(p),
+      project: projKey(p),
+      git_branch: source === 'opencode' || source === 'hermes' ? null : branch,
+      message_count: count,
+      // Span varies per row on purpose: every session sharing one duration made every shape chip
+      // read "Marathon" in the screenshot, which is a fixture artefact that looked like a bug in the
+      // classifier. The multiplier spreads them across quick/standard/deep instead.
+      created_at: ago(mins + 4 + i * 55),
+      last_activity_at: ago(mins),
+      last_role: 'assistant',
+      last_text_preview: 'Updated the module and re-ran the suite; everything passes locally.',
+      size_bytes: count * 3200,
+      transcript_path: transcriptPath(source, p, i),
+      queue_status: null,
+      instance: source === 'claude' ? instance : null,
+      archived: false,
+      done: i === 7,
+      // Two rows carry the "queued here" marker so the shape chip in the screenshot shows both the
+      // automation case and the ordinary one. Real dispatched-ness comes from a queue row (see
+      // server/src/sessions.ts); here it is simply stated.
+      dispatched: i === 3 || i === 6,
+      // Only OpenCode reports subagent counts (server/src/sessions.ts collapseSubagents); none of
+      // these rows stand for a fan-out, so zero is the honest value everywhere.
+      subagent_count: 0,
+      // None of these threads hit a rate-limit wall — a fabricated badge here would photograph a
+      // state the sample data never earned.
+      limit_stop: null,
+      // Every row's title reads as a deliberately-set label in the screenshot, not an inferred one —
+      // 'custom' is the source that means exactly that (see TitleSource in server/src/types.ts).
+      title_source: 'custom',
+      title_tag: null, // only used for title_source: 'envelope', which none of these rows are.
+      copy_index: 1,
+      copy_count: 1, // ordinary case: one transcript file per conversation, no interrupt/resume split.
+      ended_because: null, // Claude-only marker for a superseded copy; none of these are superseded.
+    }
+  })
   /** The queue only ever holds `claude` runs, so its rows may only point at Claude sessions. */
   const claudeSessions = sessions.filter((s) => s.source === 'claude')
 

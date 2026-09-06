@@ -11,15 +11,27 @@ export interface LoopbackGuardResult {
   reason?: string;
 }
 
+/** Opt-in exact-origin mode (AH-11) — see evaluateRequest/createLoopbackGuard doc comments. */
+export interface LoopbackGuardOptions {
+  allowedOrigins?: () => string[];
+}
+
 /** The origin string (scheme://host[:port]) has a loopback host. For narrowing a CORS allowlist. */
 export function isLoopbackOrigin(origin: string): boolean;
 
 /** Pure decision function (for tests): should this request's headers be allowed? */
-export function evaluateRequest(headers: {
-  secFetchSite?: string;
-  origin?: string;
-  host?: string;
-}): LoopbackGuardResult;
+export function evaluateRequest(
+  headers: {
+    secFetchSite?: string;
+    origin?: string;
+    host?: string;
+  },
+  options?: LoopbackGuardOptions,
+): LoopbackGuardResult;
 
-/** Hono middleware: reject browser cross-site requests to the loopback API with 403. */
+/** Build a Hono middleware; pass `{ allowedOrigins }` for the opt-in exact-origin mode. */
+export function createLoopbackGuard(options?: LoopbackGuardOptions): MiddlewareHandler;
+
+/** The default-mode guard (no exact-origin allowlist): reject browser cross-site requests to the
+ *  loopback API with 403, accepting any loopback-port Origin. */
 export const loopbackGuard: MiddlewareHandler;

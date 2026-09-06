@@ -10,6 +10,7 @@ import {
 import { readOpenCodeSession } from './opencode-sessions'
 import { createLimitStopTracker, type LimitStop } from './rate-limit-signal'
 import { classifyEnding, endingEventText, type SessionEnding } from './session-ending'
+import { makeLocator } from './session-locator'
 import {
   decodeProjectKey,
   describeTaggedText,
@@ -742,23 +743,27 @@ export function collapseSubagents(files: TranscriptFile[]): {
   // A store that records no parentage at all is every store but OpenCode, so leave early rather than
   // build an index of every session on the machine for nothing.
   if (!files.some((f) => f.parentId)) return { rows: files, counts: new Map() }
-  const key = (source: string, id: string) => `${source}:${id}`
-  // Keyed by source as well as id: two stores can hand out the same bare id, and one of them must
-  // not be able to hide the other's session.
-  const byId = new Map(files.map((f) => [key(f.source, f.session_id), f]))
+  // Keyed by TOOL, not just source: a parent/child pair is always read out of the same physical
+  // store's own tables, so tool is exactly the disambiguator a bare source misses — two OpenCode-
+  // format products (Kilo, MiMo Code) can otherwise hand out the same bare session id, and one of
+  // them must not be able to claim ownership of the other's row (audit AH-35, same bug class as the
+  // index's own de-dup — see session-locator.ts).
+  const key = (tf: Pick<TranscriptFile, 'source' | 'tool'>, id: string) =>
+    `${tf.tool ?? tf.source}:${id}`
+  const byId = new Map(files.map((f) => [key(f, f.session_id), f]))
 
   /** The top-level session this row belongs to, or null when it is one itself — or owned by nothing
    *  real, which is the same answer as far as this list is concerned. */
   const ownerOf = (file: TranscriptFile): TranscriptFile | null => {
-    const seen = new Set<string>([key(file.source, file.session_id)])
-    let parent = file.parentId ? byId.get(key(file.source, file.parentId)) : undefined
+    const seen = new Set<string>([key(file, file.session_id)])
+    let parent = file.parentId ? byId.get(key(file, file.parentId)) : undefined
     while (parent) {
       // Already on this path: the parentage is a cycle and owns nothing. Keep the row.
-      if (seen.has(key(parent.source, parent.session_id))) return null
+      if (seen.has(key(parent, parent.session_id))) return null
       // Reached a session nobody spawned. Everything below it really is a subagent.
       if (!parent.parentId) return parent
-      seen.add(key(parent.source, parent.session_id))
-      parent = byId.get(key(parent.source, parent.parentId))
+      seen.add(key(parent, parent.session_id))
+      parent = byId.get(key(parent, parent.parentId))
     }
     // The chain ran off the end of the index: the owner was deleted or pruned. Keep the row.
     return null
@@ -773,8 +778,9 @@ export function collapseSubagents(files: TranscriptFile[]): {
       continue
     }
     // Credited to the ROOT rather than to the immediate parent, so a chain two deep still counts on
-    // the row the user can actually see.
-    const k = key(owner.source, owner.session_id)
+    // the row the user can actually see. Counted by source:id (not the tool-keyed lookup key above)
+    // because that is what callers of this map already look it up by (see listSessions/getSession).
+    const k = `${owner.source}:${owner.session_id}`
     counts.set(k, (counts.get(k) ?? 0) + 1)
   }
   return { rows, counts }
@@ -964,6 +970,7 @@ export async function listSessions(opts: ListSessionsOptions = {}): Promise<Sess
       session_id: tf.session_id,
       source: tf.source,
       tool: toolIdOf(tf),
+      locator: tf.locator ?? makeLocator(tf),
       title: m.title,
       cwd: m.cwd,
       project: tf.project,
@@ -978,7 +985,7 @@ export async function listSessions(opts: ListSessionsOptions = {}): Promise<Sess
       queue_status: tf.source === 'claude' ? (qmap.get(tf.session_id) ?? null) : null,
       instance: desk?.instance ?? null,
       archived: tf.archived || (desk?.archived ?? false),
-      done: dmap.get(sessionMarkKey(tf.source, tf.session_id)) ?? false,
+      done: dmap.get(sessionMarkKey(tf.source, tf.session_id, tf.tool)) ?? false,
       dispatched: tf.source === 'claude' && qmap.has(tf.session_id),
       subagent_count: collapsed.counts.get(`${tf.source}:${tf.session_id}`) ?? 0,
       limit_stop: m.limit_stop,
@@ -1072,8 +1079,20 @@ function toolIdOf(tf: TranscriptFile): string {
   return tf.source === 'claude' ? 'claude-code' : tf.source
 }
 
-export function sessionMarkKey(source: SessionSource, sessionId: string): string {
-  return source === 'claude' ? sessionId : `${source}:${sessionId}`
+/**
+ * The done-mark's storage key. Bare `sessionId` for claude is kept exactly as it always was — that
+ * namespace has real marks on disk and Claude Code sessions are never format-ambiguous — but a
+ * non-claude mark keys on TOOL rather than source alone whenever the tool is known and differs from
+ * the source: two products of one format (Kilo and MiMo Code, both `opencode`; two Hermes profiles,
+ * both `hermes`) can hold the same session id, and a mark keyed on source+id would toggle whichever
+ * one the id happened to resolve to (audit AH-35). Passing no `tool` (the caller has only a source,
+ * not a resolved row) falls back to the old `source:id` key unchanged, so a call site that has not
+ * been updated yet keeps working exactly as before rather than silently losing marks.
+ */
+export function sessionMarkKey(source: SessionSource, sessionId: string, tool?: string): string {
+  if (source === 'claude') return sessionId
+  const t = tool && tool !== source ? tool : null
+  return t ? `${source}:${t}:${sessionId}` : `${source}:${sessionId}`
 }
 
 /**
@@ -1195,13 +1214,14 @@ export async function warmSessionScanCache(newest = 400): Promise<void> {
 export async function getSession(
   sessionId: string,
   source?: SessionSource,
+  locator?: string,
 ): Promise<SessionSummary | null> {
   // findTranscriptAsync, not the sync pair this used to call: only a MISS can be wrong, and the
   // sync miss path cannot WAIT for the sweep it starts (it would have to be the blocking builder).
   // This function is already async and is what answers "show me this session", including for a run
   // dispatched a moment ago whose transcript is newer than the snapshot — precisely the case that
   // has to wait rather than report nothing.
-  const tf = await findTranscriptAsync(sessionId, source)
+  const tf = await findTranscriptAsync(sessionId, source, locator)
   if (!tf) return null
   const m = await scanMeta(tf)
   // Deleted between finding it and reading it, which answers the caller's question the same way a
@@ -1215,6 +1235,7 @@ export async function getSession(
     session_id: tf.session_id,
     source: tf.source,
     tool: toolIdOf(tf),
+    locator: tf.locator ?? makeLocator(tf),
     title: m.title,
     cwd: m.cwd,
     project: tf.project,
@@ -1229,7 +1250,7 @@ export async function getSession(
     queue_status: tf.source === 'claude' ? (qmap.get(tf.session_id) ?? null) : null,
     instance: tf.source === 'claude' ? (meta?.instance ?? null) : null,
     archived: tf.archived || (meta?.archived ?? false),
-    done: dmap.get(sessionMarkKey(tf.source, sessionId)) ?? false,
+    done: dmap.get(sessionMarkKey(tf.source, sessionId, tf.tool)) ?? false,
     dispatched: tf.source === 'claude' && qmap.has(tf.session_id),
     // Asked of the whole index rather than tracked per row, because this route can be handed a
     // subagent's own id — reached from a search hit — and that row is not in the collapsed list at

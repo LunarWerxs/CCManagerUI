@@ -123,6 +123,18 @@ export interface SessionSummary {
   /** Which PRODUCT wrote it, as an agent-catalog.ts id ('claude-code', 'openclaude', 'traex', …).
    *  `source` is only the FORMAT, and forks share one. */
   tool: string
+  /**
+   * The opaque, versioned identity for THIS exact row (server/src/session-locator.ts) — source +
+   * product + physical store, not just source + session_id.
+   *
+   * `source` + `session_id` alone cannot always tell two rows apart: two OpenCode-format products
+   * (Kilo, MiMo Code) or two Hermes profiles can hold the same session id (audit AH-35). Every
+   * session route accepts `?locator=` alongside the older `?source=`, and a caller that already has
+   * this row — because it just listed it — should pass the locator back rather than source alone,
+   * which resolves to "the first/newest match for that id+source" and can silently pick the wrong
+   * product's session when two of them collide.
+   */
+  locator: string
   title: string
   cwd: string
   project: string

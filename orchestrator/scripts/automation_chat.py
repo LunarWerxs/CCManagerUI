@@ -119,16 +119,22 @@ def _save_confirmed(data: dict) -> None:
 
 
 def mark_confirmed(sid: str, how: str) -> None:
-    data = load_confirmed()
-    data[sid] = {"at": int(time.time() * 1000), "how": how[:160]}
-    _save_confirmed(data)
+    # Load-mutate-save under one lock (audit AH-30): a successful picker recording its verdict
+    # and the fleet pass dropping a stale confirmation for ANOTHER chat used to read the same
+    # snapshot and the loser erased the winner's entry - the next tick then re-ran a picker on
+    # a chat that had already confirmed, and the compliance report undercounted.
+    with ledgerlib.locked("mode-confirmed"):
+        data = load_confirmed()
+        data[sid] = {"at": int(time.time() * 1000), "how": how[:160]}
+        _save_confirmed(data)
 
 
 def drop_confirmed(sid: str) -> None:
-    data = load_confirmed()
-    if sid in data:
-        del data[sid]
-        _save_confirmed(data)
+    with ledgerlib.locked("mode-confirmed"):
+        data = load_confirmed()
+        if sid in data:
+            del data[sid]
+            _save_confirmed(data)
 
 
 def running_rows(fleet: dict) -> list[dict]:

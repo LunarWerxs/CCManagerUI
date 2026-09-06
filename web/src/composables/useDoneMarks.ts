@@ -18,7 +18,7 @@ export function useDoneMarks(deps: { sessions: Ref<SessionSummary[]> }) {
     const prev = s.done
     s.done = done // optimistic: the row marks instantly, the write is a formality
     try {
-      await api.setSessionDone(s.session_id, s.source, done)
+      await api.setSessionDone(s.session_id, s.source, done, s.locator)
     } catch {
       s.done = prev
       toast.error(t('sessions.markDoneFailed'))

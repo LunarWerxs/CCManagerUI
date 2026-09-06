@@ -147,6 +147,7 @@ function copy(text: string) {
 const {
   selectedId,
   selectedSource,
+  selectedLocator,
   tail,
   tailLoading,
   chatEl,
@@ -158,7 +159,11 @@ const {
   toggleExpand,
 } = useOpenSession({ sessions, queue, showTools, showThinking, humanOnly })
 
-const { loadUsage, usageSummary, usageDetail } = useSessionUsage({ selectedId, selectedSource })
+const { loadUsage, usageSummary, usageDetail } = useSessionUsage({
+  selectedId,
+  selectedSource,
+  selectedLocator,
+})
 // Cost moves only when the CLI writes turns, so refresh on the run's edges rather than on the
 // 4-second tail poll (useOpenSession's own concern) — re-streaming a large transcript every tick to
 // watch a number tick up is not worth it.
@@ -166,7 +171,11 @@ watch(runningRunId, (id, oldId) => {
   if (!!id !== !!oldId && selectedId.value) loadUsage()
 })
 
-const { secrets, secretsOpen, secretsDetail } = useSessionSecrets({ selectedId, selectedSource })
+const { secrets, secretsOpen, secretsDetail } = useSessionSecrets({
+  selectedId,
+  selectedSource,
+  selectedLocator,
+})
 
 const {
   events,
@@ -1373,7 +1382,15 @@ function onComposerSent(mode: 'now' | 'queued') {
                           <DropdownMenuSubContent>
                             <DropdownMenuItem as-child>
                               <a
-                                :href="api.sessionExportUrl(selected.session_id, selected.source, 'markdown')"
+                                :href="
+                                  api.sessionExportUrl(
+                                    selected.session_id,
+                                    selected.source,
+                                    'markdown',
+                                    false,
+                                    selected.locator,
+                                  )
+                                "
                                 download
                               >
                                 <FileText />{{ $t('sessions.exportMarkdown') }}
@@ -1381,7 +1398,15 @@ function onComposerSent(mode: 'now' | 'queued') {
                             </DropdownMenuItem>
                             <DropdownMenuItem as-child>
                               <a
-                                :href="api.sessionExportUrl(selected.session_id, selected.source, 'html')"
+                                :href="
+                                  api.sessionExportUrl(
+                                    selected.session_id,
+                                    selected.source,
+                                    'html',
+                                    false,
+                                    selected.locator,
+                                  )
+                                "
                                 download
                               >
                                 <Globe />{{ $t('sessions.exportHtml') }}

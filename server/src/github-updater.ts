@@ -22,11 +22,21 @@
 
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs'
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import os from 'node:os'
 import { basename, join } from 'node:path'
 import { APP_ROOT, appEnv, SERVICE_NAME, VERSION } from './config'
 import { getSetting, setSetting } from './db'
+import { orchestratorBusy } from './orchestrator'
 import {
   beginUpdateProgress,
   finishUpdateProgress,
@@ -469,12 +479,243 @@ async function extract(archivePath: string, destDir: string): Promise<void> {
 }
 
 /** Move `from`→`to`, falling back to copy+remove across volumes (renameSync throws EXDEV there). */
-function moveInto(from: string, to: string): void {
+function moveInto(from: string, to: string, rename: RenameFn = renameSync): void {
   try {
-    renameSync(from, to)
+    rename(from, to)
   } catch {
     cpSync(from, to, { recursive: true })
     rmSync(from, { recursive: true, force: true })
+  }
+}
+
+// ── release-owned components (audit AH-08) ──────────────────────────────────────────────────
+//
+// A release archive is the executable PLUS two folders beside it: misc/ (the tray toolkit) and
+// orchestrator/ (the Python toolbox). Until 2026-09-05 the compiled updater swapped the executable,
+// overlaid misc/ file by file, and never touched orchestrator/ at all - so an installed toolbox
+// stayed at whatever version first installed it while the executable's MCP advertised newer tools
+// and contracts, a retired sidecar in misc/ lived forever (overlay never deletes), and a
+// bare-executable install could never acquire the toolbox through an update. Reproduced with a
+// synthetic release against a disposable install: orchestrator/old-payload.txt stayed,
+// orchestrator/new-payload.txt never arrived, misc/obsolete-component.txt stayed.
+//
+// The rule now: every component listed here is release-owned and is brought to the release's
+// exact content on update. Two strategies, because the two folders live different lives:
+//
+//   swap       orchestrator/: nothing holds it open while the daemon is not running a script
+//              (applyUpdate refuses while one is), so the whole folder is replaced atomically -
+//              user state inside it (`preserve`) is carried into the new copy first, the current
+//              folder is renamed aside, the new one moved in, and a failure anywhere puts the
+//              aside copy back. Retired files are gone by construction.
+//   reconcile  misc/: the running tray host holds its own executable image, so a rename-aside
+//              would fail or strand it. Files are copied over one by one and files the release no
+//              longer ships are deleted; a locked file is reported and left, and the next update
+//              retries - the same best-effort, non-fatal posture misc/ always had, minus the
+//              retired-sidecar leak.
+//
+// Each installed component gets a RELEASE_VERSION_FILE so the components' versions can be read
+// and compared, instead of inferred from the executable's.
+
+export type RenameFn = (from: string, to: string) => void
+
+export interface ReleaseComponent {
+  /** Folder name beside the executable. */
+  name: string
+  strategy: 'swap' | 'reconcile'
+  /** Paths inside the folder that are USER STATE, never release content: carried across a swap
+   *  and never deleted by a reconcile. */
+  preserve: string[]
+}
+
+export const RELEASE_COMPONENTS: readonly ReleaseComponent[] = [
+  { name: 'orchestrator', strategy: 'swap', preserve: ['state'] },
+  { name: 'misc', strategy: 'reconcile', preserve: [] },
+]
+
+/** Written into every installed component with the release version it came from. */
+export const RELEASE_VERSION_FILE = '.release-version'
+
+export interface ComponentDeps {
+  /** Injected rename (tests make a specific step fail). Defaults to renameSync. */
+  rename?: RenameFn
+  /** Injected "put the new copy in place" step. Defaults to moveInto with the rename above, i.e.
+   *  rename with a copy fallback, so a test that wants the swap to FAIL injects this one. */
+  move?: (from: string, to: string) => void
+}
+
+/** Every regular file under `dir`, as forward-slash paths relative to it. */
+function listFilesRecursive(dir: string): string[] {
+  const out: string[] = []
+  const walk = (d: string, rel: string): void => {
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = readdirSync(d, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name
+      if (e.isDirectory()) walk(join(d, e.name), r)
+      else if (e.isFile()) out.push(r)
+    }
+  }
+  walk(dir, '')
+  return out
+}
+
+function underPreserved(rel: string, comp: ReleaseComponent): boolean {
+  return comp.preserve.some((p) => rel === p || rel.startsWith(`${p}/`))
+}
+
+/** What a swap left behind for rollback: the previous copy, renamed aside. */
+export interface ComponentAside {
+  name: string
+  aside: string
+}
+
+/**
+ * Replace one swap-strategy component with the bundle's copy. Returns the aside record when a
+ * previous copy existed (the caller keeps it for rollback and removes it once the whole update
+ * has succeeded), null when the bundle did not ship the component or nothing was there before.
+ * Throws on failure - with the previous copy already put back where it was.
+ */
+export function swapComponent(
+  bundleDir: string,
+  installDir: string,
+  comp: ReleaseComponent,
+  stamp: string,
+  version: string,
+  output: string[],
+  deps: ComponentDeps = {},
+): ComponentAside | null {
+  const rename = deps.rename ?? renameSync
+  const move = deps.move ?? ((from: string, to: string) => moveInto(from, to, rename))
+  const src = join(bundleDir, comp.name)
+  if (!existsSync(src)) {
+    output.push(`the bundle ships no ${comp.name}/ - the installed copy is kept as it is`)
+    return null
+  }
+  const cur = join(installDir, comp.name)
+  const aside = join(installDir, `${comp.name}.old-${stamp}`)
+  const hadPrevious = existsSync(cur)
+  if (hadPrevious) {
+    // User state rides into the NEW copy before anything moves, so the swap never has a moment
+    // where the state exists only in a folder about to be renamed. Ours wins over anything the
+    // bundle happened to ship at the same path (a release must not carry state, but if it did,
+    // the user's is the truth).
+    for (const rel of comp.preserve) {
+      const from = join(cur, rel)
+      if (!existsSync(from)) continue
+      cpSync(from, join(src, rel), { recursive: true, force: true })
+    }
+    rename(cur, aside)
+  }
+  try {
+    move(src, cur)
+    writeFileSync(join(cur, RELEASE_VERSION_FILE), `${version}\n`)
+  } catch (e) {
+    // Put the previous copy back before telling the caller. A half-moved new copy is removed.
+    try {
+      rmSync(cur, { recursive: true, force: true })
+    } catch {
+      /* best-effort */
+    }
+    if (hadPrevious) {
+      try {
+        rename(aside, cur)
+      } catch {
+        /* best-effort; the aside still exists on disk under its .old- name */
+      }
+    }
+    throw e
+  }
+  output.push(
+    `installed ${comp.name}/ v${version}${comp.preserve.length ? ` (carried ${comp.preserve.join(', ')} across)` : ''}`,
+  )
+  return hadPrevious ? { name: comp.name, aside } : null
+}
+
+/** Undo swaps, newest first: remove what was installed, put the aside copies back. */
+export function rollbackComponents(
+  installDir: string,
+  asides: ComponentAside[],
+  deps: ComponentDeps = {},
+): void {
+  const rename = deps.rename ?? renameSync
+  for (const { name, aside } of [...asides].reverse()) {
+    const cur = join(installDir, name)
+    try {
+      rmSync(cur, { recursive: true, force: true })
+      if (existsSync(aside)) rename(aside, cur)
+    } catch {
+      /* best-effort; a leftover .old- folder is swept at the next boot */
+    }
+  }
+}
+
+/**
+ * Bring one reconcile-strategy component to the bundle's exact content, file by file, without
+ * ever renaming the folder: copy every shipped file over, delete every file the release no longer
+ * ships (except preserved paths and the version stamp), report what could not be touched.
+ * Never throws: a locked tray executable must not fail an otherwise-good update.
+ */
+export function reconcileComponent(
+  bundleDir: string,
+  installDir: string,
+  comp: ReleaseComponent,
+  version: string,
+  output: string[],
+): { installed: boolean; removed: string[]; locked: string[] } {
+  const src = join(bundleDir, comp.name)
+  if (!existsSync(src)) return { installed: false, removed: [], locked: [] }
+  const cur = join(installDir, comp.name)
+  const wanted = new Set(listFilesRecursive(src))
+  const locked: string[] = []
+  const removed: string[] = []
+  try {
+    mkdirSync(cur, { recursive: true })
+  } catch (e) {
+    output.push(`could not create ${comp.name}/: ${e instanceof Error ? e.message : String(e)}`)
+    return { installed: false, removed, locked }
+  }
+  for (const rel of wanted) {
+    try {
+      mkdirSync(join(cur, rel, '..'), { recursive: true })
+      cpSync(join(src, rel), join(cur, rel), { force: true })
+    } catch {
+      locked.push(rel)
+    }
+  }
+  for (const rel of listFilesRecursive(cur)) {
+    if (wanted.has(rel) || rel === RELEASE_VERSION_FILE || underPreserved(rel, comp)) continue
+    try {
+      rmSync(join(cur, rel), { force: true })
+      removed.push(rel)
+    } catch {
+      locked.push(rel)
+    }
+  }
+  try {
+    writeFileSync(join(cur, RELEASE_VERSION_FILE), `${version}\n`)
+  } catch {
+    locked.push(RELEASE_VERSION_FILE)
+  }
+  output.push(
+    `reconciled ${comp.name}/ to v${version}` +
+      (removed.length ? `; removed ${removed.length} retired file(s): ${removed.join(', ')}` : '') +
+      (locked.length
+        ? `; ${locked.length} file(s) in use and left for the next update: ${locked.join(', ')}`
+        : ''),
+  )
+  return { installed: true, removed, locked }
+}
+
+/** The version stamp an installed component carries, or null (older install, never stamped). */
+export function installedComponentVersion(installDir: string, name: string): string | null {
+  try {
+    return readFileSync(join(installDir, name, RELEASE_VERSION_FILE), 'utf8').trim() || null
+  } catch {
+    return null
   }
 }
 
@@ -557,30 +798,6 @@ async function downloadAndVerifyUpdate(
   return { newExe, bundleDirPath }
 }
 
-// The swap above moves ONE file, which is right for the daemon but would freeze misc/ at
-// whatever version first installed it. The tray host is a separate executable with its own
-// bugs (an icon that did not survive an Explorer restart, most recently), so without this a
-// fixed launcher would never reach anyone who updates in place. These are app-owned launcher
-// files, not user data: the shortcut lives at the install root and is untouched. Best-effort,
-// and deliberately non-fatal: the daemon is already updated and working, and a locked
-// lunarwerx-tray.exe (the running tray host holds its own image) must not roll back an
-// otherwise-good update. The next update retries. Pulled out of applyUpdate, see fail() above.
-function refreshTrayToolkit(
-  bundleDirPath: string | null,
-  staging: string,
-  installDir: string,
-  output: string[],
-): void {
-  const bundledMisc = bundleDirPath ? join(bundleDirPath, 'misc') : join(staging, 'misc')
-  if (!existsSync(bundledMisc)) return
-  try {
-    cpSync(bundledMisc, join(installDir, 'misc'), { recursive: true })
-    output.push('refreshed the tray toolkit')
-  } catch {
-    output.push('could not refresh misc/ (in use?) — the app itself is updated')
-  }
-}
-
 export async function applyUpdate(): Promise<UpdateApplyResult> {
   beginUpdateProgress('Checking for the latest release…')
   const status = await checkForUpdate({ fresh: true })
@@ -621,6 +838,7 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
 
   // Staged renames-aside, tracked so a mid-swap failure can roll them back.
   let exeMovedAside: string | null = null
+  const componentAsides: ComponentAside[] = []
 
   try {
     const prepared = await downloadAndVerifyUpdate(
@@ -634,9 +852,24 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
     )
     if (!('newExe' in prepared)) return prepared
     const { newExe, bundleDirPath } = prepared
+    const bundleDir = bundleDirPath ?? staging
     setUpdatePhase('installing', `Installing v${remoteVersion}…`)
 
-    // --- swap the exe (rename-aside is allowed on a running Windows image) ---
+    // A toolbox script mid-run executes out of orchestrator/; replacing that folder under it
+    // is not an update, it is a crash with a good excuse. Refuse and let the next tick retry.
+    if (orchestratorBusy())
+      return fail(
+        'an orchestrator script is running through this daemon; the update would replace the code it is executing - retry when it finishes',
+      )
+
+    // --- 1. swap-strategy components (orchestrator/), each rollbackable ---
+    for (const comp of RELEASE_COMPONENTS) {
+      if (comp.strategy !== 'swap') continue
+      const aside = swapComponent(bundleDir, installDir, comp, stamp, remoteVersion, output)
+      if (aside) componentAsides.push(aside)
+    }
+
+    // --- 2. swap the exe (rename-aside is allowed on a running Windows image) ---
     exeMovedAside = join(installDir, `${exeName}.old-${stamp}`)
     renameSync(exePath, exeMovedAside)
     moveInto(newExe, exePath)
@@ -649,8 +882,15 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
     }
     output.push(`installed v${remoteVersion}`)
 
-    refreshTrayToolkit(bundleDirPath, staging, installDir, output)
+    // --- 3. reconcile-strategy components (misc/), best-effort and last: nothing below can fail
+    //        the update, and everything above it is already consistent. ---
+    for (const comp of RELEASE_COMPONENTS) {
+      if (comp.strategy !== 'reconcile') continue
+      reconcileComponent(bundleDir, installDir, comp, remoteVersion, output)
+    }
 
+    // The previous component copies are only garbage once the whole update has landed.
+    for (const { aside } of componentAsides) rmSync(aside, { recursive: true, force: true })
     rmSync(staging, { recursive: true, force: true })
     cached = null // force the next check to re-read the (now-current) version
     finishUpdateProgress(true, `Updated to v${remoteVersion}. Restarting…`)
@@ -663,7 +903,8 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
       output,
     }
   } catch (e) {
-    // Roll back anything we moved aside so the install is never left half-swapped.
+    // Roll back anything we moved aside so the install is never left half-swapped: the
+    // executable, then the components that were swapped before it (newest first).
     try {
       if (exeMovedAside && existsSync(exeMovedAside)) {
         rmSync(exePath, { force: true })
@@ -672,6 +913,7 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
     } catch {
       /* rollback is best-effort */
     }
+    rollbackComponents(installDir, componentAsides)
     return fail(`update failed: ${e instanceof Error ? e.message : String(e)}`)
   }
 }

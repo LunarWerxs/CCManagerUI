@@ -13,6 +13,9 @@ import { formatCompact, formatUsd } from '@/lib/format'
 export function useSessionUsage(deps: {
   selectedId: Ref<string | null>
   selectedSource: Ref<SessionSource | null>
+  /** The exact row's locator (audit AH-35), when the selection carries one. Optional so a caller
+   *  that predates locators still compiles and behaves exactly as before. */
+  selectedLocator?: Ref<string | null>
 }) {
   const { t } = useI18n()
   const usage = ref<SessionUsage | null>(null)
@@ -20,12 +23,13 @@ export function useSessionUsage(deps: {
   async function loadUsage() {
     const id = deps.selectedId.value
     const source = deps.selectedSource.value
+    const locator = deps.selectedLocator?.value ?? undefined
     if (!id || !source) {
       usage.value = null
       return
     }
     try {
-      const u = await api.getSessionUsage(id, source)
+      const u = await api.getSessionUsage(id, source, locator)
       if (deps.selectedId.value !== id || deps.selectedSource.value !== source) return // selection moved on
       usage.value = u
     } catch {

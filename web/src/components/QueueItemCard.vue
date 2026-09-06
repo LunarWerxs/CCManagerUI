@@ -22,6 +22,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import type { QueueItem } from '@/lib/api'
 import { baseName, formatRunAt } from '@/lib/format'
+import { HEADLESS_QUEUEING_ENABLED } from '@/lib/headless'
+import IconTooltip from '@/shell/IconTooltip.vue'
 
 defineProps<{
   item: QueueItem
@@ -106,8 +108,22 @@ defineEmits<{
       </div>
 
       <div class="flex shrink-0 flex-col gap-1.5">
+        <!-- AH-12: AgentHydra never runs a chat nobody can see (headless-policy.ts) — every run
+             attempt fails moments after reporting "started" now, so Run is disabled with the real
+             reason rather than left to fail predictably. Cancel is untouched: it stops a process
+             that is genuinely active (a legacy row from before this policy, or one mid-shutdown),
+             which has nothing to do with dispatch being refused. -->
+        <IconTooltip
+          v-if="item.status !== 'running' && !HEADLESS_QUEUEING_ENABLED"
+          :label="$t('queue.run')"
+          :description="$t('queue.runUnavailableHint')"
+        >
+          <Button size="sm" variant="outline" disabled>
+            <Play /> {{ $t('queue.run') }}
+          </Button>
+        </IconTooltip>
         <Button
-          v-if="item.status !== 'running'"
+          v-else-if="item.status !== 'running'"
           size="sm"
           variant="outline"
           :title="$t('queue.runNow')"

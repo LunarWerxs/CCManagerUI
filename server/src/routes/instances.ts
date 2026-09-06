@@ -19,7 +19,14 @@ import { createInstance, removeInstance } from '../core/lifecycle'
 import { INSTANCE_COLOR_KEYS, INSTANCE_ICON_KEYS } from '../core/shared'
 import { createInstanceShortcut } from '../core/shortcut'
 import { app } from '../http-app'
-import { orchestratorStatus, runOrchestrator, runOriginAllowed } from '../orchestrator'
+import {
+  cancelOrchestratorOperation,
+  getOrchestratorOperation,
+  listOrchestratorOperations,
+  orchestratorStatus,
+  runOriginAllowed,
+  startOrchestratorOperation,
+} from '../orchestrator'
 import { jsonBody } from '../route-helpers'
 
 /** Multi-instance (isolated Claude Desktop instances), instance-number lookups, and the
@@ -119,13 +126,50 @@ app.post('/api/orchestrator/run', async (c) => {
       403,
     )
   const body = await jsonBody(c)
-  const result = await runOrchestrator({
-    script: body.script,
-    args: body.args,
-    timeoutMs: body.timeoutMs,
-  })
+  // Durable operations (audit AH-09). An `X-Idempotency-Key` header (or body.idempotencyKey)
+  // makes a retry of the same request - after a dropped connection, say - return the ORIGINAL
+  // operation rather than start a second act. `async: true` answers at once with the id, for a
+  // caller that would rather poll than hold a 30-minute connection open.
+  const headerKey = c.req.header('x-idempotency-key')
+  const idempotencyKey =
+    (typeof headerKey === 'string' && headerKey.trim()) ||
+    (typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim()) ||
+    null
+  const started = startOrchestratorOperation(
+    { script: body.script, args: body.args, timeoutMs: body.timeoutMs },
+    { idempotencyKey },
+  )
+  if (body.async === true)
+    return c.json(
+      { ok: true, operationId: started.op.id, status: started.op.status, reused: started.reused },
+      202,
+    )
+  const op = await started.promise
+  const result = op.result ?? { ok: false, error: 'operation finished without a result' }
   // 409 = that script is already running through this route; 400 = the request itself is wrong.
-  return c.json(result, 'error' in result ? (result.busy ? 409 : 400) : 200)
+  return c.json(
+    { ...result, operationId: op.id, operationStatus: op.status, reused: started.reused },
+    'error' in result ? (result.busy ? 409 : 400) : 200,
+  )
+})
+// The operations behind that route: poll one, list recent ones, cancel a running one. Same
+// origin rule as run: this is control over acts, not a read of the fleet.
+app.get('/api/orchestrator/operations', (c) => c.json({ operations: listOrchestratorOperations() }))
+app.get('/api/orchestrator/operations/:id', (c) => {
+  const op = getOrchestratorOperation(c.req.param('id'))
+  return op ? c.json(op) : c.json({ ok: false, error: 'no such operation' }, 404)
+})
+app.post('/api/orchestrator/operations/:id/cancel', (c) => {
+  if (!runOriginAllowed(c.req.header('origin'), c.req.url))
+    return c.json(
+      {
+        ok: false,
+        error: 'orchestrator operations accept only same-origin or non-browser requests',
+      },
+      403,
+    )
+  const r = cancelOrchestratorOperation(c.req.param('id'))
+  return c.json(r, r.ok ? 200 : 404)
 })
 app.delete('/api/instances/:dir', async (c) => {
   const dir = decodeURIComponent(c.req.param('dir'))

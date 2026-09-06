@@ -29,6 +29,7 @@ import {
   resolveContinuations,
   supersededSessions,
 } from './session-continuations'
+import { dedupeKey, makeLocator, matchesLocator, parseLocator } from './session-locator'
 import type { SessionSource, TailEvent, TailResult } from './types'
 
 // --- cwd folder-name encoding (forward only; reverse is lossy) --------------
@@ -105,6 +106,17 @@ export interface TranscriptFile {
    * listed, which is the same treatment subagents get.
    */
   supersededBy?: string
+  /**
+   * The opaque, versioned session-locator.ts identity for THIS row: `source` + product identity
+   * + physical store, never just source + session_id.
+   *
+   * `source` is a FORMAT and `session_id` alone is not unique across it — two OpenCode-format
+   * products (Kilo, MiMo Code) or two Hermes profiles can hold the same session id (audit AH-35).
+   * This is what every route, the done-mark key and the index's own de-dup now key on instead, so a
+   * caller that already knows which exact row it means (because it just listed it) can say so
+   * rather than falling back to the first match for `source` alone. Always set by finishIndex.
+   */
+  locator?: string
 }
 
 let cache: { at: number; files: TranscriptFile[] } | null = null
@@ -838,15 +850,21 @@ function finishIndex(
   const unique = new Map<string, TranscriptFile>()
   const siblings = new Map<string, string[]>()
   for (const file of files) {
-    const key = `${file.source}:${file.session_id}`
+    // source + PRODUCT + STORE, not just source + session_id (audit AH-35): a bare source+id key
+    // collapsed two OpenCode-format products (Kilo, MiMo Code) holding the same session id into one
+    // row, keeping only the newer. dedupeKey still merges the genuine same-store case this dedup
+    // exists for — a Codex rollout briefly visible in both the live and archived roots while a move
+    // settles — because storeKeyOf treats codex's live+archived roots as one family. See
+    // session-locator.ts.
+    const key = dedupeKey(file)
     const paths = siblings.get(key)
     if (paths) paths.push(file.path)
     else siblings.set(key, [file.path])
     const previous = unique.get(key)
     if (!previous || file.mtime_ms >= previous.mtime_ms) unique.set(key, file)
   }
-  const result = [...unique.values()].map((file) => {
-    const key = `${file.source}:${file.session_id}`
+  const result: TranscriptFile[] = [...unique.values()].map((file): TranscriptFile => {
+    const key = dedupeKey(file)
     // Only the OTHERS: `path` is already read by every caller, and listing it twice would double
     // that file's tokens.
     const rest = (siblings.get(key) ?? []).filter((p) => p !== file.path)
@@ -855,7 +873,11 @@ function finishIndex(
     // record carries its own request id and the usage parser charges a request once.
     if (file.source === 'claude')
       for (const p of claudeChildren?.get(file.session_id) ?? []) if (p !== file.path) rest.push(p)
-    return rest.length ? { ...file, siblingPaths: rest } : file
+    const withSiblings = rest.length ? { ...file, siblingPaths: rest } : file
+    // Computed once per sweep, not on demand: every row gets a stable public identity whether or
+    // not a caller ever asks for it, so a session found through the plain list is immediately
+    // addressable by locator (see routes/sessions.ts and web/src/lib/api.ts).
+    return { ...withSiblings, locator: makeLocator(file) }
   })
   // A map lookup and nothing else. Working out WHICH session continued which means reading whole
   // transcripts, so that happens between sweeps (see resolveContinuations); this only applies what
@@ -1083,15 +1105,38 @@ export async function ensureTranscriptIndex(force = false): Promise<TranscriptFi
   return build
 }
 
-const pickSession = (sessionId: string, source?: SessionSource) => (files: TranscriptFile[]) =>
-  files.filter((f) => f.session_id === sessionId && (!source || f.source === source))
+/**
+ * Every row a lookup could mean, narrowed as far as the caller told us.
+ *
+ * A `locator` that parses AND has at least one exact match wins outright (audit AH-35: it is the
+ * one identity that survives two products sharing a format), which is why it short-circuits before
+ * the plain id/source filter even runs — falling through to that filter on a locator naming a row
+ * that is not (yet) in this snapshot would silently answer with some OTHER session sharing the bare
+ * id instead of "not here yet". A locator that fails to parse, or that matches nothing in THIS
+ * snapshot, is treated exactly like no locator at all: the caller may be a step behind a sweep, and
+ * a hard error over a stale query param would be the wrong failure mode for what is, from here, an
+ * ordinary miss.
+ */
+const pickSession =
+  (sessionId: string, source?: SessionSource, locator?: string) => (files: TranscriptFile[]) => {
+    const parsed = parseLocator(locator)
+    if (parsed) {
+      const exact = files.filter((f) => matchesLocator(f, parsed))
+      if (exact.length) return exact
+    }
+    return files.filter((f) => f.session_id === sessionId && (!source || f.source === source))
+  }
 
 /** newest wins if a session id appears under multiple project folders */
 const newestOf = (matches: TranscriptFile[]): TranscriptFile | null =>
   matches.length === 0 ? null : matches.reduce((a, b) => (b.mtime_ms > a.mtime_ms ? b : a))
 
-export function findTranscript(sessionId: string, source?: SessionSource): TranscriptFile | null {
-  const pick = pickSession(sessionId, source)
+export function findTranscript(
+  sessionId: string,
+  source?: SessionSource,
+  locator?: string,
+): TranscriptFile | null {
+  const pick = pickSession(sessionId, source, locator)
   // A miss is the one answer the snapshot can get wrong — a transcript created seconds ago is
   // absent from it — so a sweep is started. This cannot WAIT for it (see
   // listTranscriptFilesAfterMiss), which is why an async caller should prefer findTranscriptAsync.
@@ -1112,8 +1157,9 @@ export function findTranscript(sessionId: string, source?: SessionSource): Trans
 export async function findTranscriptAsync(
   sessionId: string,
   source?: SessionSource,
+  locator?: string,
 ): Promise<TranscriptFile | null> {
-  const pick = pickSession(sessionId, source)
+  const pick = pickSession(sessionId, source, locator)
   let matches = pick(await ensureTranscriptIndex())
   if (matches.length === 0) matches = pick(await ensureTranscriptIndexAfterMiss())
   return newestOf(matches)
@@ -1504,6 +1550,7 @@ export async function tailTranscript(
   sessionId: string,
   opts: TailOptions = {},
   source?: SessionSource,
+  locator?: string,
 ): Promise<TailResult> {
   const limit = opts.limit ?? 40
   const keep = tailKeeper(opts)
@@ -1511,7 +1558,7 @@ export async function tailTranscript(
   // Async: this is the endpoint the open chat polls every 4 s, and the one a just-dispatched run
   // hits before its transcript exists. The sync lookup would answer "not found" until some later
   // poll — or, before the sweep became async, freeze the daemon while it looked.
-  const tf = await findTranscriptAsync(sessionId, source)
+  const tf = await findTranscriptAsync(sessionId, source, locator)
   if (!tf) {
     return {
       session_id: sessionId,

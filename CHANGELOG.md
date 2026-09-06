@@ -9,6 +9,15 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ### Added
 
+- **The courier lane, entered here late** (`orchestrator/scripts/courier.py`, `stage_reply.py`,
+  `lib/deliverylib.py`; landed 2026-09-03 with the orchestrator's move back into this repo, after
+  v0.38.3 was tagged, and left out of this file at the time). It is the last manual lane closed:
+  an AI stages a decided reply, and the courier delivers it into the chat through the app's own
+  composer (or the peer channel for a live session), proving the chat moved afterwards. Rails in
+  order: held? breaker? resolves to exactly one chat? never mid-turn on the composer route? the
+  pane shows a snippet of this chat's own last words? Then send, then confirm. `sweep.py --deliver`
+  runs it as part of an acting pass.
+
 - **A provenance ratchet on the agent catalog** (`scripts/checks/catalog-row-provenance.mjs`, wired
   into CI). The 58 rows in `server/src/agent-catalog.ts` say where each coding agent keeps its
   conversations, and their paths were compiled from a third-party registry rather than read from
@@ -155,6 +164,36 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
   token is read into a local binding only and never logged or returned.
 
 ### Fixed
+
+- **The last twelve audit findings** (audit AH-07/08/09/10/11/12/16/25/30/35/40/42, 2026-09-05),
+  which closes the 42-item orchestrator audit. A compiled update now brings `orchestrator/` and
+  `misc/` to the release's exact content as one unit with the executable: the toolbox is swapped
+  with its `state/` carried across and a `.release-version` stamp, retired files go, a failure
+  rolls every part back, a bare-executable install acquires the toolbox, and the swap refuses to
+  run while a toolbox script is executing through the daemon. The manual `install.ps1` is
+  transactional the same way (stage, canary the staged exe, refuse under a running instance,
+  rename-aside per component, restore on any failure) and a test pins its component list to the
+  updater's. A long toolbox run is a durable operation: an idempotency key makes a retry after a
+  dropped connection return the original outcome rather than start a second act, `async` returns
+  an id to poll, and a running operation can be cancelled (its whole process tree is killed).
+  MCP requests over stdio dispatch concurrently with per-request cancellation, so a pause or
+  status call is no longer stuck behind a 30-minute act. The daemon's guard and CORS accept an
+  exact origin allowlist instead of any loopback port. The web no longer offers queue creation or
+  Run controls that the server refuses unconditionally: the composer sends through the working
+  delivery path and shows the server's real reason, and the README describes what works. Every
+  toolbox script carries one explicit capability contract (kind, invocation, guard, availability)
+  that the menu, `--catalog` and the arm check all read, replacing classification by docstring
+  prose. Scheduled lanes hold a proof-of-death job lock (owner pid + creation time, heartbeat,
+  reclaim only when the owner is provably gone) instead of an age-only directory. The doctrine
+  picker's confirmation ledger is written under a lock, so a concurrent drop can no longer erase
+  a fresh confirmation. Fleet-wide enumeration pages the session list to the end and raises on a
+  bad page instead of treating the first 500 rows as the fleet. Sessions carry a locator that
+  includes the store they came from, so Kilo, MiMo Code, IcodeMate and multi-profile Hermes rows
+  stop colliding. And a collection guard fails the Python suite when any `test_*.py` collects as
+  zero cases; it fired at once on the chatwatch checks, which had been a bare script off the gate
+  since they were written. Finally, the desktop-record mutation guard compares the record's BYTES
+  before it writes, not its timestamp and size: a same-size rewrite by the app inside one
+  filesystem timestamp tick was invisible to the old check and a stale copy went straight over it.
 
 - **A damaged instance registry is never silently replaced, and a delete never claims more than it
   did** (audit AH-01/02/03, 2026-09-05). Three related holes in how the CLI and Codex instance

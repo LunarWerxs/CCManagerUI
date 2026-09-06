@@ -73,6 +73,23 @@ Two shapes to keep intact if the workflow is ever restructured:
   installer matches on the file's LEAF name for that reason; moving the build output to another
   directory is fine, renaming the assets is not.
 
+**The install itself is transactional (AH-40).** After the checksum passes, `install.ps1` extracts
+into a staging directory beside `-InstallDir` (same volume, so the real swap is a rename) and
+validates the complete staged payload: exe present, `misc/` and `orchestrator/` present, and the
+`--version` canary run **on the staged copy** before anything real is touched, then refuses to
+proceed under a detected running instance (`AgentHydra`/`lunarwerx-tray` process, or a live pid in
+`<config dir>\runtime.json`) unless `-Force` is passed. The three release-owned components
+(`AgentHydra.exe`, `misc/`, `orchestrator/`, the same three names should reappear if
+`server/src/github-updater.ts`'s self-updater ever grows a shared component list; there is no such
+list there today) are then swapped one at a time: each is renamed aside (`<name>.old-<stamp>`),
+the staged copy is moved into place, and orchestrator's user-owned `state/` directory is carried
+across the swap rather than dropped. Any failure during the swap rolls every component processed
+so far back to its `.old-` copy, so a disk-full, interrupted, or locked-file mid-copy can no longer
+leave `misc/`, `orchestrator/`, and the exe at silently different versions. `-FromZip`, `-Sha256`,
+`-InstallDir`, `-NoLaunch`, and `-Force` exist so this is testable offline (see
+`tests/install-transactional.test.ts`) without touching a real install, the real daemon, or the
+real tray; none of them change the default (no-arguments) behaviour a real user gets.
+
 ## When a push doesn't trigger anything
 
 GitHub's standard mitigation for an Actions incident is to **throttle webhook triggers**, which

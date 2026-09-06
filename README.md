@@ -64,25 +64,27 @@ When you want a raw Claude or Codex file, there is a button for opening the `.js
 downloading it under its real title, or copying it out. OpenCode conversations are rendered from its
 database rather than exposed as a raw file.
 
-## Queue work and let it run
+## Reply, fan out, or move a session, never headless
 
-![The run queue drawer: five runs, one running, three queued and one finished, each showing its project, model, effort and scheduled time](.github/screenshots/queue.png)
+AgentHydra does not run a `claude` chat you cannot see. There is no headless queue or scheduler:
+every run happens in a real desktop app window, on purpose, so nothing is ever working away in a
+process with no chat for you to open. Three things actually work today:
 
-Build a list of `claude` runs, each with its own prompt, working directory, model, effort,
-permission mode and account. Run one on demand, or let the scheduler drain the queue for you, one at
-a time or a few at once, with spacing so you are not hammering anything.
+- **Reply straight into a session's own desktop chat.** The composer at the bottom of a session
+  types your message into that chat's own app window (the same delivery `fan_out_send` uses over
+  MCP) and confirms it landed by watching the transcript grow. A busy chat refuses honestly instead
+  of pretending to queue behind it.
+- **Fan a task list out across your other signed-in accounts** with the MCP `fan_out` tool, one
+  visible chat per account, then steer the whole group with `fan_out_send`.
+- **Import a session into a desktop app** so it becomes a real chat you can continue by hand.
 
-Anything you queue can be given a start time, so "do this at 3am" is a checkbox and not a cron job
-you have to maintain.
+The **run queue** view still exists as a record of past runs: every historical item, its prompt,
+model, exit code and live output, stays inspectable and editable, but creating or dispatching a
+new one is refused by policy. There is nothing here you can turn back on. If you're looking for the
+"queue a run for 3am" feature an earlier version of this README described, it has been removed, not
+hidden; the screenshot below is historical.
 
-Two things make this survive contact with reality:
-
-- **Runs reattach after a restart.** Quitting the app, or letting it auto-update, does not kill
-  what is in flight. It picks the runs back up.
-- **A rate limit is not a dead end.** Sessions stopped by a 5-hour limit can resume themselves once
-  the window resets, gated on your weekly usage so it does not spend everything the moment it can.
-  With several accounts signed in, it can instead move the run to one that still has headroom and
-  carry on immediately. Both are off unless you turn them on.
+![The run queue drawer, from before headless dispatch was removed: five runs, one running, three queued and one finished, each showing its project, model, effort and scheduled time](.github/screenshots/queue.png)
 
 ## See where the time and the money went
 

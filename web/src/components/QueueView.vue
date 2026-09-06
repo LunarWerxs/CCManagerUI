@@ -1,14 +1,5 @@
 <script setup lang="ts">
-import {
-  ChevronDown,
-  CircleAlert,
-  FastForward,
-  ListPlus,
-  Plus,
-  Power,
-  PowerOff,
-  Trash2,
-} from '@lucide/vue'
+import { ChevronDown, CircleAlert, ListPlus, Plus, Power, PowerOff, Trash2 } from '@lucide/vue'
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
@@ -23,6 +14,7 @@ import { useInstances } from '@/composables/useInstances'
 import { usePanels } from '@/composables/usePanels'
 import type { QueueItem } from '@/lib/api'
 import * as api from '@/lib/api'
+import { HEADLESS_QUEUEING_ENABLED } from '@/lib/headless'
 import { displayName } from '@/lib/instance-appearance'
 import IconTooltip from '@/shell/IconTooltip.vue'
 import InfoHint from '@/shell/InfoHint.vue'
@@ -78,14 +70,6 @@ const diedOnly = ref(false)
 const died = computed(() => finished.value.filter((q) => q.status !== 'completed'))
 const finishedShown = computed(() => (diedOnly.value ? died.value : finished.value))
 
-// re-evaluated on every 2s queue poll, so a schedule crossing "now" surfaces the button
-const dueCount = computed(
-  () =>
-    queue.value.filter(
-      (q) => q.status === 'queued' && (!q.not_before || Date.parse(q.not_before) <= Date.now()),
-    ).length,
-)
-
 /** The login badge for a queue item: an instance-pinned item resolves through the live
  *  instance lists FIRST (desktop dir -> its displayName, cli id -> its name) — otherwise it
  *  would render with no account badge at all, since account_id is null on those items. Falls
@@ -115,33 +99,12 @@ function toggle(id: string) {
   expanded.value = expanded.value === id ? null : id
 }
 
-async function runDue() {
-  try {
-    const r = await api.runDueQueueItems()
-    toast.success(t('queue.toastRanDue', { n: r.started }), {
-      description: r.skipped ? t('queue.toastRanDueSkipped', { n: r.skipped }) : undefined,
-    })
-  } catch {
-    toast.error(t('queue.toastRunDueFailed'))
-  }
-  await refreshQueue()
-}
-
 /** AH-26: show the server's own error text when present — a bad cwd, a stale session id, a run
  *  the daemon refused — rather than a fixed generic toast that never says why. */
 function actionErrorText(e: unknown, fallback: string): string {
   return e instanceof Error && e.message ? e.message : fallback
 }
 
-async function run(item: QueueItem) {
-  try {
-    await api.runQueueItem(item.id)
-  } catch (e) {
-    toast.error(actionErrorText(e, t('queue.toastRunFailed')))
-  }
-  expanded.value = item.id
-  await refreshQueue()
-}
 async function cancel(item: QueueItem) {
   try {
     await api.cancelQueueItem(item.id)
@@ -226,28 +189,21 @@ async function clearFinished() {
             <PowerOff v-else class="size-3.5" />
           </button>
         </IconTooltip>
-        <!-- manual drain: run everything already due, skipping busy sessions -->
-        <Button
-          v-if="dueCount > 0"
-          size="sm"
-          variant="outline"
-          :title="$t('queue.runDueTitle')"
-          @click="runDue"
+        <!-- AH-12: AgentHydra never runs a chat nobody can see (headless-policy.ts) — creating a
+             new run always 409s and running/run-due always fail moments after "started", so the
+             control that used to open the builder is a disabled, explained stand-in instead of a
+             button that would work until you actually pressed it. -->
+        <IconTooltip
+          v-if="!HEADLESS_QUEUEING_ENABLED"
+          :label="$t('queue.newRun')"
+          :description="$t('queue.createUnavailableHint')"
         >
-          <FastForward /> {{ $t('queue.runDue', { n: dueCount }) }}
-        </Button>
-        <!-- expanding icon button; opens the builder (defaults to resume mode). A separate
-             "Queue resume" button used to sit here but opened this same dialog identically. -->
-        <Button
-          size="sm"
-          class="group/newrun gap-0 overflow-hidden transition-all"
-          :aria-label="$t('queue.newRun')"
-          @click="openBuilder()"
-        >
-          <Plus class="shrink-0" />
-          <span
-            class="max-w-0 overflow-hidden whitespace-nowrap opacity-0 transition-all duration-200 ease-out group-hover/newrun:ml-1.5 group-hover/newrun:max-w-[7rem] group-hover/newrun:opacity-100 group-focus-visible/newrun:ml-1.5 group-focus-visible/newrun:max-w-[7rem] group-focus-visible/newrun:opacity-100"
-          >{{ $t('queue.newRun') }}</span>
+          <Button size="sm" disabled :aria-label="$t('queue.newRun')">
+            <Plus /> {{ $t('queue.newRun') }}
+          </Button>
+        </IconTooltip>
+        <Button v-else size="sm" :aria-label="$t('queue.newRun')" @click="openBuilder()">
+          <Plus /> {{ $t('queue.newRun') }}
         </Button>
       </div>
     </div>
@@ -296,11 +252,14 @@ async function clearFinished() {
 
       <div
         v-else-if="queue.length === 0"
-        class="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground"
+        class="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-sm text-muted-foreground"
       >
         <ListPlus class="size-8 opacity-40" />
         <p>{{ $t('queue.empty') }}</p>
-        <Button size="sm" variant="outline" @click="openBuilder()"
+        <p v-if="!HEADLESS_QUEUEING_ENABLED" class="max-w-xs text-xs">
+          {{ $t('queue.createUnavailableHint') }}
+        </p>
+        <Button v-else size="sm" variant="outline" @click="openBuilder()"
           ><ListPlus /> {{ $t('queue.queueARun') }}</Button
         >
       </div>
@@ -312,7 +271,6 @@ async function clearFinished() {
         :expanded="expanded === item.id"
         :account-label="accountLabel(item)"
         @toggle="toggle(item.id)"
-        @run="run(item)"
         @cancel="cancel(item)"
         @edit="openEditor(item)"
         @remove="remove(item)"
@@ -375,7 +333,6 @@ async function clearFinished() {
             :expanded="expanded === item.id"
             :account-label="accountLabel(item)"
             @toggle="toggle(item.id)"
-            @run="run(item)"
             @cancel="cancel(item)"
             @edit="openEditor(item)"
             @remove="remove(item)"

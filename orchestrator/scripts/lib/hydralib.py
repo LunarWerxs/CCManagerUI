@@ -209,6 +209,49 @@ def dossier(query: str) -> list[dict]:
     raise DaemonError("/api/chats/dossier", None, f"unexpected response shape: {str(got)[:200]!r}")
 
 
+CENSUS_PAGE = 500
+
+
+def sessions_all(archived: str = "include", page_size: int = CENSUS_PAGE) -> list[dict]:
+    """THE CENSUS: every session the daemon has, following its own pagination to the end.
+
+    sessions() above is a recent-search: one page of at most 500 rows, and it never follows
+    `offset`. Any lane that used it as a whole-account enumeration (audit AH-07) silently
+    stopped at row 500 - on an account whose archived history fills most of that first page,
+    unarchived work past it was invisible and a sweep could report the account drained.
+
+    Contract: returns the complete list or RAISES. A page that fails is a DaemonError, never a
+    shorter list - an incomplete census must not read as an empty or drained account. Rows are
+    de-duplicated by session id across pages: the daemon lists newest first, so a row that
+    arrives while we page shifts older rows LATER (where we still meet them) rather than past
+    us, and a row we already hold simply repeats. A page that yields nothing new ends the walk,
+    so a list churning underneath can never loop this forever.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    offset = 0
+    while True:
+        query = f"/api/sessions?period=all&limit={int(page_size)}&offset={offset}"
+        if archived:
+            query += f"&archived={urllib.parse.quote(archived)}"
+        got = api_get(query)
+        page = got if isinstance(got, list) else (got.get("sessions") if isinstance(got, dict) else None)
+        if not isinstance(page, list):
+            raise DaemonError("/api/sessions", None,
+                              f"unexpected response shape at offset {offset}: {str(got)[:200]!r}")
+        fresh = 0
+        for row in page:
+            key = str(row.get("session_id") or row.get("sessionId") or "") or json.dumps(row, sort_keys=True)[:200]
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+            fresh += 1
+        if len(page) < page_size or fresh == 0:
+            return rows
+        offset += len(page)
+
+
 def resolve_one(query: str) -> dict:
     """Resolve a query (title fragment or session id) to EXACTLY one chat, or refuse.
 
@@ -423,9 +466,11 @@ def _live_endpoint() -> dict | None:
 
 
 def _live_ids_via_walk() -> set[str]:
-    """Fallback for a daemon without /api/sessions/live: one dossier lookup per chat."""
+    """Fallback for a daemon without /api/sessions/live: one dossier lookup per chat. Walks
+    the whole census, not the seven-day window - a live chat can sit outside that window
+    (see sessions()), and an undercount here reads as room under the running cap."""
     ids: set[str] = set()
-    for row in sessions():
+    for row in sessions_all():
         if row.get("archived"):
             continue
         sid = row.get("session_id") or ""

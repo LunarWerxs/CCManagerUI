@@ -287,34 +287,25 @@ ARM_GUARD = (
     ")\n"
 )
 
-# A tick that finds the previous run still going must SAY SO and leave, never stack. mkdir is
-# the atomic primitive cmd actually has: it succeeds for exactly one caller.
-#
-# ⛔ THE LOCK IS TAKEN LAST, AFTER EVERY EARLY-EXIT GUARD. The first cut took it first, so the
-# daemon-down path exited while still holding it and the job would never run again - a lock
-# that outlives its holder is worse than no lock. And a crash can still strand one, so a
-# stale lock (older than STALE_LOCK_MIN) is cleared before the attempt.
-STALE_LOCK_MIN = 30
+# AH-16: a tick that finds the previous run still going must SAY SO and leave, never stack -
+# but "still going" must be PROVEN, not merely inferred from age. The lock used to be a bare
+# mkdir'd directory reclaimed once it was older than 30 minutes, with no check of who held it:
+# a second wrapper invocation could steal a legitimate long-running job's lock past that
+# window, and the ORIGINAL holder then unconditionally rmdir'd the lock on its own exit -
+# deleting its successor's lock too. The ownership/heartbeat/reclaim logic now lives in
+# lib/joblocklib.py (PID + process-creation-time ownership, reclaim only on proven death, only
+# the owning token may release) and runs from Python via run_locked.py, never as raw cmd/
+# PowerShell text in the wrapper - which also means the wrapper carries no `if ( ... )` block
+# for this any more, so it cannot fall into the "a ')' inside the block aborts the whole batch"
+# footgun documented on ARM_GUARD below.
+def work_path(job: str) -> Path:
+    """The plain, unguarded .cmd holding just a lock-carrying job's own command lines -
+    run_locked.py invokes this while it holds the job lock. A job with lock=False never gets
+    one; its lines are inlined straight into the main wrapper as before."""
+    return _state() / "jobs" / f"{job}.work.cmd"
 
 
-def _lock_guard(job: str) -> str:
-    lock = _state() / "locks" / job
-    return (
-        'powershell -NoProfile -WindowStyle Hidden -Command "'
-        f"$d = '{lock}'; if ((Test-Path $d) -and "
-        f"((Get-Item $d).LastWriteTime -lt (Get-Date).AddMinutes(-{STALE_LOCK_MIN}))) "
-        '{ Remove-Item $d -Recurse -Force }"\n'
-        f'mkdir "{lock}" 2>nul\n'
-        "if not %ERRORLEVEL%==0 (\n"
-        f"  echo [%DATE% %TIME%] SKIPPED - the previous {job} run is still going.\n"
-        "  exit /b 0\n"
-        ")\n"
-    )
-
-
-def _lock_release(job: str) -> str:
-    lock = _state() / "locks" / job
-    return f'rmdir "{lock}" 2>nul'
+RUN_LOCKED = SCRIPTS / "run_locked.py"
 
 
 def wrapper_path(job: str) -> Path:
@@ -366,28 +357,48 @@ def write_wrapper(job: str, spec: dict) -> Path:
         f'cd /d "{REPO}"',
         f'echo [%DATE% %TIME%] --- {job} ---',
     ]
-    # Order matters: every guard that can exit early runs BEFORE the lock is taken, so no
-    # early exit can strand it.
+    # Order matters: every guard that can exit early runs BEFORE the lock is (attempted to be)
+    # taken, so a daemon-down or disarmed tick never touches the lock at all.
     if spec["needs_daemon"]:
         body.append(DAEMON_GUARD.rstrip())
     if job not in UNGATED_JOBS:
         body.append(ARM_GUARD.replace("{python}", str(PYTHON)).replace("{repo}", str(REPO)).rstrip())
-    if spec.get("lock"):
-        body.append(_lock_guard(job).rstrip())
-    for line in spec["lines"]:
+    resolved = [
         # Plain replacement, never str.format: these lines carry PowerShell blocks whose
         # braces are syntax, and format() read `try { $r = ...` as a field name and died.
-        body.append(line.replace("{scripts}", str(SCRIPTS))
-                        .replace("{odin}", str(ODIN))
-                        .replace("{repo}", str(REPO))
-                        .replace("{pythonw}", str(PYTHONW))
-                        .replace("{python}", str(PYTHON)))
+        line.replace("{scripts}", str(SCRIPTS))
+            .replace("{odin}", str(ODIN))
+            .replace("{repo}", str(REPO))
+            .replace("{pythonw}", str(PYTHONW))
+            .replace("{python}", str(PYTHON))
+        for line in spec["lines"]
+    ]
     if spec.get("lock"):
-        # Released on EVERY exit path above too - the guards `exit /b 0` before taking it.
-        body.append(_lock_release(job))
+        # AH-16: the job's own lines run in a SEPARATE, unguarded .cmd that run_locked.py
+        # invokes while it holds the proof-of-death job lock (lib/joblocklib.py) - no lock
+        # mkdir/rmdir text lives in this wrapper at all any more.
+        write_work(job, resolved)
+        body.append(f'"{PYTHON}" "{RUN_LOCKED}" {job} "{work_path(job)}"')
+    else:
+        body.extend(resolved)
     # Everything the job prints lands in one readable log, newest run appended.
     script = "\n".join(body) + "\n"
     path.write_text(script, encoding="utf-8")
+    return path
+
+
+def write_work(job: str, resolved_lines: list[str]) -> Path:
+    """The plain .cmd holding one lock-carrying job's own command lines, no guards, no lock -
+    run_locked.py runs this via `cmd /c` while it holds the job lock and reports its exit
+    code back out. Kept in its own file (rather than inlined into a shell string) so the
+    existing quoting in spec['lines'] - long paths, embedded PowerShell blocks - needs no
+    second layer of escaping to cross a subprocess boundary."""
+    path = work_path(job)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = ["@echo off", f":: {PREFIX}{job} work - generated by scripts/schedule_jobs.py."]
+    body.extend(resolved_lines)
+    body.append("exit /b %ERRORLEVEL%")
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
     return path
 
 

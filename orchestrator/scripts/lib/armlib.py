@@ -40,6 +40,31 @@ ARM_CMD = "python orch.py arm"
 HEARTBEAT_SECS = 15
 STALE_SECS = 60
 
+# THE CANONICAL DIRECT-VS-UNATTENDED SET (AH-25). Before this, "which scripts actually ask
+# the tray icon" lived nowhere as a fact you could name - it was whatever each script's own
+# source happened to do (call refuse_unless_armed, or don't). These are the ones that DO: the
+# scheduled lane goes through the gate on every tick, and a person's own --force is the
+# documented bypass for one run by hand (this module's own docstring, "the switch bounds the
+# UNATTENDED path"). Everything else - migrate_chat.py's documented exception among them -
+# never imports this module at all, and is therefore "direct" by the same fact, not by a
+# second list. lib/actionlib.CATALOG's `invocation` field is DERIVED from this set at import
+# time (see actionlib.py's own tail), so the catalog cannot silently drift from what the code
+# actually does - grep this file for `refuse_unless_armed(argv` if you ever need to re-verify
+# it by hand instead of trusting the set.
+GATED_SCRIPTS = frozenset({
+    "audit_twins", "automation_chat", "chips", "cli_saturate", "courier",
+    "groundskeeper", "harvest_todos", "overlord", "reconcile", "saturate",
+    "sweep", "unblock_prompts",
+})
+
+
+def requires_arm_check(script_name: str) -> bool:
+    """Whether `script_name` is expected to consult refuse_unless_armed - i.e. it is reached
+    from the unattended scheduled lane, not only from a person's direct word. A predicate
+    function rather than a bare set lookup so a caller never has to know GATED_SCRIPTS is a
+    frozenset versus some other container - this is the one thing to call."""
+    return script_name in GATED_SCRIPTS
+
 
 def heartbeat_path() -> Path:
     return ledgerlib._state_dir() / "tray.json"
@@ -193,3 +218,28 @@ def refuse_unless_armed(argv: list[str], what: str) -> str | None:
     return (f"DISARMED - {what}: planned only, nothing acted ({st['why']}). The unattended "
             f"machinery acts only while the tray icon is up: `{ARM_CMD}` (or --force for "
             "this one run by hand).")
+
+
+def refuse_unless_armed_for(script_name: str, argv: list[str], what: str) -> str | None:
+    """The catalog-consulting form of refuse_unless_armed (AH-25): looks up whether
+    `script_name` even needs to ask, via lib/actionlib.CATALOG's `invocation` field, instead
+    of a caller having to know a second, hand-maintained list of exempt scripts. A script
+    whose entry is invocation="direct" (migrate_chat.py's documented exception, and everyone
+    else GATED_SCRIPTS above does not name) is waved through with no check at all - exactly
+    what already happens today when such a script's own source contains no call to
+    refuse_unless_armed. Anything else (invocation "both" or "unattended") is asked exactly
+    as refuse_unless_armed already asks.
+
+    This is new, additional plumbing, not a replacement for the dozen existing call sites:
+    the scripts in GATED_SCRIPTS keep calling refuse_unless_armed directly, unchanged, so
+    today's behaviour is untouched. This entry point exists for a caller that only knows a
+    script BY NAME (orch.py's dispatch, a future daemon route reading --catalog) and wants
+    one answer without importing actionlib itself."""
+    from lib import actionlib  # local: actionlib imports armlib at module scope (to derive
+                                # CATALOG's own invocation field), so importing it back at
+                                # armlib's own module scope would be a cycle at load time.
+
+    row = actionlib.CATALOG.get(script_name)
+    if row is not None and row["invocation"] == "direct":
+        return None
+    return refuse_unless_armed(argv, what)

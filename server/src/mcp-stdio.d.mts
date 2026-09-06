@@ -8,8 +8,11 @@ export interface McpEngineTool {
   description: string;
   /** JSON Schema object advertised for this tool's arguments. */
   inputSchema: unknown;
-  /** Validate `args`, perform the action, and return a JSON-serialisable value (or throw). */
-  run(args: Record<string, unknown>): Promise<unknown> | unknown;
+  /** Validate `args`, perform the action, and return a JSON-serialisable value (or throw).
+   *  `signal` (present when running under `runMcpStdio`) fires if the client sends a
+   *  `notifications/cancelled` for this call; a tool that ignores the parameter is unaffected —
+   *  it simply isn't cancellable, and the engine reports that rather than pretending. */
+  run(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> | unknown;
 }
 
 /** What every dispatch/loop call needs: the server identity + the live tool set. */
@@ -25,11 +28,24 @@ export interface McpServerContext {
 /** A JSON-RPC -32700 parse-error response (id null) for a transport to emit on malformed input. */
 export function parseErrorResponse(): object;
 
-/** Dispatch one parsed JSON-RPC message; returns the response object, or null for a notification. */
-export function handleRpc(msg: unknown, ctx: McpServerContext): Promise<object | null>;
+/** Dispatch one parsed JSON-RPC message; returns the response object, or null for a notification.
+ *  `signal` is threaded through to a `tools/call`'s `tool.run`; every other method ignores it. */
+export function handleRpc(msg: unknown, ctx: McpServerContext, signal?: AbortSignal): Promise<object | null>;
 
 /** Process one raw stdin line; returns the JSON string to write, or null for a notification/blank. */
-export function processLine(line: string, ctx: McpServerContext): Promise<string | null>;
+export function processLine(line: string, ctx: McpServerContext, signal?: AbortSignal): Promise<string | null>;
 
-/** Run the newline-delimited JSON-RPC stdio server loop until stdin closes. */
-export function runMcpStdio(ctx: McpServerContext): Promise<void>;
+/** Options for `runMcpStdio`. */
+export interface RunMcpStdioOptions {
+  /** Max requests dispatched concurrently; further requests queue FIFO for a free slot. Default 8. */
+  maxInFlight?: number;
+  /** Override the input stream (defaults to `process.stdin`); mainly for tests. */
+  input?: NodeJS.ReadableStream;
+  /** Override the output stream (defaults to `process.stdout`); mainly for tests. */
+  output?: NodeJS.WritableStream;
+}
+
+/** Run the newline-delimited JSON-RPC stdio server loop until stdin closes. Requests are
+ *  dispatched concurrently up to `opts.maxInFlight`; see the .mjs file header for the full
+ *  concurrency/cancellation semantics. */
+export function runMcpStdio(ctx: McpServerContext, opts?: RunMcpStdioOptions): Promise<void>;

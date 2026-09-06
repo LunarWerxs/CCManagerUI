@@ -67,6 +67,167 @@ const DRIVER_WORDS = new Set(['loop', 'arm', 'resume', 'pause', 'disarm', 'armed
  *  overlap (a window, a lane's lockfile); this is the daemon-side backstop so two callers cannot
  *  start the same acting pass twice through this route. Different scripts may overlap. */
 const inFlight = new Map<string, number>()
+
+/** Is any toolbox script running through this daemon right now? The compiled updater asks
+ *  before it replaces orchestrator/ (audit AH-08). */
+export function orchestratorBusy(): boolean {
+  return inFlight.size > 0
+}
+
+// ── durable operations (audit AH-09) ────────────────────────────────────────────────────────
+//
+// A script may run for 10, 30 or 60 minutes, and the HTTP route used to hold its result hostage
+// to one connection whose idle timeout is 255 s. Reproduced end to end: ECONNRESET at 256 s, a
+// retry answered "busy", and the original command finished at 270 s with nobody to tell. A client
+// therefore read "network failure" for an act that was still running, and a blind retry could
+// either hit busy or, later, repeat an act that had already completed.
+//
+// The registry below makes a run an OPERATION with an id and a lifetime beyond the connection:
+//   * a caller may pass an idempotency key - a second request with the same key, while the
+//     first is running or within OPERATION_TTL_MS of finishing, returns THE SAME operation and
+//     starts nothing (so a retry after a dropped connection gets the original outcome);
+//   * a caller may ask for the id up front (`async`) and poll it;
+//   * a running operation can be cancelled, which kills the child's whole tree; the outcome then
+//     says cancelled rather than failed.
+// Results are kept in memory, bounded (OPERATION_KEEP) and expiring (OPERATION_TTL_MS): this is
+// reconciliation for a dropped connection and a restart-free daemon, not an audit log - the
+// toolbox's own ledgers are the durable record of what an act did.
+
+export type OrchestratorOutcome = OrchestratorRun | { ok: false; error: string; busy?: boolean }
+
+export interface OrchestratorOperation {
+  id: string
+  script: string
+  args: string[]
+  idempotencyKey: string | null
+  startedAt: number
+  finishedAt: number | null
+  status: 'running' | 'done' | 'failed' | 'cancelled'
+  /** Null while running. */
+  result: OrchestratorOutcome | null
+  /** True once the child process actually started. A refusal before that (bad request, busy)
+   *  is a result too, but not one an idempotency key should pin: the caller may retry. */
+  ran: boolean
+}
+
+interface OperationEntry {
+  op: OrchestratorOperation
+  promise: Promise<OrchestratorOperation>
+  kill: (() => void) | null
+  cancelRequested: boolean
+}
+
+const OPERATION_TTL_MS = 60 * 60_000
+const OPERATION_KEEP = 200
+const operations = new Map<string, OperationEntry>()
+
+function pruneOperations(now = Date.now()): void {
+  const finished = [...operations.values()].filter((e) => e.op.finishedAt !== null)
+  for (const e of finished) {
+    if (now - (e.op.finishedAt ?? now) > OPERATION_TTL_MS) operations.delete(e.op.id)
+  }
+  const stillFinished = [...operations.values()]
+    .filter((e) => e.op.finishedAt !== null)
+    .sort((a, b) => (a.op.finishedAt ?? 0) - (b.op.finishedAt ?? 0))
+  while (stillFinished.length > OPERATION_KEEP) {
+    const oldest = stillFinished.shift()
+    if (oldest) operations.delete(oldest.op.id)
+  }
+}
+
+function snapshot(op: OrchestratorOperation): OrchestratorOperation {
+  return { ...op, args: [...op.args] }
+}
+
+/**
+ * Start a run as an operation - or, with an idempotency key that names one already running or
+ * recently finished (and which actually ran), return that one and start nothing.
+ */
+export function startOrchestratorOperation(
+  input: { script?: unknown; args?: unknown; timeoutMs?: unknown },
+  opts: {
+    idempotencyKey?: string | null
+    deps?: SpawnDeps & { dir?: string; python?: string }
+  } = {},
+): { op: OrchestratorOperation; promise: Promise<OrchestratorOperation>; reused: boolean } {
+  pruneOperations()
+  const key = opts.idempotencyKey?.trim() || null
+  if (key) {
+    for (const e of operations.values()) {
+      if (e.op.idempotencyKey === key && (e.op.status === 'running' || e.op.ran))
+        return { op: snapshot(e.op), promise: e.promise, reused: true }
+    }
+  }
+  const check = validateInvocation(input)
+  const op: OrchestratorOperation = {
+    id: crypto.randomUUID(),
+    script: check.ok ? check.invocation.script : String(input.script ?? ''),
+    args: check.ok ? check.invocation.args : [],
+    idempotencyKey: key,
+    startedAt: Date.now(),
+    finishedAt: null,
+    status: 'running',
+    result: null,
+    ran: false,
+  }
+  const entry: OperationEntry = {
+    op,
+    promise: Promise.resolve(op),
+    kill: null,
+    cancelRequested: false,
+  }
+  const deps = opts.deps ?? {}
+  entry.promise = runOrchestrator(input, {
+    ...deps,
+    onProcess: (kill) => {
+      op.ran = true
+      entry.kill = kill
+      deps.onProcess?.(kill)
+      // A cancel that arrived before the child existed lands the moment it does.
+      if (entry.cancelRequested) kill()
+    },
+  }).then((result) => {
+    // An injected spawn never reports a process; if the run went far enough to have a script
+    // record, it ran as far as this registry is concerned.
+    if ('script' in result) op.ran = true
+    op.result = result
+    op.finishedAt = Date.now()
+    op.status = entry.cancelRequested ? 'cancelled' : result.ok ? 'done' : 'failed'
+    return snapshot(op)
+  })
+  operations.set(op.id, entry)
+  return { op: snapshot(op), promise: entry.promise, reused: false }
+}
+
+export function getOrchestratorOperation(id: string): OrchestratorOperation | null {
+  const e = operations.get(id)
+  return e ? snapshot(e.op) : null
+}
+
+export function listOrchestratorOperations(): OrchestratorOperation[] {
+  pruneOperations()
+  return [...operations.values()]
+    .map((e) => snapshot(e.op))
+    .sort((a, b) => b.startedAt - a.startedAt)
+}
+
+/** Ask a running operation to stop. Its whole process tree is killed; the outcome then reads
+ *  `cancelled`. A finished operation is left as it is. */
+export function cancelOrchestratorOperation(
+  id: string,
+): { ok: true; status: OrchestratorOperation['status'] } | { ok: false; error: string } {
+  const e = operations.get(id)
+  if (!e) return { ok: false, error: 'no such operation' }
+  if (e.op.status !== 'running') return { ok: true, status: e.op.status }
+  e.cancelRequested = true
+  e.kill?.()
+  return { ok: true, status: 'running' }
+}
+
+/** Tests only: forget every operation (the registry is module state). */
+export function resetOrchestratorOperationsForTests(): void {
+  operations.clear()
+}
 /** Output kept per stream. The dry loop over a full fleet is a few thousand lines; a runaway is
  *  truncated from the FRONT so the verdict lines at the end survive. */
 export const MAX_OUTPUT_CHARS = 200_000
@@ -200,11 +361,20 @@ function tail(raw: string, alreadyDropped = 0): string {
 
 /** One spawn, captured, with a deadline. Exposed for tests through `deps`; the real thing is
  *  Bun.spawn with windowsHide (python is a console program - see scripts/checks/spawn-console-window.mjs). */
+/** What a spawn adapter can hand back while the child runs. `onProcess` receives a kill switch
+ *  the moment the child exists, so a caller (the durable-operation registry) can cancel it. */
+export interface SpawnHooks {
+  onProcess?: (kill: () => void) => void
+}
+
 export interface SpawnDeps {
+  /** Forwarded to the spawn adapter; see SpawnHooks. */
+  onProcess?: SpawnHooks['onProcess']
   spawn?: (
     command: string[],
     cwd: string,
     timeoutMs: number,
+    hooks?: SpawnHooks,
   ) => Promise<{
     code: number | null
     stdout: string
@@ -369,7 +539,7 @@ export function orchestratorChildEnv(
   return env
 }
 
-async function realSpawn(command: string[], cwd: string, timeoutMs: number) {
+async function realSpawn(command: string[], cwd: string, timeoutMs: number, hooks?: SpawnHooks) {
   const proc = Bun.spawn(command, {
     cwd,
     stdout: 'pipe',
@@ -378,6 +548,7 @@ async function realSpawn(command: string[], cwd: string, timeoutMs: number) {
     windowsHide: true,
     env: orchestratorChildEnv(),
   })
+  hooks?.onProcess?.(() => killTree(proc))
   let timedOut = false
   const killer = setTimeout(() => {
     timedOut = true
@@ -437,7 +608,7 @@ export async function runOrchestrator(
   const started = Date.now()
   inFlight.set(script, started)
   try {
-    const r = await spawn(command, dir, timeoutMs)
+    const r = await spawn(command, dir, timeoutMs, { onProcess: deps.onProcess })
     return {
       ok: r.code === 0 && !r.timedOut,
       script,

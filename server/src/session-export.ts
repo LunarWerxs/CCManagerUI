@@ -265,10 +265,13 @@ export async function exportSession(
   sessionId: string,
   format: ExportFormat,
   source?: SessionSource,
-  meta: { title?: string; cwd?: string; thinking?: boolean } = {},
+  // `locator` lives on meta rather than as its own positional parameter so an existing caller
+  // passing a meta object stays valid unchanged (audit AH-35: without it, a source+id pointing at
+  // two products sharing a format — Kilo/MiMo Code, both `opencode` — could export the wrong one).
+  meta: { title?: string; cwd?: string; thinking?: boolean; locator?: string } = {},
   deps: { findTranscript?: typeof findTranscriptAsync; maxBytes?: number } = {},
 ): Promise<SessionExport | ExportRefused | null> {
-  const tf = await (deps.findTranscript ?? findTranscriptAsync)(sessionId, source)
+  const tf = await (deps.findTranscript ?? findTranscriptAsync)(sessionId, source, meta.locator)
   if (!tf) return null
 
   // The ceiling, checked BEFORE a byte of the transcript is parsed (see the file header). The
@@ -336,8 +339,9 @@ const MAX_FINDINGS = 200
 export async function scanSessionSecrets(
   sessionId: string,
   source?: SessionSource,
+  locator?: string,
 ): Promise<SessionSecretScan | null> {
-  const tf = await findTranscriptAsync(sessionId, source)
+  const tf = await findTranscriptAsync(sessionId, source, locator)
   if (!tf) return null
   const events = await readAllEvents(tf.path, tf.source, sessionId)
   const findings: SessionSecretScan['findings'] = []

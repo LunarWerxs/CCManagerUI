@@ -12,7 +12,9 @@ Run: python scripts/tests/test_chatwatch.py
 It is also on the suite's gate: `ChatwatchTest` below runs main() under unittest. Until
 2026-09-05 this file had no TestCase at all, so `python -m unittest discover` collected NOTHING
 from it and every check here was invisible to the gate - a guard that never fired, inside the
-file written to catch guards that never fire.
+file written to catch guards that never fire. `tests/test_collection_guard.py` (audit AH-42)
+now fails the suite on any tracked `test_*.py` that collects as zero cases, so a test module
+cannot go quiet like this again.
 """
 
 from __future__ import annotations

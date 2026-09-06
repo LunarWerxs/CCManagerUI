@@ -32,6 +32,7 @@ const REQUIRED_SESSION_FIELDS = [
   'session_id',
   'source',
   'tool',
+  'locator',
   'title',
   'cwd',
   'project',

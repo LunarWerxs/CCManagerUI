@@ -17,6 +17,7 @@ Two jobs:
      thing as `sweep.py --all --yes`, spelled out; there is no third behaviour hiding here.
 
 Usage: python orch.py                       # the menu
+       python orch.py --catalog             # lib/actionlib.CATALOG as JSON (AH-25)
        python orch.py <script> [args...]    # run one script (its own --help still works)
        python orch.py loop [--json]         # DRY: the whole loop, acting on nothing
        python orch.py loop --live           # the acting version (same as sweep --all --yes)
@@ -77,28 +78,36 @@ def _find_running_tray(repo: Path) -> "int | None":
 
 
 def _catalog() -> list[dict]:
-    """Every runnable script with its headline, from its own docstring."""
-    out = []
-    for path in sorted(SCRIPTS.glob("*.py")):
-        try:
-            doc = ast.get_docstring(ast.parse(path.read_text(encoding="utf-8"))) or ""
-        except (OSError, SyntaxError):
-            continue
-        head = doc.splitlines()[0] if doc else ""
-        summary = head.split(" - ", 1)[1] if " - " in head else head
-        low = summary.lower()
-        kind = ("act" if low.startswith("act") or "act (" in low[:24]
-                else "observe" if low.startswith("observe") else "other")
-        out.append({"name": path.stem, "kind": kind, "summary": summary})
-    order = {"observe": 0, "act": 1, "other": 2}
+    """Every runnable script with its headline, from lib/actionlib.CATALOG (AH-25) - not from
+    parsing each docstring's first line any more. The old parser sorted by whether a
+    docstring's SUMMARY happened to start with the exact word "act" or "observe", which
+    quietly dropped migrate_batch.py, interview.py, run_locked.py and smoke.py into a leftover
+    "other" bucket (smoke.py is a READ-ONLY smoke test and still landed there) because their
+    first line was not phrased the way the parser wanted. actionlib.CATALOG is the curated
+    fix: one entry per script, kind decided once by a human reading the whole docstring, not
+    re-guessed from a prefix on every menu render."""
+    from lib import actionlib
+
+    order = {"observe": 0, "mutate": 1}
+    out = [{"name": name, "kind": row["kind"], "summary": row["summary"]}
+           for name, row in actionlib.CATALOG.items()]
     out.sort(key=lambda r: (order[r["kind"]], r["name"]))
     return out
 
 
+def _scripts_on_disk() -> set[str]:
+    """Every *.py file directly under scripts/, independent of the catalog. Dispatch validity
+    (`main`'s "unknown script" check, and `_script_doc`) uses THIS, not `_catalog()`, so a
+    brand-new script is runnable the moment it lands, even before someone adds its
+    lib/actionlib.CATALOG entry - tests/test_actionlib.py is what catches a script missing
+    from the catalog, not a refusal to run it."""
+    return {p.stem for p in SCRIPTS.glob("*.py")}
+
+
 def _script_doc(name: str) -> str | None:
     """A runnable script's docstring, read from its source without importing or running it.
-    None for anything that is not a script on the menu (the switch words, a typo)."""
-    if name not in {r["name"] for r in _catalog()}:
+    None for anything that is not a script on disk (the switch words, a typo)."""
+    if name not in _scripts_on_disk():
         return None
     try:
         return ast.get_docstring(ast.parse((SCRIPTS / f"{name}.py").read_text(encoding="utf-8")))
@@ -106,13 +115,23 @@ def _script_doc(name: str) -> str | None:
         return None
 
 
+def show_catalog_json() -> int:
+    """`orch.py --catalog`: lib/actionlib.CATALOG as JSON, so a daemon or MCP tool can read
+    the action catalog directly instead of parsing the printed menu's prose (AH-25 - mcp.ts's
+    orchestrator_menu tool currently reads the TEXT menu; it can move to this once ready, see
+    the audit's own report)."""
+    from lib import actionlib
+
+    print(json.dumps(actionlib.CATALOG, indent=2, default=str))
+    return 0
+
+
 def show_menu() -> int:
     rows = _catalog()
     print("orchestrator - one entry point. `orch.py <script> --help` for any of them.\n")
     labels = {"observe": "OBSERVE  (reads only, touches nothing)",
-              "act": "ACT      (changes something, behind the rails)",
-              "other": "OTHER"}
-    for kind in ("observe", "act", "other"):
+              "mutate": "ACT      (changes something, behind the rails)"}
+    for kind in ("observe", "mutate"):
         group = [r for r in rows if r["kind"] == kind]
         if not group:
             continue
@@ -329,9 +348,11 @@ def render_loop(s: dict) -> str:
 
 
 def _maybe_top_help(argv: list[str]) -> int | None:
-    """Bare invocation, or `--help`/`-h` with no subcommand yet: the menu vs the full
-    manual. Returns an exit code when that is all there is to do, or None so `main` keeps
-    going to parse a subcommand."""
+    """Bare invocation, `--help`/`-h`, or `--catalog` with no subcommand yet: the menu vs the
+    full manual vs the machine-readable catalog. Returns an exit code when that is all there
+    is to do, or None so `main` keeps going to parse a subcommand."""
+    if argv and argv[0] == "--catalog":
+        return show_catalog_json()
     if not argv or argv[0] in ("--help", "-h"):
         if argv and argv[0] in ("--help", "-h"):
             print(__doc__.strip())
@@ -547,7 +568,7 @@ def main(argv: list[str]) -> int:
     if name == "loop":
         return _cmd_loop(rest)
 
-    known = {r["name"] for r in _catalog()}
+    known = _scripts_on_disk()
     if name not in known:
         print(f"unknown script {name!r}. Run `python orch.py` for the menu.", file=sys.stderr)
         return 3

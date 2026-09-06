@@ -14,7 +14,7 @@ export function useResumeInTerminal() {
   async function resumeInTerminal(s: SessionSummary) {
     resuming.value = true
     try {
-      const r = await api.resumeSessionInTerminal(s.session_id, s.source)
+      const r = await api.resumeSessionInTerminal(s.session_id, s.source, s.locator)
       if (r.ok) {
         toast.success(t('sessions.resumeOpened'))
         return

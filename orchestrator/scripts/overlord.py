@@ -526,7 +526,15 @@ def settle_twins(twins: list[dict]) -> str:
     """Flag superseded twin rows archived ON DISK. Honest about the limit: the app's own
     control cannot disambiguate two rendered rows sharing one title, and a RUNNING app can
     re-save this flag away - durability belongs to the daemon's reassert machinery; this
-    keeps the board as clean as a watchdog can."""
+    keeps the board as clean as a watchdog can.
+
+    ON THE SAME LEDGER THE JANITOR READS (closes the gap reconcile.py's docstring left open):
+    this writes the disk flag directly, bypassing archive_chat.py entirely, so without a
+    ledger row reconcile.py's revert-detector never learns the attempt happened - a later
+    re-save erasing the flag would surface only through the FULL archive-candidate pipeline
+    (preserve turn included), one extra closeout turn a janitor-caused revert never pays.
+    One `ledgerlib.note("archive", ...)` per settled twin puts it on reconcile's radar, so a
+    revert here converges the same way - archive_chat's --no-preserve retry, no extra turn."""
     if not twins:
         return ""
     done = 0
@@ -539,6 +547,9 @@ def settle_twins(twins: list[dict]) -> str:
             meta["isArchived"] = True
             Path(mp).write_text(json.dumps(meta), encoding="utf-8")
             done += 1
+            sid = t.get("cliSessionId")
+            if sid:
+                ledgerlib.note("archive", str(sid), note="handoff: zombie twin settled archived")
         except (OSError, ValueError):
             pass
     return (f" ⚠ {len(twins)} zombie twin(s) of the overlord were visible; {done} flagged "

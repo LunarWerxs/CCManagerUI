@@ -29,6 +29,7 @@ import { useData } from '@/composables/useData'
 import { useInstances } from '@/composables/useInstances'
 import * as api from '@/lib/api'
 import { EFFORTS, MODELS, PERMISSION_MODES } from '@/lib/format'
+import { HEADLESS_QUEUEING_ENABLED } from '@/lib/headless'
 import { displayName } from '@/lib/instance-appearance'
 import ExpandTransition from '@/shell/ExpandTransition.vue'
 import InfoHint from '@/shell/InfoHint.vue'
@@ -65,6 +66,12 @@ const advancedOpen = ref(false)
 const editing = computed(() => !!editItem.value)
 // Multi-select resume is a create-only convenience: editing acts on one existing item.
 const multiSession = computed(() => !editing.value && !form.new_chat)
+// AH-12: creating a NEW queue item always 409s (headless-policy.ts), whether it would resume an
+// existing session or mint a fresh one — dispatch never gets far enough to care which. Editing an
+// existing item is a plain PATCH (title/cwd/prompt/etc.) and stays real: it just can never be
+// followed by a run. So the create form only renders while editing; a fresh "New run" open shows
+// why instead.
+const showCreateForm = computed(() => editing.value || HEADLESS_QUEUEING_ENABLED)
 
 // Queue dispatch is intentionally Claude-only even though the Sessions tab can now browse other
 // providers. Keep a dedicated source-scoped list so changing the Sessions provider filter cannot
@@ -331,10 +338,20 @@ async function submit() {
       </DialogHeader>
 
       <div class="space-y-4">
+        <!-- AH-12: AgentHydra never runs a chat nobody can see (headless-policy.ts) — creating a
+             NEW queue item 409s unconditionally, whatever it would resume or start. Editing an
+             existing item is a plain PATCH and still works (it just can never be followed by a
+             run), so the create form below only renders while editing an existing row. -->
+        <div v-if="!showCreateForm" class="flex flex-col items-center gap-2 py-6 text-center">
+          <CalendarClock class="size-8 text-muted-foreground opacity-40" />
+          <p class="text-sm font-medium">{{ $t('builder.createUnavailableTitle') }}</p>
+          <p class="max-w-sm text-xs text-muted-foreground">{{ $t('builder.createUnavailableBody') }}</p>
+        </div>
+
         <!-- mode toggle: create-only. Editing an existing item never converts it to/from
              a from-scratch run, so the switch is hidden there (owner request). -->
         <div
-          v-if="!editing"
+          v-if="showCreateForm && !editing"
           class="flex items-center gap-3 rounded-lg border border-border bg-muted/30 px-3 py-2.5"
         >
           <Sparkles class="size-4 text-primary" />
@@ -346,7 +363,7 @@ async function submit() {
         </div>
 
         <!-- resume: searchable session picker (multi in create, single in edit) -->
-        <div v-if="!form.new_chat" class="space-y-1.5">
+        <div v-if="showCreateForm && !form.new_chat" class="space-y-1.5">
           <label class="text-xs font-medium text-muted-foreground">{{ $t('builder.sessionToResumeLabel') }}</label>
           <SessionPicker
             v-model="form.session_ids"
@@ -356,7 +373,7 @@ async function submit() {
         </div>
 
         <!-- new chat: title + cwd are the core inputs -->
-        <div v-if="form.new_chat" class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div v-if="showCreateForm && form.new_chat" class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-muted-foreground">{{ $t('builder.titleLabel') }}</label>
             <Input v-model="form.title" :placeholder="$t('builder.titlePlaceholder')" />
@@ -367,7 +384,7 @@ async function submit() {
           </div>
         </div>
 
-        <div class="space-y-1.5">
+        <div v-if="showCreateForm" class="space-y-1.5">
           <label class="text-xs font-medium text-muted-foreground">{{ $t('builder.promptLabel') }}</label>
           <Textarea v-model="form.prompt" class="max-h-56 min-h-24" :placeholder="$t('builder.promptPlaceholder')" />
         </div>
@@ -375,7 +392,7 @@ async function submit() {
         <!-- Account stays in the core view (not Advanced): it's the "which login this run uses"
              choice and people want it up front. "Ambient" = whatever the CLI is already signed
              into; specific accounts are the instances signed in via the Instances tab. -->
-        <div class="space-y-1.5">
+        <div v-if="showCreateForm" class="space-y-1.5">
           <label class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
             {{ $t('builder.accountLabel') }}
             <InfoHint :text="$t('builder.accountHint')" />
@@ -399,7 +416,7 @@ async function submit() {
 
              Promoted out of Advanced for the same stated reason Account sits out here: WHEN a run
              happens is a decision people make up front, not a tuning knob you go looking for. -->
-        <div class="space-y-1.5">
+        <div v-if="showCreateForm" class="space-y-1.5">
           <label class="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
             {{ $t('builder.runAtLabel') }}
             <InfoHint :text="$t('builder.runAtHint')" />
@@ -438,6 +455,7 @@ async function submit() {
 
         <!-- everything else is advanced: hidden by default so the common path stays short -->
         <button
+          v-if="showCreateForm"
           type="button"
           class="flex w-full items-center justify-between rounded-md px-1 py-1 text-xs font-medium text-muted-foreground hover:text-foreground"
           @click="advancedOpen = !advancedOpen"
@@ -445,7 +463,7 @@ async function submit() {
           {{ $t('builder.advancedOptions') }}
           <ChevronDown class="size-4 transition-transform duration-200" :class="advancedOpen ? 'rotate-180' : ''" />
         </button>
-        <ExpandTransition :open="advancedOpen">
+        <ExpandTransition :open="showCreateForm && advancedOpen">
           <div class="space-y-4 pt-1">
             <!-- resume: optional title/cwd overrides (single select only) -->
             <div v-if="!form.new_chat && form.session_ids.length === 1" class="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -500,12 +518,14 @@ async function submit() {
           </div>
         </ExpandTransition>
 
-        <p v-if="error" class="text-xs text-destructive">{{ error }}</p>
+        <p v-if="showCreateForm && error" class="text-xs text-destructive">{{ error }}</p>
       </div>
 
       <DialogFooter>
-        <Button variant="ghost" @click="open = false">{{ $t('builder.cancel') }}</Button>
-        <Button :disabled="!canSubmit || submitting" @click="submit">
+        <Button variant="ghost" @click="open = false">
+          {{ showCreateForm ? $t('builder.cancel') : $t('builder.close') }}
+        </Button>
+        <Button v-if="showCreateForm" :disabled="!canSubmit || submitting" @click="submit">
           <Pencil v-if="editing" /><Plus v-else />
           {{ editing ? $t('builder.saveChanges') : $t('builder.addToQueue') }}
         </Button>

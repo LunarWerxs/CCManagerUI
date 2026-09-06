@@ -193,20 +193,24 @@ def mutate_meta(meta_path: str | Path, apply, *, _between=None) -> dict:
         with ledgerlib.locked(f"meta-{p.stem}"):
             for _attempt in range(META_WRITE_ATTEMPTS):
                 try:
-                    st = p.stat()
+                    # The revision is THE BYTES, not (mtime, size). A same-size rewrite that lands
+                    # inside one filesystem timestamp tick is invisible to a stat-based check -
+                    # the flaky test that proved it wrote "edit 1" over "edit 2" within the tick
+                    # and the stale copy went straight through. Two small reads cost nothing; a
+                    # write landing between them only makes the comparison stricter.
+                    revision = p.read_bytes()
                     meta = read_meta(p)
                 except (OSError, ValueError) as err:
                     return {"changed": False, "meta": None, "error": str(err)}
-                revision = (st.st_mtime_ns, st.st_size)
                 if not apply(meta):
                     return {"changed": False, "meta": meta, "error": None}
                 if _between is not None:
                     _between()
                 try:
-                    now = p.stat()
+                    now = p.read_bytes()
                 except OSError as err:
                     return {"changed": False, "meta": None, "error": str(err)}
-                if (now.st_mtime_ns, now.st_size) != revision:
+                if now != revision:
                     continue  # someone wrote underneath us: re-read, re-apply, never clobber
                 try:
                     tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")

@@ -451,6 +451,10 @@ chat list in memory and can re-save the flag away - claiming that as success is 
 ```sh
 python scripts/smoke.py       # read-only, safe any time: proves the observe chain end to end
 python -m unittest discover -s scripts/tests    # the unit suite (stub daemon, no fleet needed)
+#   ^ THE runner, here and in CI: stdlib unittest, no third-party test dependency, on purpose. A
+#     pytest-style module (bare test_ functions, pytest fixtures) is imported by it and then runs
+#     NOTHING - a green import of zero cases. tests/test_collection_guard.py fails the suite on
+#     any committed test module that yields no unittest cases, and names it; write TestCase classes.
 python scripts/census.py      # what the fleet looks like right now
 python scripts/waiting_scan.py  # who is waiting on a person, over full transcript tails
 ```
