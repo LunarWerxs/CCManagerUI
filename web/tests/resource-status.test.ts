@@ -34,7 +34,17 @@ function errorResponse(message: string, status = 500): Response {
   return jsonResponse({ error: message }, status)
 }
 
-const { sessions, sessionsStatus, queue, queueStatus, refreshSessions, refreshQueue } = useData()
+const {
+  sessions,
+  sessionsStatus,
+  queue,
+  queueStatus,
+  incidents,
+  incidentsStatus,
+  refreshSessions,
+  refreshQueue,
+  refreshIncidents,
+} = useData()
 
 describe('per-resource poll status (AH-20)', () => {
   beforeEach(() => {
@@ -44,6 +54,9 @@ describe('per-resource poll status (AH-20)', () => {
     queue.value = []
     queueStatus.error.value = null
     queueStatus.lastSuccessAt.value = null
+    incidents.value = []
+    incidentsStatus.error.value = null
+    incidentsStatus.lastSuccessAt.value = null
   })
 
   test('a first-load queue failure is "unavailable" — the queue stays empty, not silently so', async () => {
@@ -80,6 +93,24 @@ describe('per-resource poll status (AH-20)', () => {
     expect(queue.value.map((q) => (q as { id: string }).id)).toEqual(['a'])
     expect(queueStatus.stale.value).toBe(true)
     expect(queueStatus.unavailable.value).toBe(false)
+  })
+
+  test('a first-load incidents failure is "unavailable" — IncidentsPanel must not read this as zero incidents', async () => {
+    const originalFetch = globalThis.fetch
+    try {
+      setFetch(async () => errorResponse('daemon unreachable'))
+      await refreshIncidents()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    // IncidentsPanel gates its empty state on `incidents.length > 0` alone reverting to a lie:
+    // a failed-but-empty fetch would render identically to "there are genuinely no incidents".
+    // unavailable is the signal the panel needs to show the Retry state instead.
+    expect(incidents.value).toEqual([])
+    expect(incidentsStatus.unavailable.value).toBe(true)
+    expect(incidentsStatus.stale.value).toBe(false)
+    expect(incidentsStatus.error.value).toBe('daemon unreachable')
   })
 
   test('a queue error does not contaminate the sessions status, or vice versa', async () => {

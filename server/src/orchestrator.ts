@@ -17,9 +17,10 @@
  * the process as an argv array, never through a shell, so there is nothing to inject.
  */
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { APP_ROOT } from './config'
+import { killProcessTree } from './core/process'
 import { readInstanceInfo } from './instance'
 
 /** Where the toolbox lives. `AGENTHYDRA_ORCHESTRATOR_DIR` overrides for a layout where the Python
@@ -445,124 +446,25 @@ export async function drainBounded(
   return { text, dropped }
 }
 
-/** Hard cap on how deep the Unix descendant walk goes. An actuator chain is python -> shell ->
- *  tool, three or four levels; twelve bounds a pathological fork tree without ever mattering. */
-const UNIX_TREE_MAX_DEPTH = 12
-
-/**
- * Every descendant of `pid` on a Unix host, DEEPEST FIRST, read from `pgrep -P` one level at a
- * time (pgrep ships with procps on Linux and with macOS). Exported for the test; returns [] when
- * pgrep is missing or the process has no children.
- *
- * WHY THIS EXISTS (audit AH-15): on Windows the deadline kill is `taskkill /T`, the whole tree; on
- * Linux/macOS it was `proc.kill()` - the interpreter alone. The interpreter's own child (the
- * actuator it was blocking on, a `subprocess.run` in migrate_chat / chips / courier) kept running
- * unsupervised, still holding the stdout/stderr pipes, so the adapter's drain could not finish
- * until that grandchild happened to exit. A process group would be the canonical answer, but
- * Bun.spawn offers no `detached`, so the tree is enumerated and killed leaf-first instead.
- */
-/** Linux: the process table straight from /proc, so the walk needs no `pgrep` or `ps`. A minimal
- *  image (the CI container is one: oven/bun ships neither) made the pgrep walk answer EMPTY, so a
- *  timed-out run killed only the interpreter, its grandchild kept the pipes open, and the route
- *  hung until the caller gave up (2026-09-05). Null where /proc is not readable (macOS), so the
- *  caller falls back to pgrep. */
-function procDescendants(pid: number, maxDepth: number): number[] | null {
-  let entries: string[]
-  try {
-    entries = readdirSync('/proc')
-  } catch {
-    return null
-  }
-  const children = new Map<number, number[]>()
-  let sawAny = false
-  for (const name of entries) {
-    if (!/^\d+$/.test(name)) continue
-    let stat: string
-    try {
-      stat = readFileSync(`/proc/${name}/stat`, 'utf8')
-    } catch {
-      continue // raced with an exit
-    }
-    // "pid (comm) state ppid ..." - comm may hold spaces and parentheses, so split after the LAST ')'.
-    const close = stat.lastIndexOf(')')
-    if (close < 0) continue
-    const fields = stat
-      .slice(close + 1)
-      .trim()
-      .split(/\s+/)
-    const ppid = Number.parseInt(fields[1] ?? '', 10)
-    const child = Number.parseInt(name, 10)
-    if (!Number.isFinite(ppid) || !Number.isFinite(child)) continue
-    sawAny = true
-    const list = children.get(ppid)
-    if (list) list.push(child)
-    else children.set(ppid, [child])
-  }
-  if (!sawAny) return null
-  const out: number[] = []
-  const walk = (parent: number, depth: number): void => {
-    if (depth >= maxDepth) return
-    for (const child of children.get(parent) ?? []) {
-      if (child === parent) continue
-      walk(child, depth + 1) // grandchildren first, so a parent cannot respawn what we killed
-      out.push(child)
-    }
-  }
-  walk(pid, 0)
-  return out
-}
-
-export function unixDescendants(pid: number, maxDepth = UNIX_TREE_MAX_DEPTH): number[] {
-  if (process.platform === 'linux') {
-    const viaProc = procDescendants(pid, maxDepth)
-    if (viaProc !== null) return viaProc
-  }
-  const out: number[] = []
-  const walk = (parent: number, depth: number): void => {
-    if (depth >= maxDepth) return
-    let stdout: string
-    try {
-      const r = Bun.spawnSync(['pgrep', '-P', String(parent)], { stdout: 'pipe', stderr: 'ignore' })
-      stdout = r.stdout.toString()
-    } catch {
-      return // no pgrep on this host: the parent kill below is all we can do
-    }
-    for (const line of stdout.split('\n')) {
-      const child = Number.parseInt(line.trim(), 10)
-      if (!Number.isFinite(child) || child <= 0 || child === parent) continue
-      walk(child, depth + 1) // grandchildren first, so a parent cannot respawn what we killed
-      out.push(child)
-    }
-  }
-  walk(pid, 0)
-  return out
-}
+// The Unix process-tree walk and the tree kill live in ./core/process, beside the process table
+// they read: dispatch.ts needs the same two, and keeping a second copy here is how its Unix
+// branch stayed a bare single-process kill while this one was fixed (audit AH-15, and the
+// adversarial re-check of that closure on 2026-09-06 that found the surviving duplicate).
 
 /** Kill the WHOLE tree, not just python. An acting script blocks on its actuator (a powershell
  *  driving a window, `subprocess.run` in migrate_chat / chips / courier); killing only the
  *  interpreter would leave that actuator running unsupervised while the caller reads "timed
- *  out". The toolbox itself uses `taskkill /T /F` for the same reason (lib/enginelib.py). On
- *  Unix the tree is walked with pgrep and killed leaf-first (see unixDescendants). */
+ *  out". The toolbox itself uses `taskkill /T /F` for the same reason (lib/enginelib.py). The walk
+ *  and the kill live in core/process.ts (killProcessTree), shared with dispatch.ts, because two
+ *  copies of this is how dispatch's Unix branch stayed a single-process kill after this one was
+ *  fixed. */
 function killTree(proc: ReturnType<typeof Bun.spawn>): void {
   try {
-    if (process.platform === 'win32' && proc.pid) {
-      Bun.spawnSync(['taskkill', '/PID', String(proc.pid), '/T', '/F'], {
-        stdout: 'ignore',
-        stderr: 'ignore',
-        windowsHide: true,
-      })
-    } else {
-      if (proc.pid) {
-        for (const child of unixDescendants(proc.pid)) {
-          try {
-            process.kill(child, 'SIGKILL')
-          } catch {
-            // already gone
-          }
-        }
-      }
-      proc.kill('SIGKILL')
-    }
+    if (proc.pid) killProcessTree(proc.pid)
+    // Settle Bun's own handle too: the tree kill above went through the OS, and on Windows it
+    // already took this pid with it, so this is a no-op there and the real kill on a host where
+    // the pid could not be enumerated.
+    proc.kill('SIGKILL')
   } catch {
     // already gone
   }

@@ -284,6 +284,60 @@ describe.skipIf(!win || !CSC)('install.ps1 transactional swap (AH-40)', () => {
     expect(leftoverArtifacts(installDir)).toEqual([])
   }, 30_000)
 
+  // THE ONE ABOVE CANNOT CATCH THE STATE BUG, which is why this one exists. 'misc' is swapped
+  // before 'orchestrator', so failing after it means the state-carry step never ran and the
+  // sentinel survives no matter what that step does. Failing after 'orchestrator' is the only
+  // ordering that exercises it: by then state/ has been carried into staging, and the outer
+  // `finally` deletes staging unconditionally. With the carry done as a MOVE (as it was until
+  // 2026-09-06) the rollback restored an orchestrator/ whose state/ had gone with the staging
+  // directory, silently destroying the scheduler's ledger in the one path built to protect it.
+  test('a failure AFTER the orchestrator swap still leaves the scheduler ledger intact', () => {
+    const work = mkdtempSync(join(tmpdir(), 'ah-install-rollback-state-'))
+    const installDir = join(work, 'install')
+
+    const zipV1 = buildReleaseZip(work, '0.23.0')
+    expect(
+      runInstall([
+        '-FromZip',
+        zipV1,
+        '-InstallDir',
+        installDir,
+        '-NoShortcut',
+        '-NoLaunch',
+        '-Force',
+      ]).status,
+    ).toBe(0)
+
+    // A ledger with real shape: a file at the top and one nested a directory down, because the
+    // carry copies a TREE and a shallow copy would pass a one-file assertion.
+    const stateDir = join(installDir, 'orchestrator', 'state')
+    mkdirSync(join(stateDir, 'trash', 'abc'), { recursive: true })
+    writeFileSync(join(stateDir, 'sentinel.json'), '{"attempts":["keep-me"]}')
+    writeFileSync(join(stateDir, 'trash', 'abc', 'manifest.json'), '{"undo":true}')
+
+    const zipV2 = buildReleaseZip(work, '0.23.1')
+    const result = runInstall([
+      '-FromZip',
+      zipV2,
+      '-InstallDir',
+      installDir,
+      '-NoShortcut',
+      '-NoLaunch',
+      '-Force',
+      '-FailAfterStage',
+      'orchestrator',
+    ])
+    expect(result.status).not.toBe(0)
+
+    // Rolled back whole: the old executable, and every byte of the ledger, nested file included.
+    expect(exeVersion(join(installDir, 'AgentHydra.exe'))).toBe('0.23.0')
+    expect(readFileSync(join(stateDir, 'sentinel.json'), 'utf8')).toBe('{"attempts":["keep-me"]}')
+    expect(readFileSync(join(stateDir, 'trash', 'abc', 'manifest.json'), 'utf8')).toBe(
+      '{"undo":true}',
+    )
+    expect(leftoverArtifacts(installDir)).toEqual([])
+  }, 30_000)
+
   test('a version-mismatch canary refuses before touching the install', () => {
     const work = mkdtempSync(join(tmpdir(), 'ah-install-mismatch-'))
     const installDir = join(work, 'install')

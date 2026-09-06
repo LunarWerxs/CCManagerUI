@@ -37,6 +37,7 @@ import { Database, type Statement } from 'bun:sqlite'
 import { existsSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { DATA_DIR } from './config'
+import { dedupeKey } from './session-locator'
 import type { SearchIndexStatus, SessionSource } from './types'
 
 let indexPath = join(DATA_DIR, 'search-index.db')
@@ -46,10 +47,20 @@ let indexPath = join(DATA_DIR, 'search-index.db')
 export const searchIndexPath = (): string => indexPath
 
 /** Bump to force a rebuild when the extraction or schema changes meaning. */
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
-/** A session's identity across the two file-backed providers. */
-const docKey = (source: SessionSource, sessionId: string) => `${source}:${sessionId}`
+/**
+ * A session's identity, store included (audit AH-35).
+ *
+ * Used to be `${source}:${sessionId}` alone, which collapses two different PRODUCTS that share a
+ * format and a session id (Kilo and MiMo Code are both `source: 'opencode'`, two Hermes profiles
+ * are both `tool: 'hermes'`) into one row — the second store indexed just overwrote the first's.
+ * `dedupeKey` (session-locator.ts) is the one place that identity is computed everywhere else in
+ * this codebase, so this index uses it too rather than inventing a second key format. Bumping
+ * SCHEMA_VERSION above forces every row to be rebuilt under the new key rather than mixing old and
+ * new formats silently.
+ */
+const docKey = (f: IndexableFile) => dedupeKey(f)
 
 let db: Database | null = null
 let openFailed = false
@@ -189,6 +200,9 @@ export interface IndexableFile {
   path: string
   mtime_ms: number
   size_bytes: number
+  /** Product identity, forwarded to dedupeKey() so two products sharing `source` + session id
+   *  (e.g. Kilo and MiMo Code, both `source: 'opencode'`) never collapse to one indexed row. */
+  tool?: string
 }
 
 let refreshing = false
@@ -220,7 +234,7 @@ async function indexOneStaleFile(
   stmts: StaleFileStatements,
   result: IndexRefreshResult,
 ): Promise<void> {
-  const key = docKey(f.source, f.session_id)
+  const key = docKey(f)
   let text: string
   try {
     text = conversationText(await Bun.file(f.path).text())
@@ -263,7 +277,7 @@ export async function refreshSearchIndex(
     const wanted = new Set<string>()
     const stale: IndexableFile[] = []
     for (const f of files) {
-      const key = docKey(f.source, f.session_id)
+      const key = docKey(f)
       wanted.add(key)
       const have = known.get(key)
       if (!have || have.mtime_ms !== f.mtime_ms || have.size_bytes !== f.size_bytes) stale.push(f)
@@ -355,7 +369,7 @@ export function searchIndexCoverage(files: IndexableFile[]): { covered: number; 
       known.set(row.key, row)
     let covered = 0
     for (const f of files) {
-      const have = known.get(docKey(f.source, f.session_id))
+      const have = known.get(docKey(f))
       if (have && have.mtime_ms === f.mtime_ms && have.size_bytes === f.size_bytes) covered++
     }
     return { covered, stale: files.length - covered }

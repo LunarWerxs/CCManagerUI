@@ -90,6 +90,103 @@ export function linuxProcTable(): ProcTableRow[] | null {
   return rows.length > 0 ? rows : null
 }
 
+/** Hard cap on how deep the Unix descendant walk goes. An actuator chain is python -> shell ->
+ *  tool, three or four levels; twelve bounds a pathological fork tree without ever mattering. */
+const UNIX_TREE_MAX_DEPTH = 12
+
+/**
+ * Every descendant of `pid` on a Unix host, DEEPEST FIRST. Returns [] for a childless process or
+ * a host where neither source can be read.
+ *
+ * WHY IT EXISTS (audit AH-15): on Windows the kill is `taskkill /T`, the whole tree; on Unix it
+ * was the named process alone. Its own child, the actuator it was blocking on, kept running
+ * unsupervised and still held the stdout/stderr pipes, so a caller's drain could not finish until
+ * that grandchild happened to exit. A process group would be the canonical answer, but Bun.spawn
+ * offers no `detached`, so the tree is enumerated and killed leaf-first instead.
+ *
+ * /proc first (via linuxProcTable), `pgrep -P` second. The order matters: the CI container ships
+ * neither `pgrep` nor `ps`, and the pgrep-only walk answered EMPTY there, which is indistinguishable
+ * from "no children" and silently turned the tree kill back into a single-process kill (2026-09-05).
+ */
+export function unixDescendants(pid: number, maxDepth = UNIX_TREE_MAX_DEPTH): number[] {
+  const out: number[] = []
+  const table = linuxProcTable()
+  if (table) {
+    const children = new Map<number, number[]>()
+    for (const row of table) {
+      const list = children.get(row.ppid)
+      if (list) list.push(row.pid)
+      else children.set(row.ppid, [row.pid])
+    }
+    const walk = (parent: number, depth: number): void => {
+      if (depth >= maxDepth) return
+      for (const child of children.get(parent) ?? []) {
+        if (child === parent) continue
+        walk(child, depth + 1) // grandchildren first, so a parent cannot respawn what we killed
+        out.push(child)
+      }
+    }
+    walk(pid, 0)
+    return out
+  }
+  const walk = (parent: number, depth: number): void => {
+    if (depth >= maxDepth) return
+    let stdout: string
+    try {
+      const r = Bun.spawnSync(['pgrep', '-P', String(parent)], { stdout: 'pipe', stderr: 'ignore' })
+      stdout = r.stdout.toString()
+    } catch {
+      return // no pgrep on this host: killing the named process is all we can do
+    }
+    for (const line of stdout.split('\n')) {
+      const child = Number.parseInt(line.trim(), 10)
+      if (!Number.isFinite(child) || child <= 0 || child === parent) continue
+      walk(child, depth + 1)
+      out.push(child)
+    }
+  }
+  walk(pid, 0)
+  return out
+}
+
+/**
+ * Kill `pid` AND everything it spawned. The one implementation, because there were two and only
+ * one of them was ever fixed.
+ *
+ * A cancelled or timed-out run is the case that matters: the thing being killed is a supervisor
+ * blocked on an actuator (a PowerShell driving a window, a `subprocess.run` inside the toolbox, a
+ * `claude` under a runner), and killing only the named process leaves that actuator running with
+ * nobody watching it while the caller is told the work stopped. Windows has always used
+ * `taskkill /T /F`; the Unix branch walks the tree and kills leaf-first so a parent cannot respawn
+ * what was just killed.
+ *
+ * Never throws: a process that died between enumeration and signal is the expected case, not an
+ * error, and every caller here is already reporting some other outcome.
+ */
+export function killProcessTree(pid: number): void {
+  if (!Number.isFinite(pid) || pid <= 0) return
+  try {
+    if (process.platform === 'win32') {
+      Bun.spawnSync(['taskkill', '/PID', String(pid), '/T', '/F'], {
+        stdout: 'ignore',
+        stderr: 'ignore',
+        windowsHide: true,
+      })
+      return
+    }
+    for (const child of unixDescendants(pid)) {
+      try {
+        process.kill(child, 'SIGKILL')
+      } catch {
+        // already gone
+      }
+    }
+    process.kill(pid, 'SIGKILL')
+  } catch {
+    // already gone
+  }
+}
+
 // `--user-data-dir` shows up three ways in a reported command line, depending on how the value
 // was quoted when the process was launched — the discovery here must handle all three or a
 // running instance whose profile path contains a space is mis-parsed (and so appears "stopped"

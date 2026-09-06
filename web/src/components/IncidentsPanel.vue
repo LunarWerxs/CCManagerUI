@@ -2,7 +2,7 @@
 // A repeated queue-run failure, grouped and deduped (server/src/incidents.ts). Collapsed by
 // default behind an open-count badge - a quiet fleet should look quiet - and expands to a short
 // list with ack/resolve, mirroring QueueView's "Show finished" disclosure.
-import { ChevronDown, TriangleAlert } from '@lucide/vue'
+import { ChevronDown, CircleAlert, TriangleAlert } from '@lucide/vue'
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
@@ -16,7 +16,7 @@ import IconTooltip from '@/shell/IconTooltip.vue'
 import InfoHint from '@/shell/InfoHint.vue'
 
 const { t } = useI18n()
-const { incidents, refreshIncidents } = useData()
+const { incidents, incidentsStatus, refreshIncidents } = useData()
 
 const expanded = ref(false)
 // Newest activity first is already the server's own order (listIncidents); resolved incidents sort
@@ -60,7 +60,10 @@ const STATE_VARIANT: Record<Incident['state'], 'warning' | 'secondary' | 'succes
 </script>
 
 <template>
-  <div v-if="incidents.length > 0" class="shrink-0 border-b border-border px-3 pt-2 pb-1">
+  <div
+    v-if="incidents.length > 0 || incidentsStatus.unavailable"
+    class="shrink-0 border-b border-border px-3 pt-2 pb-1"
+  >
     <div class="flex items-center gap-1">
       <button
         type="button"
@@ -78,6 +81,27 @@ const STATE_VARIANT: Record<Incident['state'], 'warning' | 'secondary' | 'succes
         <InfoHint :text="t('incidents.whatIsIncidents')" />
       </button>
     </div>
+
+    <!-- AH-20: the FIRST incidents fetch ever failed — there is nothing to show, so say that
+         instead of silently rendering as "no incidents", the exact lie AH-20 was filed against.
+         Mirrors QueueView's unavailable state: an icon, the server's own reason, and Retry. -->
+    <div
+      v-if="incidentsStatus.unavailable"
+      class="mb-1.5 flex flex-col items-center gap-1.5 rounded-md border border-warning/30 bg-warning/10 px-2 py-2 text-center text-[11px] text-warning"
+    >
+      <CircleAlert class="size-4 opacity-70" />
+      <p>{{ t('incidents.unavailable', { reason: incidentsStatus.error }) }}</p>
+      <Button size="xs" variant="outline" @click="refreshIncidents()">{{ t('incidents.retry') }}</Button>
+    </div>
+
+    <!-- a LATER poll failed but we still have incidents on screen — keep showing them, just say
+         they may be stale, same as the queue's staleHint. -->
+    <p
+      v-else-if="incidentsStatus.stale"
+      class="mb-1.5 rounded-md border border-warning/30 bg-warning/10 px-2 py-1.5 text-[11px] text-warning"
+    >
+      {{ t('incidents.staleHint', { reason: incidentsStatus.error }) }}
+    </p>
 
     <div v-if="expanded" class="mb-1.5 flex flex-col gap-1.5">
       <div

@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { scanSessionAnalytics } from '../src/analytics'
 import { exportSession, isExportRefused } from '../src/session-export'
+import { searchSessionBodies } from '../src/session-search'
 import { scanMeta } from '../src/sessions'
 import { listTranscriptFiles, tailTranscript } from '../src/transcript'
 
@@ -119,4 +120,17 @@ test('analytics totals come from the Kilo row', async () => {
   expect(models.length).toBeGreaterThan(0)
   const input = models.reduce((n, m) => n + (m.input ?? 0), 0)
   expect(input).toBe(120)
+})
+
+// AH-34's own failure mode restated for search: searchOpenCode used to read only the DEFAULT
+// OpenCode database (opencode-sessions.ts's OPENCODE_DB_PATH), so a Kilo/MiMo Code/IcodeMate
+// session was indexed and listed but reported ZERO search matches — a silent miss, not an error.
+// If searchOpenCode regresses to that single-store read, listTranscriptFiles(true) above already
+// forced the Kilo row into the cache, but this session's OWN database is never opened, so this hit
+// disappears.
+test('search finds the Kilo session in its own database, not just the default OpenCode store', async () => {
+  const r = await searchSessionBodies({ query: 'from Kilo', source: 'opencode' })
+  const hit = r.results.find((x) => x.session_id === SID)
+  expect(hit).toBeDefined()
+  expect(hit?.snippets.join(' ')).toContain('from Kilo')
 })

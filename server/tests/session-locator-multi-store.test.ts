@@ -19,6 +19,7 @@ import { Hono } from 'hono'
 import { app } from '../src/http-app'
 import '../src/routes/sessions'
 import { dedupeKey, makeLocator, matchesLocator, parseLocator } from '../src/session-locator'
+import { searchSessionBodies } from '../src/session-search'
 import { findTranscriptAsync, listTranscriptFiles, tailTranscript } from '../src/transcript'
 
 // Dispatched on a PRIVATE Hono copied from the shared app, never on the shared app itself: its
@@ -78,6 +79,33 @@ const kiloRoot = join(root, 'kilo')
 const mimoRoot = join(root, 'mimocode')
 const kiloDb = makeOpenCodeDb(kiloRoot, 'kilo.db', 'from Kilo')
 const mimoDb = makeOpenCodeDb(mimoRoot, 'mimocode.db', 'from MiMo Code')
+
+// A second message per store, carrying a random per-run marker word. The search test below needs
+// a query BOTH stores' text contains, and a plain English word ("from") also matches this dev
+// machine's own real OpenCode history (thousands of sessions) since these tests hit the real
+// catalog paths when KILO_DIR/MIMOCODE_DIR are unset for other products — enough real hits to fill
+// `limit` before the synthetic Kilo/MiMo rows are ever reached. A marker nothing else on disk can
+// contain sidesteps that entirely rather than papering over it with a bigger limit.
+const SEARCH_MARKER = `zzz_ah35_marker_${crypto.randomUUID().slice(0, 8)}`
+function addSearchMarkerRow(dbPath: string, dbFile: string, text: string) {
+  const db = new Database(dbPath)
+  db.query('insert into message values (?, ?, ?, ?)').run(
+    `m2-${dbFile}`,
+    SID,
+    3,
+    JSON.stringify({ role: 'user', modelID: 'x-model' }),
+  )
+  db.query('insert into part values (?, ?, ?, ?, ?)').run(
+    `p2-${dbFile}`,
+    `m2-${dbFile}`,
+    SID,
+    3,
+    JSON.stringify({ type: 'text', text }),
+  )
+  db.close()
+}
+addSearchMarkerRow(kiloDb, 'kilo.db', `${SEARCH_MARKER} from Kilo`)
+addSearchMarkerRow(mimoDb, 'mimocode.db', `${SEARCH_MARKER} from MiMo Code`)
 
 const previousKiloDir = process.env.KILO_DIR
 const previousMimoDir = process.env.MIMOCODE_DIR
@@ -214,4 +242,26 @@ test('the intentional same-store dedup still collapses: same product, different 
     session_id: 'x',
   }
   expect(dedupeKey(kiloLike)).not.toBe(dedupeKey(mimoLike))
+})
+
+// AH-35 restated for search itself, not just the locator/route layer: searchOpenCode's internal
+// aggregation used to key its results by the bare session id, so Kilo and MiMo Code's rows under
+// SID would collapse into ONE merged result (combined match_count, snippets from whichever store
+// was read second overwriting the first's). Both fixtures share SID and both contain the word
+// "from", so a query for it must come back with two distinct rows, each carrying only its own
+// store's text.
+test('search returns both stores distinctly when they share one session id, and neither overwrites the other', async () => {
+  const r = await searchSessionBodies({ query: SEARCH_MARKER, source: 'opencode' })
+  const rows = r.results.filter((x) => x.session_id === SID)
+  expect(rows).toHaveLength(2)
+
+  const kiloRow = rows.find((x) => x.snippets.join(' ').includes('from Kilo'))
+  const mimoRow = rows.find((x) => x.snippets.join(' ').includes('from MiMo Code'))
+  expect(kiloRow).toBeDefined()
+  expect(mimoRow).toBeDefined()
+  // Neither row's text bled into the other's — proof they were never merged.
+  expect(kiloRow?.snippets.join(' ')).not.toContain('from MiMo Code')
+  expect(mimoRow?.snippets.join(' ')).not.toContain('from Kilo')
+  expect(kiloRow?.match_count).toBe(1)
+  expect(mimoRow?.match_count).toBe(1)
 })

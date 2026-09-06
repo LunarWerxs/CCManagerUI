@@ -708,6 +708,18 @@ const importClaims = new Map<string, { instanceDir: string; run: Promise<ImportR
 const recentImports = new Map<string, { instanceDir: string; at: number }>()
 const RECENT_IMPORT_MS = 120_000
 
+/** Test seam ONLY: seed (or clear, with null) the post-completion coalescing window above
+ *  directly, so a test can exercise it without driving a real import through importClaims first
+ *  (every test in session-import-claim.test.ts otherwise takes the alreadyRendered exit, which
+ *  never touches this map). Never let one test's seed leak into the next. */
+export function __seedRecentImportForTests(
+  sessionId: string,
+  entry: { instanceDir: string; at: number } | null,
+): void {
+  if (entry) recentImports.set(sessionId, entry)
+  else recentImports.delete(sessionId)
+}
+
 /**
  * Import a finished session into a desktop instance as a visible chat - ONE import per session
  * at a time, whoever asks (audit AH-05).

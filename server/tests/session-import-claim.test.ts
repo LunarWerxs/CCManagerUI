@@ -12,7 +12,7 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { importSessionToDesktop } from '../src/session-launch'
+import { __seedRecentImportForTests, importSessionToDesktop } from '../src/session-launch'
 
 const realSpawn = Bun.spawn
 let spawnAttempts = 0
@@ -177,6 +177,41 @@ test('distinct sessions into the same target do not wait on each other', async (
     expect((await slow).ok).toBe(true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the post-completion recent-import window (AH-05) coalesces a same-target repeat and refuses a different target', async () => {
+  // importClaims only covers imports still in flight; recentImports is the separate 120s window
+  // that covers the gap after a successful import lands but before the app has created the row.
+  // Every other test above takes the alreadyRendered exit before an import ever finishes, so this
+  // map is seeded directly via the test seam instead of driving a real import through it.
+  const dirA = mkdtempSync(join(tmpdir(), 'ah-import-claim-recent-a-'))
+  const dirB = mkdtempSync(join(tmpdir(), 'ah-import-claim-recent-b-'))
+  const sid = `claim-${crypto.randomUUID()}`
+  try {
+    __seedRecentImportForTests(sid, { instanceDir: dirA, at: Date.now() })
+
+    const same = await importSessionToDesktop({
+      sessionId: sid,
+      instanceDir: dirA,
+      title: 'Real title',
+    })
+    expect(same.ok).toBe(true)
+    expect(same.alreadyRendered).toBe(true)
+    expect(same.coalesced).toBe(true)
+
+    const different = await importSessionToDesktop({
+      sessionId: sid,
+      instanceDir: dirB,
+      title: 'Real title',
+    })
+    expect(different.ok).toBe(false)
+    expect(different.reason).toContain('import-in-flight')
+    expect(different.reason).toContain(dirA)
+  } finally {
+    __seedRecentImportForTests(sid, null)
+    rmSync(dirA, { recursive: true, force: true })
+    rmSync(dirB, { recursive: true, force: true })
   }
 })
 

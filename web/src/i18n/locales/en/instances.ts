@@ -37,7 +37,6 @@ export default {
   resolving: 'Resolving…',
   open: 'Open',
   quit: 'Quit',
-  focus: 'Focus window',
   focusHint: 'Bring this instance to the foreground',
   focusShort: 'Focus',
   delete: 'Delete',

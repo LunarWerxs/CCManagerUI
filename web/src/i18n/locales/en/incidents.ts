@@ -15,4 +15,8 @@ export default {
   lastSeen: 'last seen {time}',
   toastAckFailed: 'Failed to acknowledge the incident.',
   toastResolveFailed: 'Failed to resolve the incident.',
+  // AH-20: an outage must not read as "no incidents".
+  unavailable: 'Could not load incidents: {reason}.',
+  retry: 'Retry',
+  staleHint: 'Showing the last known incidents — updates unavailable: {reason}.',
 }

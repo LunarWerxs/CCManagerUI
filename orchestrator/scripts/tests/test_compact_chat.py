@@ -82,6 +82,25 @@ class CompactChatTest(unittest.TestCase):
         self.assertGreater(payload["contextBefore"], payload["contextAfter"])
         self.assertEqual(len(ledgerlib._load()), 0)  # success clears the attempt
 
+    def test_widens_to_the_full_census_when_the_default_window_misses_it(self):
+        # AH-07: the default /api/sessions window (period=7d here) can miss a real, compactable
+        # chat; main() must widen to hydralib.sessions_all() (period=all) before refusing. The
+        # stub route below deliberately answers DIFFERENTLY by period, so this only passes if
+        # main() actually asks twice rather than reusing the first (empty) page.
+        from urllib.parse import parse_qs
+
+        good_row = self.stub.routes["/api/sessions"][0]
+
+        def sessions_route(method, path, query, body):
+            period = parse_qs(query).get("period", [""])[0]
+            return [good_row] if period == "all" else []
+
+        self.stub.routes["/api/sessions"] = sessions_route
+        code, out, _ = run_cli(
+            lambda argv: compact_chat.main(argv, runner=self.ok_runner()), [SID, "--json"])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out)["compacted"])
+
     def test_shrink_without_marker_still_counts(self):
         code, out, _ = run_cli(
             lambda argv: compact_chat.main(argv, runner=self.ok_runner(marker=False, roll=False)),

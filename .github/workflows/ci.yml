@@ -126,6 +126,15 @@ jobs:
       - name: Guardrail (a test stub must not outlive its file)
         run: bun scripts/checks/test-stub-outlives-its-file.mjs
 
+      # Fails if a local HTTP server binds a port without the EXACT-ORIGIN loopback guard. A
+      # browser treats every localhost port as its own origin, so "any loopback origin" lets a
+      # page on any other local port drive these APIs cross-site, and here that reaches instance
+      # create/open/quit. AH-11 asked both servers to use an allowlist; the fix landed in index.ts
+      # only and instance-mode.ts kept the permissive guard, which nothing caught until the
+      # closure was adversarially re-checked (2026-09-06). This is that check, made permanent.
+      - name: Guardrail (local API servers use an exact-origin allowlist)
+        run: bun scripts/checks/local-api-origin-allowlist.mjs
+
       - name: Build (web SPA)
         run: bun run build
 

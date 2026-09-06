@@ -39,6 +39,56 @@ const CMD_LINE = 'Command' + 'Line'
 // each check's own header comment documents, not a synthetic near-miss. A check that exports
 // findViolations but has no entry here fails loudly below rather than being silently skipped.
 const FIXTURES_BY_FILE: Record<string, { broken: string[]; fixed: string[] }> = {
+  'local-api-origin-allowlist.mjs': {
+    broken: [
+      // instance-mode.ts as it actually stood after AH-11 was marked closed: a second local server,
+      // serving instance create/open/quit, still trusting ANY loopback origin. A page on any other
+      // localhost port could drive it, and nothing said so.
+      `
+      import { cors } from 'hono/cors'
+      import { isLoopbackOrigin, loopbackGuard } from './loopback-guard.mjs'
+      app.use('/api/*', cors({ origin: (o) => (o && isLoopbackOrigin(o) ? o : '') }))
+      app.use('/api/*', loopbackGuard)
+      Bun.serve({ hostname: HOST, port: boundPort, fetch: app.fetch })
+      `,
+      // The permissive default called by its new name is still the permissive default: naming
+      // createLoopbackGuard is not the rule, passing allowedOrigins is.
+      `
+      import { createLoopbackGuard } from './loopback-guard.mjs'
+      app.use('/api/*', createLoopbackGuard())
+      Bun.serve({ port, fetch: app.fetch })
+      `,
+      // Binds a port and installs no guard at all.
+      `
+      const app = new Hono()
+      app.get('/api/things', (c) => c.json([]))
+      Bun.serve({ port: 7799, fetch: app.fetch })
+      `,
+    ],
+    fixed: [
+      // The shape both entry points now have.
+      `
+      import { apiOriginAllowlist } from './api-origins'
+      import { createLoopbackGuard } from './loopback-guard.mjs'
+      let allowedApiOrigins: string[] = []
+      app.use('/api/*', createLoopbackGuard({ allowedOrigins: () => allowedApiOrigins }))
+      allowedApiOrigins = apiOriginAllowlist(\`http://\${HOST}:\${boundPort}\`)
+      Bun.serve({ hostname: HOST, port: boundPort, fetch: app.fetch })
+      `,
+      // A routes module hangs handlers on a shared app and binds nothing. Not an entry point, and
+      // demanding a guard of it would be the false red that gets a check ignored.
+      `
+      import { app } from '../http-app'
+      app.get('/api/sessions', async (c) => c.json(await listSessions()))
+      app.post('/api/sessions/:id/done', async (c) => c.json({ ok: true }))
+      `,
+      // http-app.ts itself: builds the Hono app, serves nothing.
+      `
+      import { Hono } from 'hono'
+      export const app = new Hono()
+      `,
+    ],
+  },
   'test-stub-outlives-its-file.mjs': {
     broken: [
       // The tmp/audit2 probe shape (2026-09-05): fetch replaced at module scope, never put back, so

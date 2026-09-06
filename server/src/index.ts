@@ -6,6 +6,7 @@ import { bodyLimit } from 'hono/body-limit'
 import { serveStatic } from 'hono/bun'
 import { cors } from 'hono/cors'
 import { warmAnalyticsInBackground } from './analytics'
+import { apiOriginAllowlist } from './api-origins'
 import {
   autoUpdateEnabled,
   getAutoUpdateIntervalSecs,
@@ -151,22 +152,9 @@ function setHideTrayIcon(value: boolean): void {
 // captured at wiring time.
 let allowedApiOrigins: string[] = []
 function computeAllowedApiOrigins(port: number): string[] {
-  const own = readInstanceInfo()?.url ?? `http://127.0.0.1:${port}`
-  const origins = new Set<string>([own])
-  try {
-    const u = new URL(own)
-    if (u.hostname === '127.0.0.1')
-      origins.add(`${u.protocol}//localhost${u.port ? `:${u.port}` : ''}`)
-    else if (u.hostname === 'localhost')
-      origins.add(`${u.protocol}//127.0.0.1${u.port ? `:${u.port}` : ''}`)
-  } catch {
-    // own origin unparseable (shouldn't happen) — skip the alt-host spelling
-  }
-  for (const dev of (process.env.AGENTHYDRA_DEV_ORIGINS ?? '').split(',')) {
-    const trimmed = dev.trim()
-    if (trimmed) origins.add(trimmed)
-  }
-  return [...origins]
+  // The expansion itself lives in ./api-origins so this daemon and the instances window cannot
+  // drift apart again; only the "what origin am I" question differs between them.
+  return apiOriginAllowlist(readInstanceInfo()?.url ?? `http://127.0.0.1:${port}`)
 }
 
 // CORS narrowed to the exact allowlist above (defense-in-depth for cross-origin READABILITY); the

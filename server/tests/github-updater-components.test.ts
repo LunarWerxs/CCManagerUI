@@ -19,6 +19,10 @@ import {
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
+  applyUpdate,
+  CHECKSUM_MANIFEST,
+  componentVersions,
+  currentTarget,
   installedComponentVersion,
   RELEASE_COMPONENTS,
   RELEASE_VERSION_FILE,
@@ -170,6 +174,135 @@ test('the version stamp reads null on an install that predates stamping', () => 
   try {
     expect(installedComponentVersion(install, 'orchestrator')).toBeNull()
     expect(RELEASE_VERSION_FILE).toBe('.release-version')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('componentVersions reports null before stamping and the stamped version after a swap/reconcile', () => {
+  const { root, bundle, install } = fixture()
+  try {
+    expect(componentVersions(install)).toEqual(
+      RELEASE_COMPONENTS.map((c) => ({ name: c.name, version: null })),
+    )
+    swapComponent(bundle, install, ORCH, 'stampV', '9.9.9', [])
+    reconcileComponent(bundle, install, MISC, '9.9.9', [])
+    expect(componentVersions(install)).toEqual(
+      RELEASE_COMPONENTS.map((c) => ({ name: c.name, version: '9.9.9' })),
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// applyUpdate is the real production orchestration function: the tests above only exercise its
+// extracted pure helpers (swapComponent/reconcileComponent/rollbackComponents), so the WIRING —
+// the orchestratorBusy() refusal gate, the swap-then-exe-rename ordering, and the rollback the
+// catch block performs — was unguarded. Driven here with injected deps (ApplyUpdateDeps) against
+// scratch directories only: no real install, process, or network is touched.
+function applyFixture(): { root: string; bundle: string; install: string } {
+  const root = mkdtempSync(join(tmpdir(), 'ah-apply-'))
+  // bundleDirPath, as returned by the (mocked) downloadAndVerifyUpdate: the exe sits beside the
+  // release-owned component folders, matching a real extracted archive's top level.
+  const bundle = join(root, 'bundle')
+  const install = join(root, 'install')
+  put(bundle, 'AgentHydra.exe', 'new exe')
+  put(bundle, 'orchestrator/orch.py', 'new driver')
+  put(bundle, 'misc/lunarwerx-tray.exe', 'new tray')
+  put(install, 'AgentHydra.exe', 'old exe')
+  put(install, 'orchestrator/orch.py', 'old driver')
+  put(install, 'misc/lunarwerx-tray.exe', 'old tray')
+  return { root, bundle, install }
+}
+
+const FAKE_ASSET_NAME = `AgentHydra-9.9.9-${currentTarget()}${process.platform === 'win32' ? '.zip' : '.tar.gz'}`
+
+function fakeCheckForUpdate() {
+  return async () => ({
+    ok: true,
+    service: 'agenthydra',
+    currentVersion: '9.9.8',
+    currentCommit: null,
+    remoteCommit: 'v9.9.9',
+    branch: null,
+    upstream: null,
+    remote: 'https://github.com/LunarWerxs/agenthydra/releases',
+    dirty: false,
+    updateAvailable: true,
+    canApply: true,
+    checkedAt: 1735689600000,
+    reason: null,
+  })
+}
+
+function fakeFetchLatestRelease() {
+  return async () => ({
+    res: {
+      ok: true,
+      json: async () => ({
+        assets: [
+          { name: FAKE_ASSET_NAME, browser_download_url: 'https://example.invalid/a', size: 1 },
+          { name: CHECKSUM_MANIFEST, browser_download_url: 'https://example.invalid/s', size: 1 },
+        ],
+      }),
+    },
+  })
+}
+
+test('applyUpdate refuses while a toolbox script is running and changes nothing on disk', async () => {
+  const { root, bundle, install } = applyFixture()
+  try {
+    const result = await applyUpdate({
+      installDir: install,
+      exePath: join(install, 'AgentHydra.exe'),
+      checkForUpdate: fakeCheckForUpdate(),
+      fetchLatestRelease: fakeFetchLatestRelease(),
+      downloadAndVerifyUpdate: async () => ({
+        newExe: join(bundle, 'AgentHydra.exe'),
+        bundleDirPath: bundle,
+      }),
+      orchestratorBusy: () => true,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('orchestrator script is running')
+    // Nothing moved: refused before any component swap or the exe rename.
+    expect(readFileSync(join(install, 'AgentHydra.exe'), 'utf8')).toBe('old exe')
+    expect(readFileSync(join(install, 'orchestrator/orch.py'), 'utf8')).toBe('old driver')
+    expect(readFileSync(join(install, 'misc/lunarwerx-tray.exe'), 'utf8')).toBe('old tray')
+    expect(readdirSync(install).some((n) => n.includes('.old-'))).toBe(false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('applyUpdate rolls back the executable AND every already-swapped component when the exe swap fails', async () => {
+  const { root, bundle, install } = applyFixture()
+  try {
+    const result = await applyUpdate({
+      installDir: install,
+      exePath: join(install, 'AgentHydra.exe'),
+      checkForUpdate: fakeCheckForUpdate(),
+      fetchLatestRelease: fakeFetchLatestRelease(),
+      downloadAndVerifyUpdate: async () => ({
+        newExe: join(bundle, 'AgentHydra.exe'),
+        bundleDirPath: bundle,
+      }),
+      orchestratorBusy: () => false,
+      // The rename-aside succeeds; putting the new exe in place fails, the same EBUSY/full-disk
+      // shape swapComponent's own failure test injects.
+      move: () => {
+        throw new Error('EBUSY: injected')
+      },
+    })
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('update failed')
+    // The exe is restored...
+    expect(readFileSync(join(install, 'AgentHydra.exe'), 'utf8')).toBe('old exe')
+    // ...and so is orchestrator/, which had already been swapped to the new release before the
+    // exe step ran and failed.
+    expect(readFileSync(join(install, 'orchestrator/orch.py'), 'utf8')).toBe('old driver')
+    // No .old- artifacts left behind anywhere in the install.
+    expect(readdirSync(install).some((n) => n.includes('.old-'))).toBe(false)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

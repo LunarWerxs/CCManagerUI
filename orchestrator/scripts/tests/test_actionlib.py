@@ -159,6 +159,38 @@ class MenuGeneratedFromCatalogTest(unittest.TestCase):
 
         self.assertEqual(orch._scripts_on_disk(), SCRIPT_FILES)
 
+    def test_menu_prints_each_rows_catalog_invocation(self):
+        # AH-25's own gap: the menu named the switch but never said, per row, which scripts it
+        # actually binds. show_menu() now prints "[<invocation>]" at the end of each row - this
+        # pins the printed label to actionlib.CATALOG's own invocation field, so the menu and
+        # the catalog can never silently drift apart again.
+        import contextlib
+        import io
+        import re
+
+        import orch
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = orch.show_menu()
+        self.assertEqual(code, 0)
+        printed: dict[str, str] = {}
+        for ln in buf.getvalue().splitlines():
+            if ln[:4] != "    " or ln[4:5] == " " or not ln.strip():
+                continue
+            name = ln.split(None, 1)[0]
+            if name not in actionlib.CATALOG:
+                continue
+            m = re.search(r"\[(\w+)\]\s*$", ln)
+            self.assertIsNotNone(m, f"{name}: menu row has no gating label: {ln!r}")
+            printed[name] = m.group(1)
+        self.assertEqual(set(printed), set(actionlib.CATALOG),
+                          "every catalogued script's menu row must print a gating label")
+        for name, row in actionlib.CATALOG.items():
+            self.assertEqual(printed[name], row["invocation"],
+                              f"{name}: menu prints [{printed[name]}] but the catalog says "
+                              f"invocation={row['invocation']!r}")
+
 
 class CatalogJsonRoundTripTest(unittest.TestCase):
     def test_catalog_serializes_and_round_trips_as_json(self):

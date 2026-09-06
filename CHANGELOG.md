@@ -165,6 +165,40 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ### Fixed
 
+- **Every closure of the 42-item audit was re-checked against its own acceptance criteria, and 12
+  of them were overstated** (2026-09-06). Two independent reviewers read the committed code and the
+  named regression test for each item, with a third deciding wherever they disagreed. 30 held. The
+  suite had been green throughout and said nothing about the other 12, which is the point: a green
+  suite proves the tests that exist pass, not that any of them asserts what the item required.
+
+  Three were real defects rather than overclaims, and all three were the same shape, a fix applied
+  at one call site while the finding named a class of sites:
+
+  - The transactional installer **destroyed the data it exists to protect.** It moved
+    `orchestrator/state/`, the scheduler's ledger, out of the rollback copy before the step that can
+    fail, and the cleanup deletes the staging directory unconditionally, so any mid-install failure
+    rolled back a toolbox whose ledger had gone with it. It is copied now, and the rollback copy is
+    discarded only once everything has landed. The rollback test that existed could not have caught
+    it: it injected its failure one component too early. The new one was confirmed to fail against
+    the old code.
+  - **The instances window accepted any loopback origin.** The exact-origin allowlist landed on the
+    daemon and not on the second local server, which serves instance create, open and quit, so a page
+    on any other localhost port could drive it from a browser. Both build the allowlist from one
+    module now, and a new guardrail fails the build if a local server ever binds a port without it.
+  - **Cancelling a run on Linux or macOS killed one process, not the tree,** under a comment
+    promising otherwise, so everything the agent had spawned kept running. There is one tree-kill
+    implementation now instead of two, of which only one had been fixed.
+
+  The rest were coverage gaps, each now closed: session search read only the default database for
+  OpenCode-format stores (Kilo, MiMo Code and IcodeMate sessions listed and opened but could not be
+  found), and its index keyed without the store, so two stores sharing a session id overwrote each
+  other; the incidents panel still rendered "no incidents" when the read had actually failed; the
+  updater's own apply path had no test at all behind its extracted helpers, and the daemon could not
+  report which component versions had landed; the toolbox menu never showed which actions the tray
+  icon gates and which run directly; the release smoke test never asked the booted binary about its
+  toolbox; and the tunnel-readiness fix and the kit-sync hook were both unguarded. The full linter
+  now runs clean, and the one dead translation key is gone.
+
 - **Linux enumeration no longer depends on `ps`/`pgrep`, and two identity keys follow the store**
   (2026-09-05, found by running the repo's own ubuntu CI leg in its container after the audit
   closed; GitHub's runner ships procps and had hidden all of it). On Linux the process table is

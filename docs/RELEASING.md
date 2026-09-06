@@ -79,9 +79,7 @@ validates the complete staged payload: exe present, `misc/` and `orchestrator/` 
 `--version` canary run **on the staged copy** before anything real is touched, then refuses to
 proceed under a detected running instance (`AgentHydra`/`lunarwerx-tray` process, or a live pid in
 `<config dir>\runtime.json`) unless `-Force` is passed. The three release-owned components
-(`AgentHydra.exe`, `misc/`, `orchestrator/`, the same three names should reappear if
-`server/src/github-updater.ts`'s self-updater ever grows a shared component list; there is no such
-list there today) are then swapped one at a time: each is renamed aside (`<name>.old-<stamp>`),
+(`AgentHydra.exe`, `misc/`, `orchestrator/`) are then swapped one at a time: each is renamed aside (`<name>.old-<stamp>`),
 the staged copy is moved into place, and orchestrator's user-owned `state/` directory is carried
 across the swap rather than dropped. Any failure during the swap rolls every component processed
 so far back to its `.old-` copy, so a disk-full, interrupted, or locked-file mid-copy can no longer
@@ -89,6 +87,18 @@ leave `misc/`, `orchestrator/`, and the exe at silently different versions. `-Fr
 `-InstallDir`, `-NoLaunch`, and `-Force` exist so this is testable offline (see
 `tests/install-transactional.test.ts`) without touching a real install, the real daemon, or the
 real tray; none of them change the default (no-arguments) behaviour a real user gets.
+
+**The compiled self-updater owns the same three components (AH-08).** `server/src/github-updater.ts`
+carries `RELEASE_COMPONENTS`, and a manual install and an in-app update can no longer disagree about
+what a release IS: `orchestrator/` is swapped (renamed aside, the release copy moved in, the
+user-owned `state/` carried across, a `.release-version` stamp written, retired files gone by
+construction) and `misc/` is reconciled (release files copied in, retired files removed, a locked
+file reported rather than silently skipped). Components go first, then the executable; any failure
+rolls the executable AND every swapped component back as one unit, and the aside copies are
+discarded only once everything has landed. A swap refuses to start while a toolbox script is running
+through the daemon (`orchestratorBusy()`), and a bare-executable install acquires the toolbox on its
+first update. `server/tests/github-updater-components.test.ts` pins `install.ps1`'s component list to
+`RELEASE_COMPONENTS` by parsing the PowerShell, so the two lists cannot drift apart unnoticed.
 
 ## When a push doesn't trigger anything
 

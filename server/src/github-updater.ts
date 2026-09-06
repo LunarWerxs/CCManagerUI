@@ -318,6 +318,7 @@ function baseStatus(overrides: Partial<UpdateStatus>): UpdateStatus {
     canApply: false,
     checkedAt: Date.now(),
     reason: null,
+    components: componentVersions(APP_ROOT),
     ...overrides,
   }
 }
@@ -719,6 +720,18 @@ export function installedComponentVersion(installDir: string, name: string): str
   }
 }
 
+/** Every release component's installed version, as the update status reports it (audit AH-08:
+ *  "Done when" required the daemon to REPORT matching versions, not merely swap them correctly).
+ *  Exported so a test can point it at a scratch install dir instead of the real APP_ROOT. */
+export function componentVersions(
+  installDir: string,
+): Array<{ name: string; version: string | null }> {
+  return RELEASE_COMPONENTS.map((c) => ({
+    name: c.name,
+    version: installedComponentVersion(installDir, c.name),
+  }))
+}
+
 function fail(message: string): UpdateApplyResult {
   // Every early return in applyUpdate goes through here, so this is the one place that has to
   // settle the progress record — otherwise a failed apply leaves the UI on "Downloading…" forever,
@@ -798,9 +811,44 @@ async function downloadAndVerifyUpdate(
   return { newExe, bundleDirPath }
 }
 
-export async function applyUpdate(): Promise<UpdateApplyResult> {
+/** Everything applyUpdate calls that a test needs to fake: network, the daemon's busy gate, and
+ *  the two filesystem paths under mutation. Defaults are the real implementations, so production
+ *  callers pass nothing and behavior is unchanged — this exists so a test can drive the actual
+ *  orchestration function (the refusal gate, the swap-then-rename ordering, the rollback) against
+ *  scratch directories instead of the real install, a real process, or the network (audit AH-08). */
+export interface ApplyUpdateDeps {
+  /** Root of the install being updated. Defaults to APP_ROOT. */
+  installDir?: string
+  /** Path of the running executable being replaced. Defaults to process.execPath. */
+  exePath?: string
+  checkForUpdate?: (opts?: { fresh?: boolean }) => Promise<UpdateStatus>
+  /** Re-fetch used to read the asset list (checkForUpdate intentionally doesn't carry it). */
+  fetchLatestRelease?: () => Promise<{ res: { ok: boolean; json: () => Promise<unknown> } }>
+  downloadAndVerifyUpdate?: (
+    asset: GhAsset,
+    sums: GhAsset,
+    remoteVersion: string,
+    staging: string,
+    bundledExeName: string,
+    exeName: string,
+    output: string[],
+  ) => Promise<{ newExe: string; bundleDirPath: string | null } | UpdateApplyResult>
+  orchestratorBusy?: () => boolean
+  /** Injected exe rename/move (tests make the swap fail). Defaults to renameSync / moveInto. */
+  rename?: RenameFn
+  move?: (from: string, to: string) => void
+}
+
+export async function applyUpdate(deps: ApplyUpdateDeps = {}): Promise<UpdateApplyResult> {
+  const doCheckForUpdate = deps.checkForUpdate ?? checkForUpdate
+  const doFetchLatestRelease = deps.fetchLatestRelease ?? fetchLatestRelease
+  const doDownloadAndVerifyUpdate = deps.downloadAndVerifyUpdate ?? downloadAndVerifyUpdate
+  const isOrchestratorBusy = deps.orchestratorBusy ?? orchestratorBusy
+  const rename = deps.rename ?? renameSync
+  const move = deps.move ?? ((from: string, to: string) => moveInto(from, to, rename))
+
   beginUpdateProgress('Checking for the latest release…')
-  const status = await checkForUpdate({ fresh: true })
+  const status = await doCheckForUpdate({ fresh: true })
   if (!status.ok) return fail(status.reason ?? 'update check failed')
   if (!status.updateAvailable) return fail('already up to date')
 
@@ -811,7 +859,7 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
   let asset: GhAsset | null = null
   let sums: GhAsset | null = null
   try {
-    const { res } = await fetchLatestRelease()
+    const { res } = await doFetchLatestRelease()
     if (res.ok) {
       const assets = ((await res.json()) as GhRelease).assets ?? []
       asset = assetForThisPlatform(assets)
@@ -828,10 +876,10 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
       `v${remoteVersion} published no ${CHECKSUM_MANIFEST}, so the download cannot be verified - refusing to update`,
     )
 
-  const exePath = process.execPath
+  const exePath = deps.exePath ?? process.execPath
   const exeName = basename(exePath)
   const bundledExeName = process.platform === 'win32' ? 'AgentHydra.exe' : 'agenthydra'
-  const installDir = APP_ROOT
+  const installDir = deps.installDir ?? APP_ROOT
   const staging = join(installDir, '.update-staging')
   const stamp = String(status.checkedAt) // Date.now() is unavailable here; reuse the check time
   const output: string[] = []
@@ -841,7 +889,7 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
   const componentAsides: ComponentAside[] = []
 
   try {
-    const prepared = await downloadAndVerifyUpdate(
+    const prepared = await doDownloadAndVerifyUpdate(
       asset,
       sums,
       remoteVersion,
@@ -857,7 +905,7 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
 
     // A toolbox script mid-run executes out of orchestrator/; replacing that folder under it
     // is not an update, it is a crash with a good excuse. Refuse and let the next tick retry.
-    if (orchestratorBusy())
+    if (isOrchestratorBusy())
       return fail(
         'an orchestrator script is running through this daemon; the update would replace the code it is executing - retry when it finishes',
       )
@@ -871,8 +919,8 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
 
     // --- 2. swap the exe (rename-aside is allowed on a running Windows image) ---
     exeMovedAside = join(installDir, `${exeName}.old-${stamp}`)
-    renameSync(exePath, exeMovedAside)
-    moveInto(newExe, exePath)
+    rename(exePath, exeMovedAside)
+    move(newExe, exePath)
     if (process.platform !== 'win32') {
       try {
         await run('chmod', ['+x', exePath])
@@ -908,7 +956,7 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
     try {
       if (exeMovedAside && existsSync(exeMovedAside)) {
         rmSync(exePath, { force: true })
-        renameSync(exeMovedAside, exePath)
+        rename(exeMovedAside, exePath)
       }
     } catch {
       /* rollback is best-effort */

@@ -398,7 +398,9 @@ The daemon exposes it (`server/src/orchestrator.ts`):
 | surface | what |
 | --- | --- |
 | `GET /api/orchestrator` | the toolbox's own menu, where it lives, whether python answers |
-| `POST /api/orchestrator/run` `{script, args, timeoutMs}` | run one script by its menu name - exactly `python orch.py <script> <args>` in `orchestrator/`; stdout, stderr, exit code and what the driver's codes mean come back |
+| `POST /api/orchestrator/run` `{script, args, timeoutMs}` | run one script by its menu name - exactly `python orch.py <script> <args>` in `orchestrator/`; stdout, stderr, exit code and what the driver's codes mean come back. Every run is also an OPERATION with an id (audit AH-09), because a 30-minute act used to lose its result to the daemon's 255-second idle timeout: send `X-Idempotency-Key` (or `idempotencyKey` in the body) and a retry after a dropped connection returns THE ORIGINAL operation instead of starting a second act, while `async: true` answers `202` with the id at once so a caller can poll instead of holding the connection open. A refusal that never ran does not pin the key |
+| `GET /api/orchestrator/operations` · `GET /api/orchestrator/operations/:id` | what ran and what it returned, for an hour after it finished (bounded, in memory: this reconciles a dropped connection, it is not the audit log - the toolbox's own ledgers are that) |
+| `POST /api/orchestrator/operations/:id/cancel` | stop a running operation; the child's whole process tree is killed and the outcome reads `cancelled` rather than failed. Same origin rule as `run` |
 | MCP `orchestrator_menu` | the GET above |
 | MCP `orchestrator_run` | the POST above |
 | MCP `orchestrator_loop` | `loop` (dry by default; `live: true` acts) |

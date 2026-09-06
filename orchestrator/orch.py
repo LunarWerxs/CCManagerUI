@@ -89,7 +89,8 @@ def _catalog() -> list[dict]:
     from lib import actionlib
 
     order = {"observe": 0, "mutate": 1}
-    out = [{"name": name, "kind": row["kind"], "summary": row["summary"]}
+    out = [{"name": name, "kind": row["kind"], "summary": row["summary"],
+            "invocation": row["invocation"]}
            for name, row in actionlib.CATALOG.items()]
     out.sort(key=lambda r: (order[r["kind"]], r["name"]))
     return out
@@ -137,13 +138,17 @@ def show_menu() -> int:
             continue
         print(f"  {labels[kind]}")
         for r in group:
-            print(f"    {r['name']:<18} {r['summary'][:88]}")
+            print(f"    {r['name']:<18} {r['summary'][:76]} [{r['invocation']}]")
         print()
+    print("  [direct] runs on your own word, no tray-icon check - [both] consults the tray")
+    print("  switch (and a scheduled tick goes through it too) - [unattended] is reached only")
+    print("  from the generated scheduler wrapper, gated one layer up, not by this switch.")
+    print()
     print("  THE LOOP")
     print("    loop               walk the whole orchestration and print what it WOULD do (dry)")
     print("    loop --live        the same walk, acting (identical to sweep.py --all --yes)")
     print()
-    print("  THE SWITCH (nothing acts without the tray icon - owner order, 2026-09-01)")
+    print("  THE SWITCH (binds only the actions marked [both] above - owner order, 2026-09-01)")
     print("    arm                put the icon on screen, PAUSED - registered, silent, nothing acts")
     print("    arm --now          arm and start the lanes in one step (the old one-keystroke form)")
     print("    resume             THROW THE SWITCH: the lanes fire again on the next boundary")

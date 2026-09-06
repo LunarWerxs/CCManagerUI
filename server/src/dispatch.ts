@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import { isDispatchReady } from './boot-state'
 import { DB_PATH, IS_COMPILED, RUN_LOG_DIR, resolveClaudeExe } from './config'
 import { getCliInstance } from './core/cli-instances'
+import { killProcessTree } from './core/process'
 import { coerceQueueItem, db } from './db'
 import { buildDetachedSpawn } from './detached-spawn.mjs'
 import { headlessRunsAllowed, NO_HEADLESS_REASON } from './headless-policy'
@@ -472,25 +473,15 @@ function isAlive(pid: number): boolean {
 }
 
 /** Kill `claude` (childPid) and its descendants. The runner is `claude`'s PARENT, not a descendant,
- *  so it survives this and still writes the terminal marker — which is how a cancel becomes final. */
+ *  so it survives this and still writes the terminal marker, which is how a cancel becomes final.
+ *
+ *  This used to have its own body, and its Unix branch was a bare single-process kill while the
+ *  doc comment promised descendants: cancelling a run on Linux or macOS left everything `claude`
+ *  had spawned alive. AH-15 fixed the orchestrator's copy of the same code and not this one, and
+ *  nothing noticed until that closure was adversarially re-checked (2026-09-06). One
+ *  implementation now, in core/process.ts, so the next fix cannot land in only half the places. */
 async function killTree(pid: number): Promise<void> {
-  if (process.platform === 'win32') {
-    try {
-      await Bun.spawn(['taskkill', '/pid', String(pid), '/t', '/f'], {
-        stdout: 'ignore',
-        stderr: 'ignore',
-        windowsHide: true,
-      }).exited
-    } catch {
-      // already gone
-    }
-    return
-  }
-  try {
-    process.kill(pid, 'SIGKILL')
-  } catch {
-    // already gone
-  }
+  killProcessTree(pid)
 }
 
 /**

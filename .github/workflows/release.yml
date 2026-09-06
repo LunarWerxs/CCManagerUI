@@ -277,6 +277,10 @@ jobs:
           cat health.json; echo
           grep -q '"service":"agenthydra"' health.json
           grep -q '"distribution":"compiled"' health.json
+          curl -sf http://127.0.0.1:7797/api/orchestrator > orchestrator.json
+          cat orchestrator.json; echo
+          grep -q '"present":true' orchestrator.json
+          grep -q 'OBSERVE' orchestrator.json
           curl -sf http://127.0.0.1:7797/ > index.html
           grep -qi '<!doctype html' index.html
           asset=$(grep -Eo "/assets/[^\"']+\.(js|css)" index.html | head -1)

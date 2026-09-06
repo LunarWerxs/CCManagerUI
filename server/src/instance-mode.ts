@@ -11,6 +11,7 @@ import { bodyLimit } from 'hono/body-limit'
 import { serveStatic } from 'hono/bun'
 import { cors } from 'hono/cors'
 import { streamSSE } from 'hono/streaming'
+import { apiOriginAllowlist } from './api-origins'
 import { disarmBootWatchdog, renewBootWatchdog } from './boot-watchdog'
 import {
   HOST,
@@ -41,7 +42,7 @@ import {
 import { tryAcquireInstanceModeStartupLock } from './instance-mode-lock'
 import { instanceModeUrl, openInstanceModeWindow } from './instance-mode-window'
 import { initFileLogging } from './log-file.mjs'
-import { isLoopbackOrigin, loopbackGuard } from './loopback-guard.mjs'
+import { createLoopbackGuard } from './loopback-guard.mjs'
 import { openUi } from './open-ui'
 
 // Prefer an already-running full daemon: it exposes the same instance routes, so opening its
@@ -102,8 +103,22 @@ process.on('unhandledRejection', (reason) => {
 })
 
 const app = new Hono()
-app.use('/api/*', cors({ origin: (origin) => (origin && isLoopbackOrigin(origin) ? origin : '') }))
-app.use('/api/*', loopbackGuard)
+// The exact-origin allowlist, the same one the main daemon uses (index.ts). AH-11 was closed
+// there and NOT here, and this process is a second loopback HTTP API with exactly the same
+// exposure: while it accepted any loopback origin, a page served by any other localhost port
+// could drive instance create/open/quit from a browser. Found by adversarial verification of the
+// AH-11 closure, 2026-09-06 - a fix applied at one call site while the finding named a class.
+//
+// Populated just below, immediately before Bun.serve, because the port is not known until
+// findFreePort answers; both callbacks read the binding lazily per request, never a value
+// captured at wiring time. A request with NO Origin (curl, the MCP client, the tray) still
+// passes - the guard exists to stop BROWSER cross-site calls, not local tools.
+let allowedApiOrigins: string[] = []
+app.use(
+  '/api/*',
+  cors({ origin: (origin) => (origin && allowedApiOrigins.includes(origin) ? origin : '') }),
+)
+app.use('/api/*', createLoopbackGuard({ allowedOrigins: () => allowedApiOrigins }))
 app.use(
   '/api/*',
   bodyLimit({
@@ -291,6 +306,9 @@ if (embeddedWeb) {
 // then stand down the instant this process is actually listening. See ./boot-watchdog.ts.
 renewBootWatchdog('listen')
 const boundPort = await findFreePort(INSTANCE_MODE_PORT, 50, HOST)
+// Fill the allowlist the cors() and guard callbacks above read on every request. This runs
+// before Bun.serve accepts a single connection, so no request can observe the empty initial [].
+allowedApiOrigins = apiOriginAllowlist(`http://${HOST}:${boundPort}`)
 Bun.serve({ hostname: HOST, port: boundPort, fetch: app.fetch })
 disarmBootWatchdog()
 writeInstanceModeInfo(boundPort, { mode: 'instances' })

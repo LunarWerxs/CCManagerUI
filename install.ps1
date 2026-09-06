@@ -79,11 +79,10 @@ $Repo = 'LunarWerxs/AgentHydra'
 # --- release-owned components ---------------------------------------------------------------
 # The complete windows-x64 payload, per .github/workflows/release.yml's "Compile + package" step
 # (~line 90-137): AgentHydra.exe at the root, plus misc/ and orchestrator/ beside it. This is the
-# ONE place this list should live — server/src/github-updater.ts's applyUpdate() is the other
-# consumer, and as of this writing it only swaps the exe and best-effort-refreshes misc/ (it does
-# not yet update orchestrator/ in place there). If a RELEASE_COMPONENTS-style constant or a
-# release-components.json is ever added to github-updater.ts, rename/sync this list to match it
-# rather than let the two drift apart.
+# other consumer is server/src/github-updater.ts's RELEASE_COMPONENTS, which since AH-08 swaps
+# orchestrator/ and reconciles misc/ alongside the exe. The two lists must name the same
+# components, and they cannot drift unnoticed: server/tests/github-updater-components.test.ts
+# parses THIS block and asserts it matches RELEASE_COMPONENTS.
 $ReleaseComponents = @(
   [pscustomobject]@{ Name = 'exe';          RelPath = 'AgentHydra.exe' }
   [pscustomobject]@{ Name = 'misc';         RelPath = 'misc' }
@@ -270,15 +269,24 @@ try {
         }
         $movedAside += [pscustomobject]@{ Name = $c.Name; Target = $target; Aside = $aside; WasPresent = $wasPresent }
 
-        # (e) orchestrator/state/ is USER data (the scheduler's ledger — see
+        # (e) orchestrator/state/ is USER data (the scheduler's ledger, see
         # orchestrator/scripts/lib/ledgerlib.py's _state_dir()) living inside an otherwise
         # release-owned folder. Carry it across rather than let a fresh orchestrator/ drop it.
+        #
+        # COPY, NEVER MOVE, and the distinction is the whole transaction. A move takes the only
+        # copy of the ledger OUT of the rollback aside and into the staging directory - and the
+        # outer `finally` deletes staging unconditionally. So a failure anywhere after this point
+        # (the component move below, a later component, the injected test seam) rolled back an
+        # orchestrator/ whose state/ had already been deleted with the staging dir: the one folder
+        # this whole transactional install exists to protect. Copying leaves the ledger in the
+        # aside until the swap has fully succeeded, and the aside is removed only then, so no
+        # duplicate survives either. Found by adversarial verification of AH-40, 2026-09-06.
         if ($c.Name -eq 'orchestrator' -and $wasPresent) {
           $oldState = Join-Path $aside 'state'
           if (Test-Path $oldState) {
             $newState = Join-Path (Join-Path $staging $c.RelPath) 'state'
             if (Test-Path $newState) { Remove-Item $newState -Recurse -Force }
-            Move-Item -LiteralPath $oldState -Destination $newState -Force
+            Copy-Item -LiteralPath $oldState -Destination $newState -Recurse -Force
           }
         }
 

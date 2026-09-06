@@ -14,6 +14,7 @@ import {
   searchIndexCandidates,
   searchIndexCoverage,
 } from './search-index'
+import { dedupeKey } from './session-locator'
 import { eventToTailEventsForSource, listTranscriptFiles, type TranscriptFile } from './transcript'
 import type { SessionSearchResponse, SessionSearchResult, SessionSource } from './types'
 
@@ -50,6 +51,16 @@ const DEFAULT_BUDGET_MS = 7000
 const CONCURRENCY = 6
 const SNIPPET_LEN = 160
 const MAX_REGEX_LENGTH = 200
+
+/**
+ * Which physical store each result came from, keyed by object identity rather than a public field.
+ *
+ * `SessionSearchResult` deliberately carries no store/path info — session-locator.ts's whole point
+ * is that a raw filesystem or database path is never a public identifier — so this is the one place
+ * that identity survives for internal use (sortByActivity, below). Set once at construction, read
+ * once per request; nothing here is ever serialized into a response.
+ */
+const resultStoreKey = new WeakMap<SessionSearchResult, string>()
 
 function compact(s: string): string {
   return s.replace(/\s+/g, ' ').trim()
@@ -157,20 +168,18 @@ function searchForeignFile(
   // No deadline check: an adapter reads a whole conversation in one call, so there is no
   // part-way point to stop at and nothing to under-report. `stoppedEarly` stays false because it
   // means "this file's count is an undercount", which here it never is.
-  return matchCount === 0
-    ? { hit: null, stoppedEarly: false }
-    : {
-        stoppedEarly: false,
-        hit: {
-          session_id: tf.session_id,
-          source: tf.source,
-          cwd: tf.cwd || tf.project,
-          project: tf.project,
-          match_count: matchCount,
-          truncated: snippets.length < matchCount,
-          snippets,
-        },
-      }
+  if (matchCount === 0) return { hit: null, stoppedEarly: false }
+  const hit: SessionSearchResult = {
+    session_id: tf.session_id,
+    source: tf.source,
+    cwd: tf.cwd || tf.project,
+    project: tf.project,
+    match_count: matchCount,
+    truncated: snippets.length < matchCount,
+    snippets,
+  }
+  resultStoreKey.set(hit, dedupeKey(tf))
+  return { stoppedEarly: false, hit }
 }
 
 /** One line's contribution to a file search: the cwd it revealed (if any, first-hit-wins so the
@@ -241,47 +250,70 @@ export async function searchOneFile(
   }
 
   if (matchCount === 0) return { hit: null, stoppedEarly }
-  return {
-    stoppedEarly,
-    hit: {
-      session_id: tf.session_id,
-      source: tf.source,
-      cwd: cwd || tf.project,
-      project: tf.project,
-      match_count: matchCount,
-      truncated: snippets.length < matchCount,
-      snippets,
-    },
+  const hit: SessionSearchResult = {
+    session_id: tf.session_id,
+    source: tf.source,
+    cwd: cwd || tf.project,
+    project: tf.project,
+    match_count: matchCount,
+    truncated: snippets.length < matchCount,
+    snippets,
   }
+  resultStoreKey.set(hit, dedupeKey(tf))
+  return { stoppedEarly, hit }
 }
 
+/**
+ * OpenCode-format stores, plural (audit AH-34): Kilo, MiMo Code and IcodeMate each keep their own
+ * database in this same schema, and reading only the default one made every other product's
+ * sessions unsearchable even though they were indexed and listed just fine. Same shape as
+ * searchHermes below — build the store set from what the transcript index already resolved, then
+ * loop each store's own reader — because a database is not a file this loop can stream.
+ *
+ * The internal `found` map is keyed by dedupeKey, not the bare session id (audit AH-35): two of
+ * these stores can share a session id (Kilo and MiMo Code are both `source: 'opencode'`), and a
+ * bare-id key would let the second store's events silently merge into the first's result.
+ */
 function searchOpenCode(
   matcher: Matcher,
   perFileLimit: number,
   limit: number,
 ): SessionSearchResult[] {
+  const stores = new Map<string, string>() // dbPath -> tool (e.g. 'opencode', 'kilo', 'mimocode')
+  for (const f of listTranscriptFiles())
+    if (f.source === 'opencode') stores.set(f.path, f.tool ?? 'opencode')
+
   const found = new Map<string, SessionSearchResult>()
-  for (const event of listOpenCodeSearchEvents()) {
-    let result = found.get(event.session_id)
-    const idx = matcher(event.text)
-    if (idx === -1) continue
-    if (!result) {
-      if (found.size >= limit) continue
-      result = {
-        session_id: event.session_id,
+  for (const [dbPath, tool] of stores) {
+    for (const event of listOpenCodeSearchEvents(dbPath)) {
+      const idx = matcher(event.text)
+      if (idx === -1) continue
+      const key = dedupeKey({
         source: 'opencode',
-        cwd: event.cwd,
-        project: event.project,
-        match_count: 0,
-        truncated: false,
-        snippets: [],
+        tool,
+        path: dbPath,
+        session_id: event.session_id,
+      })
+      let result = found.get(key)
+      if (!result) {
+        if (found.size >= limit) continue
+        result = {
+          session_id: event.session_id,
+          source: 'opencode',
+          cwd: event.cwd,
+          project: event.project,
+          match_count: 0,
+          truncated: false,
+          snippets: [],
+        }
+        found.set(key, result)
+        resultStoreKey.set(result, key)
       }
-      found.set(event.session_id, result)
+      result.match_count++
+      if (result.snippets.length < perFileLimit)
+        result.snippets.push(snippetAround(event.text, idx, SNIPPET_LEN))
+      result.truncated = result.snippets.length < result.match_count
     }
-    result.match_count++
-    if (result.snippets.length < perFileLimit)
-      result.snippets.push(snippetAround(event.text, idx, SNIPPET_LEN))
-    result.truncated = result.snippets.length < result.match_count
   }
   return [...found.values()]
 }
@@ -297,15 +329,21 @@ function searchHermes(
   perFileLimit: number,
   limit: number,
 ): SessionSearchResult[] {
-  const stores = new Map<string, string>() // dbPath -> profile grouping (TranscriptFile.project)
-  for (const f of listTranscriptFiles()) if (f.source === 'hermes') stores.set(f.path, f.project)
+  // dbPath -> profile grouping (TranscriptFile.project) + product identity (TranscriptFile.tool)
+  const stores = new Map<string, { project: string; tool: string }>()
+  for (const f of listTranscriptFiles())
+    if (f.source === 'hermes') stores.set(f.path, { project: f.project, tool: f.tool ?? 'hermes' })
 
   const found = new Map<string, SessionSearchResult>()
-  for (const [dbPath, project] of stores) {
+  for (const [dbPath, { project, tool }] of stores) {
     for (const event of listHermesSearchEvents(dbPath, project)) {
-      let result = found.get(event.session_id)
       const idx = matcher(event.text)
       if (idx === -1) continue
+      // Two Hermes profiles both report tool: 'hermes' (session-locator.ts) — the database path is
+      // what actually distinguishes them, which is exactly what dedupeKey's storeKey resolves to
+      // for a database-backed format. A bare session-id key would merge them (audit AH-35).
+      const key = dedupeKey({ source: 'hermes', tool, path: dbPath, session_id: event.session_id })
+      let result = found.get(key)
       if (!result) {
         if (found.size >= limit) continue
         result = {
@@ -317,7 +355,8 @@ function searchHermes(
           truncated: false,
           snippets: [],
         }
-        found.set(event.session_id, result)
+        found.set(key, result)
+        resultStoreKey.set(result, key)
       }
       result.match_count++
       if (result.snippets.length < perFileLimit)
@@ -379,16 +418,19 @@ function warmIndexInBackground(files: TranscriptFile[]) {
   void refreshSearchIndex(files, { budgetMs: INDEX_REFRESH_BUDGET_MS })
 }
 
-/** Newest-active first, the order both paths return results in. */
+/** Newest-active first, the order both paths return results in.
+ *
+ *  Keyed by dedupeKey, not `${source}:${session_id}` (audit AH-35): two stores sharing a format and
+ *  a session id (Kilo/MiMo Code, or two Hermes profiles) would otherwise look up each other's
+ *  mtime. `resultStoreKey` carries the identity each result was built with; a result missing from
+ *  it (should not happen) just sorts as if it had no activity, rather than borrowing a stranger's. */
 function sortByActivity(results: SessionSearchResult[]): SessionSearchResult[] {
-  const activity = new Map(
-    listTranscriptFiles().map((file) => [`${file.source}:${file.session_id}`, file.mtime_ms]),
-  )
-  return results.sort(
-    (a, b) =>
-      (activity.get(`${b.source}:${b.session_id}`) ?? 0) -
-      (activity.get(`${a.source}:${a.session_id}`) ?? 0),
-  )
+  const activity = new Map(listTranscriptFiles().map((file) => [dedupeKey(file), file.mtime_ms]))
+  const activityOf = (r: SessionSearchResult) => {
+    const key = resultStoreKey.get(r)
+    return key !== undefined ? (activity.get(key) ?? 0) : 0
+  }
+  return results.sort((a, b) => activityOf(b) - activityOf(a))
 }
 
 /**
@@ -457,7 +499,7 @@ async function searchViaIndex(
   if (!candidates) return null
 
   const hits = files
-    .filter((f) => candidates.has(`${f.source}:${f.session_id}`))
+    .filter((f) => candidates.has(dedupeKey(f)))
     .slice(0, Math.max(0, limit - found.length))
   const outcomes = await pooledMap(hits, CONCURRENCY, (tf) =>
     searchOneFile(tf, matcher, perFileLimit, deadline),

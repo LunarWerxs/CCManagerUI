@@ -24,6 +24,13 @@ import {
   setSearchIndexPathForTests,
   toMatchExpression,
 } from '../src/search-index'
+import { dedupeKey } from '../src/session-locator'
+
+// The index keys rows by dedupeKey (audit AH-35), not a bare `${source}:${id}`. These fixtures
+// never set `tool`, so it defaults to `source` and this resolves to the same identity every test
+// below already expected — computed via the real function rather than a hand-typed string, so a
+// future change to dedupeKey's shape cannot silently desync the assertions from the code.
+const claudeKey = (id: string) => dedupeKey({ source: 'claude', session_id: id, path: '' })
 
 const dirs: string[] = []
 function scratch(): string {
@@ -142,16 +149,16 @@ describe('refresh and query', () => {
     const r = await refreshSearchIndex(files)
     expect(r.indexed).toBe(3)
 
-    expect(searchIndexCandidates('postcode')).toEqual(new Set(['claude:a']))
-    expect(searchIndexCandidates('rate limit')).toEqual(new Set(['claude:b']))
+    expect(searchIndexCandidates('postcode')).toEqual(new Set([claudeKey('a')]))
+    expect(searchIndexCandidates('rate limit')).toEqual(new Set([claudeKey('b')]))
     // A phrase means adjacency: these words exist but not in this order.
     expect(searchIndexCandidates('limit rate')).toEqual(new Set())
   })
 
   test('matching is case-insensitive, so the index over-selects and never under-selects', async () => {
     await refreshSearchIndex([session('a', [turn('user', 'WindowsHide must be set')])])
-    expect(searchIndexCandidates('windowshide')).toEqual(new Set(['claude:a']))
-    expect(searchIndexCandidates('WINDOWSHIDE')).toEqual(new Set(['claude:a']))
+    expect(searchIndexCandidates('windowshide')).toEqual(new Set([claudeKey('a')]))
+    expect(searchIndexCandidates('WINDOWSHIDE')).toEqual(new Set([claudeKey('a')]))
   })
 
   test('text inside a tool result is not findable, which is the documented limit', async () => {
@@ -164,7 +171,7 @@ describe('refresh and query', () => {
   test('a changed transcript is re-indexed, and the old text stops matching', async () => {
     const first = session('a', [turn('user', 'original wording')])
     await refreshSearchIndex([first])
-    expect(searchIndexCandidates('original')).toEqual(new Set(['claude:a']))
+    expect(searchIndexCandidates('original')).toEqual(new Set([claudeKey('a')]))
 
     // Same session id, new content: what the daemon sees when a session is carried on.
     writeFileSync(first.path, `${turn('user', 'replacement wording')}\n`)
@@ -172,7 +179,7 @@ describe('refresh and query', () => {
     const changed: IndexableFile = { ...first, mtime_ms: st.mtimeMs, size_bytes: st.size }
     const r = await refreshSearchIndex([changed])
     expect(r.indexed).toBe(1)
-    expect(searchIndexCandidates('replacement')).toEqual(new Set(['claude:a']))
+    expect(searchIndexCandidates('replacement')).toEqual(new Set([claudeKey('a')]))
     expect(searchIndexCandidates('original')).toEqual(new Set()) // no stale ghost
   })
 
@@ -186,7 +193,7 @@ describe('refresh and query', () => {
     const a = session('a', [turn('user', 'first')])
     const b = session('b', [turn('user', 'second')])
     await refreshSearchIndex([a, b])
-    expect(searchIndexCandidates('second')).toEqual(new Set(['claude:b']))
+    expect(searchIndexCandidates('second')).toEqual(new Set([claudeKey('b')]))
 
     const r = await refreshSearchIndex([a]) // b is gone from the store
     expect(r.removed).toBe(1)
@@ -213,7 +220,7 @@ describe('refresh and query', () => {
     }
     const r = await refreshSearchIndex([good, missing])
     expect(r.indexed).toBe(1)
-    expect(searchIndexCandidates('readable')).toEqual(new Set(['claude:a']))
+    expect(searchIndexCandidates('readable')).toEqual(new Set([claudeKey('a')]))
   })
 
   test('a budget stops a pass part-way and reports the backlog, newest first', async () => {
@@ -246,7 +253,7 @@ describe('status and deletion', () => {
     expect(() => statSync(searchIndexPath())).toThrow()
 
     await refreshSearchIndex(files)
-    expect(searchIndexCandidates('rebuildable')).toEqual(new Set(['claude:a']))
+    expect(searchIndexCandidates('rebuildable')).toEqual(new Set([claudeKey('a')]))
   })
 
   test('an empty store gives an empty index, not an error', async () => {

@@ -12,6 +12,11 @@ export interface UpdateStatus {
   canApply: boolean;
   checkedAt: number;
   reason: string | null;
+  /** Installed version of each release-owned component, or null where an install predates version
+   *  stamping. OPTIONAL because only an app whose release ships sidecar components beside the
+   *  executable can populate it: the git-checkout engine has no such components, and a fabricated
+   *  entry there would be worse than an absent one. */
+  components?: Array<{ name: string; version: string | null }>;
 }
 
 export interface UpdateApplyResult {

@@ -27,7 +27,7 @@ import {
   OAUTH_CALLBACK_CAPABILITY,
   publicKeyFor,
 } from './relay.ts'
-import { startNamedTunnel, startTunnel, type TunnelHandle } from './tunnel.ts'
+import { type SpawnFn, startNamedTunnel, startTunnel, type TunnelHandle } from './tunnel.ts'
 
 export type OAuthCallbackStatus = 'ready' | 'pending' | 'retrying' | 'failed' | 'incompatible'
 
@@ -246,8 +246,16 @@ function writeStatusFile(port = DEFAULT_PORT): void {
   }
 }
 
-/** Open the tunnel for `port`. Returns null (and says why) when no tunnel may be opened. */
-export function startRemote(cfg: RemoteConfig, port: number): TunnelHandle | null {
+/**
+ * Open the tunnel for `port`. Returns null (and says why) when no tunnel may be opened.
+ * `spawnFn` is a test seam forwarded to the Quick Tunnel's `startTunnel` - see tunnel.ts's own
+ * `SpawnFn` doc for why it is a constructor argument rather than `mock.module`.
+ */
+export function startRemote(
+  cfg: RemoteConfig,
+  port: number,
+  spawnFn?: SpawnFn,
+): TunnelHandle | null {
   if (process.env.ORCH_NO_TUNNEL === '1') {
     state.tunnel = 'off'
     state.tunnelError = 'ORCH_NO_TUNNEL=1 - serving loopback only'
@@ -292,5 +300,5 @@ export function startRemote(cfg: RemoteConfig, port: number): TunnelHandle | nul
     return startNamedTunnel(named.token, named.hostname, onUrl, onError)
   }
   state.tunnel = 'quick'
-  return startTunnel(port, onUrl, onError)
+  return startTunnel(port, onUrl, onError, spawnFn)
 }
