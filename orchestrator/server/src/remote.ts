@@ -275,8 +275,13 @@ export function startRemote(cfg: RemoteConfig, port: number): TunnelHandle | nul
     })
   }
   const onError = (message: string): void => {
+    // Bump generation so an announce loop already in flight for the now-dead connector (started
+    // by an earlier onUrl) can't land its result afterwards and resurrect a ready/stableUrl state
+    // - see the `gen !== generation` guards in publishRemoteRoutes.
+    generation++
     state.tunnelError = message
     state.tunnelUrl = null
+    state.stableUrl = null
     state.oauthCallback = 'failed'
     writeStatusFile(port)
     console.error(`[orchestrator-remote] tunnel: ${message}`)

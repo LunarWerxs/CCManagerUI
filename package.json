@@ -22,7 +22,7 @@
     "mcp": "bun server/src/mcp.ts",
     "screenshots": "bun scripts/screenshots/capture.mjs",
     "check": "biome check . && bun run --cwd web check:i18n && bun run check:kit",
-    "check:kit": "node ../../lunarwerx-ui/sync.mjs --check --app agenthydra",
+    "check:kit": "node ../../lunarwerx-ui/sync.mjs --check --app agenthydra && node ../../lunarwerx-ui/sync.mjs --check --app orchestrator",
     "//check:local": "Checks that CANNOT run on GitHub, so localci runs them on the host instead. check:kit compares this app's kit-managed copies against lunarwerx-ui, a PRIVATE sibling repo a public repo's CI can never check out. Without this its only enforcement is the pre-commit hook, which --no-verify skips and which silently no-ops on any machine without the sibling checkout.",
     "check:local": "bun run check:kit",
     "lint": "biome check .",

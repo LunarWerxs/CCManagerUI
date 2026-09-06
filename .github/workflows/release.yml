@@ -230,6 +230,31 @@ jobs:
               ;;
           esac
 
+      # THE ORCHESTRATOR PAYLOAD (AH-27). An archive missing orchestrator/orch.py boots and
+      # serves fine — nothing in the boot+assert steps below ever imports it — so absence here
+      # would ship silently, exactly like the tray toolkit gap above. Runs for every smoke
+      # target (native and QEMU alike): this is a filesystem check on the unpacked archive, not
+      # a runtime boot, so it needs no emulation. Checked against orchestrator/orch.py's own
+      # assembly step (release.yml's "Compile + package" step): orch.py + scripts/ + docs/ are
+      # shipped; scripts/tests/, scripts/**/__pycache__ and state/ are deliberately never shipped.
+      - name: Assert orchestrator payload
+        shell: bash
+        run: |
+          cd "$BUNDLE_DIR"
+          missing() { echo "orchestrator payload is missing $1"; exit 1; }
+          unexpected() { echo "orchestrator payload unexpectedly contains $1"; exit 1; }
+          test -f orchestrator/orch.py || missing "orchestrator/orch.py"
+          test -f orchestrator/scripts/lib/hydralib.py || missing "orchestrator/scripts/lib/hydralib.py"
+          test -n "$(find orchestrator/scripts -maxdepth 1 -name '*.py' -print -quit)" \
+            || missing "any orchestrator/scripts/*.py tool"
+          if [ -d orchestrator/scripts/tests ]; then unexpected "orchestrator/scripts/tests/"; fi
+          pycache=$(find orchestrator -name __pycache__ -print -quit)
+          [ -n "$pycache" ] && unexpected "$pycache (compiled bytecode must never ship)"
+          if [ -d orchestrator/state ] && [ -n "$(find orchestrator/state -mindepth 1 -print -quit)" ]; then
+            unexpected "orchestrator/state/ (runtime state must never ship)"
+          fi
+          echo "orchestrator payload present, no runtime/test cruft"
+
       # The actual boot+assert, factored so native and QEMU paths run identical checks.
       - name: Boot + assert (native)
         if: '!matrix.qemu'

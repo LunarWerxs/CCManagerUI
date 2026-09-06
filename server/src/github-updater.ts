@@ -10,6 +10,9 @@
 // The binary swap is the delicate part, done defensively:
 //   1. Stage the download+extract INSIDE the install dir (so every rename is same-volume — a temp
 //      dir on another drive would make renameSync throw EXDEV mid-swap).
+//   1b. VERIFY the archive's SHA-256 against the release's SHA256SUMS.txt BEFORE extracting it or
+//      running anything out of it (verifyArchiveChecksum) — a version string is a compatibility
+//      canary, not an integrity check, and running the canary already executes the download.
 //   2. PROVE the new exe runs (`<new> --version` prints the expected version) BEFORE touching the
 //      live install — never swap in a binary that doesn't launch.
 //   3. Rename the running exe aside (allowed on Windows even while running; fine on POSIX) so it can
@@ -18,7 +21,7 @@
 // Leftover `*.old-*` artifacts are swept on the next boot (cleanupStaleUpdateArtifacts).
 
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import { basename, join } from 'node:path'
@@ -206,6 +209,76 @@ interface GhRelease {
   draft: boolean
   prerelease: boolean
   assets: GhAsset[]
+}
+
+/** The manifest release.yml publishes beside the archives (`sha256sum out/* > out/SHA256SUMS.txt`)
+ *  and install.ps1 already refuses to install without. */
+export const CHECKSUM_MANIFEST = 'SHA256SUMS.txt'
+
+/**
+ * `sha256sum` output -> basename -> lowercase hex. Tolerates the binary-mode `*` marker, CRLF, blank
+ * lines and paths with directories (the workflow hashes `out/<name>`); anything that is not
+ * `<64 hex> <path>` is skipped rather than guessed at.
+ */
+export function parseSha256Sums(text: string): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const raw of text.split(/\r?\n/)) {
+    const m = /^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$/.exec(raw)
+    if (!m) continue
+    const name = m[2]!.replace(/\\/g, '/').split('/').pop()
+    if (name) out.set(name, m[1]!.toLowerCase())
+  }
+  return out
+}
+
+/** SHA-256 of a file on disk, streamed (release archives are ~100 MB). */
+export async function sha256File(path: string): Promise<string> {
+  const hash = createHash('sha256')
+  for await (const chunk of Bun.file(path).stream()) hash.update(chunk)
+  return hash.digest('hex')
+}
+
+/**
+ * Does the downloaded archive match what the release's manifest says it should be? (audit AH-38)
+ *
+ * The updater used to establish that a download was genuine by RUNNING it (`<exe> --version`
+ * must print the expected version) - a compatibility canary, not an integrity check, and by the
+ * time it answered the downloaded program had already executed. This runs first, on the bytes,
+ * before extraction and before any candidate is launched. Missing manifest, missing entry and
+ * mismatch are all refusals: an unverifiable download is not installed.
+ *
+ * Boundary, stated plainly: the manifest is downloaded from the same release as the archive, so
+ * this proves the bytes are the ones the release published, not that the publisher is who you
+ * think - a compromised release account can sign its own manifest. Publisher identity needs a
+ * signature against a key shipped in this binary; that is not built.
+ */
+export async function verifyArchiveChecksum(
+  archivePath: string,
+  assetName: string,
+  manifestText: string,
+): Promise<{ ok: true; sha256: string } | { ok: false; reason: string }> {
+  const sums = parseSha256Sums(manifestText)
+  const expected = sums.get(assetName)
+  if (!expected)
+    return {
+      ok: false,
+      reason: `${CHECKSUM_MANIFEST} has no entry for ${assetName} (${sums.size} entr${sums.size === 1 ? 'y' : 'ies'} read) - refusing an unverifiable download`,
+    }
+  let actual: string
+  try {
+    actual = await sha256File(archivePath)
+  } catch (e) {
+    return {
+      ok: false,
+      reason: `could not hash the download: ${e instanceof Error ? e.message : String(e)}`,
+    }
+  }
+  if (actual !== expected)
+    return {
+      ok: false,
+      reason: `SHA-256 mismatch for ${assetName}: the release manifest says ${expected.slice(0, 12)}…, the download is ${actual.slice(0, 12)}… - refusing a download that is not what was published`,
+    }
+  return { ok: true, sha256: actual }
 }
 
 /** The compressed updater asset for THIS platform. A release may also expose a direct Windows
@@ -428,6 +501,8 @@ function fail(message: string): UpdateApplyResult {
  */
 async function downloadAndVerifyUpdate(
   asset: GhAsset,
+  /** The release's SHA256SUMS.txt asset. Verified against BEFORE anything is extracted or run. */
+  sums: GhAsset,
   remoteVersion: string,
   staging: string,
   bundledExeName: string,
@@ -438,18 +513,29 @@ async function downloadAndVerifyUpdate(
   mkdirSync(staging, { recursive: true }) // tar -C needs it to exist; Expand-Archive/Bun.write are fine either way
   const archivePath = join(staging, asset.name)
   const totalMb = Math.round(asset.size / 1048576)
+  const headers = { accept: 'application/octet-stream', 'user-agent': `${SERVICE_NAME}/${VERSION}` }
   output.push(`downloading ${asset.name} (${totalMb} MB)`)
   setUpdatePhase('downloading', `Downloading v${remoteVersion} (${totalMb} MB)…`)
-  const dl = await fetch(asset.browser_download_url, {
-    headers: { accept: 'application/octet-stream', 'user-agent': `${SERVICE_NAME}/${VERSION}` },
-    redirect: 'follow',
-  })
+  const dl = await fetch(asset.browser_download_url, { headers, redirect: 'follow' })
   if (!dl.ok) return fail(`download failed (HTTP ${dl.status})`)
   // Streamed rather than `Bun.write(path, response)` so the bytes can be COUNTED as they land.
   // This is the step the "it just sat there spinning" report was actually about: a ~100 MB
   // release over a normal connection is tens of seconds during which the old code emitted
   // nothing at all, and a slow download was indistinguishable from a dead one.
   await writeWithProgress(dl, archivePath, asset.size)
+
+  // Integrity BEFORE extraction and before any candidate runs (audit AH-38; see
+  // verifyArchiveChecksum for what this does and does not prove).
+  output.push(`verifying SHA-256 against ${CHECKSUM_MANIFEST}`)
+  setUpdatePhase('verifying', 'Checking the download against the release checksums…')
+  const sumsRes = await fetch(sums.browser_download_url, { headers, redirect: 'follow' })
+  if (!sumsRes.ok)
+    return fail(
+      `could not fetch ${CHECKSUM_MANIFEST} (HTTP ${sumsRes.status}) - refusing an unverifiable download`,
+    )
+  const verified = await verifyArchiveChecksum(archivePath, asset.name, await sumsRes.text())
+  if (!verified.ok) return fail(verified.reason)
+  output.push(`sha256 ok (${verified.sha256.slice(0, 12)}…)`)
 
   output.push('extracting')
   setUpdatePhase('extracting', 'Extracting the update…')
@@ -506,13 +592,24 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
   // The check above already marked the ping reported on success, so this second hit never
   // resends `new=1` — one "first ping" signal per install, no matter how many requests it takes.
   let asset: GhAsset | null = null
+  let sums: GhAsset | null = null
   try {
     const { res } = await fetchLatestRelease()
-    if (res.ok) asset = assetForThisPlatform(((await res.json()) as GhRelease).assets ?? [])
+    if (res.ok) {
+      const assets = ((await res.json()) as GhRelease).assets ?? []
+      asset = assetForThisPlatform(assets)
+      sums = assets.find((a) => a.name === CHECKSUM_MANIFEST) ?? null
+    }
   } catch {
     asset = null
   }
   if (!asset) return fail(`no ${currentTarget()} build attached to v${remoteVersion}`)
+  // Same rule install.ps1 applies: a release without its manifest cannot be verified, so it is not
+  // installed. Every release since the manifest step landed carries one.
+  if (!sums)
+    return fail(
+      `v${remoteVersion} published no ${CHECKSUM_MANIFEST}, so the download cannot be verified - refusing to update`,
+    )
 
   const exePath = process.execPath
   const exeName = basename(exePath)
@@ -528,6 +625,7 @@ export async function applyUpdate(): Promise<UpdateApplyResult> {
   try {
     const prepared = await downloadAndVerifyUpdate(
       asset,
+      sums,
       remoteVersion,
       staging,
       bundledExeName,

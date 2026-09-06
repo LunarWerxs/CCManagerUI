@@ -177,6 +177,23 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
   locked profile) dropped the registry record anyway and reported success, leaving the login on
   disk with no row to manage it from; the record now stays and the real error comes back.
 
+- **Updates are verified before they run, long scripts cannot exhaust the daemon, and a dead
+  tunnel says so** (audit AH-14/19/24/27/38/41, 2026-09-05). The compiled updater now checks a
+  downloaded archive against the release's published SHA-256 manifest before extracting it or
+  running anything out of it, and refuses a release that publishes no manifest; until now its
+  only gate was running the download to see if it printed the right version, which is a
+  compatibility check, not an integrity one. (What it proves: the bytes are the ones the release
+  published. What it does not: who published them; a signed manifest is still open.) The
+  orchestrator adapter bounds a script's output while reading it, keeping the last 200k
+  characters of each stream and counting what it let go, instead of holding a runaway script's
+  entire output in memory and trimming afterwards. The remote gateway now reports an outage when
+  its tunnel connector dies after it was ready, clears the advertised URL, and cannot be talked
+  back into "ready" by a late message from the dead connector. The local kit-drift check and the
+  pre-commit guard cover both vendored kit targets, not just the main web root. Release smoke
+  asserts the orchestrator payload is inside every archive and that test and runtime-state
+  directories are not. And the README screenshot fixture matches the session DTO again, with a
+  test that keeps it that way.
+
 - **Fleet actions land once and read the right store** (audit AH-04/05/06/33/34/36, 2026-09-05).
   Six more findings, each reproduced before it was closed. The Python toolbox now finds the daemon
   the way the MCP server does (explicit URL, explicit port, then the port the daemon ACTUALLY

@@ -20,6 +20,7 @@
 if command -v node >/dev/null 2>&1; then
   echo "› kit-sync guard…"
   node .githooks/check-kit-sync-staged.mjs agenthydra || exit 1
+  node .githooks/check-kit-sync-staged.mjs orchestrator || exit 1
 fi
 
 # Biome ships as a devDependency, so this runs the local copy and does not reach the network.

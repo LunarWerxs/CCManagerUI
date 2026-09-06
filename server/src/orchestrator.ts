@@ -69,7 +69,7 @@ const DRIVER_WORDS = new Set(['loop', 'arm', 'resume', 'pause', 'disarm', 'armed
 const inFlight = new Map<string, number>()
 /** Output kept per stream. The dry loop over a full fleet is a few thousand lines; a runaway is
  *  truncated from the FRONT so the verdict lines at the end survive. */
-const MAX_OUTPUT_CHARS = 200_000
+export const MAX_OUTPUT_CHARS = 200_000
 
 export interface OrchestratorInvocation {
   script: string
@@ -187,12 +187,15 @@ export interface OrchestratorStatus {
 }
 
 /** Bounded and newline-normalised: python on Windows emits CRLF into a pipe, and an agent reading
- *  the verdict lines should not have to strip carriage returns first. */
-function tail(raw: string): string {
+ *  the verdict lines should not have to strip carriage returns first. `alreadyDropped` is what the
+ *  spawn adapter discarded WHILE READING (see drainBounded); it is folded into the one truncation
+ *  header so the caller sees the whole loss, not just this final trim. */
+function tail(raw: string, alreadyDropped = 0): string {
   const text = raw.replace(/\r\n?/g, '\n')
-  return text.length > MAX_OUTPUT_CHARS
-    ? `…[truncated ${text.length - MAX_OUTPUT_CHARS} chars]\n${text.slice(-MAX_OUTPUT_CHARS)}`
-    : text
+  const extra = Math.max(0, text.length - MAX_OUTPUT_CHARS)
+  const dropped = alreadyDropped + extra
+  const kept = extra ? text.slice(-MAX_OUTPUT_CHARS) : text
+  return dropped > 0 ? `…[truncated ${dropped} chars]\n${kept}` : kept
 }
 
 /** One spawn, captured, with a deadline. Exposed for tests through `deps`; the real thing is
@@ -202,7 +205,63 @@ export interface SpawnDeps {
     command: string[],
     cwd: string,
     timeoutMs: number,
-  ) => Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }>
+  ) => Promise<{
+    code: number | null
+    stdout: string
+    stderr: string
+    timedOut: boolean
+    /** Characters the adapter discarded from the FRONT of each stream while reading, when the
+     *  child said more than MAX_OUTPUT_CHARS. A fake spawn may leave these out. */
+    stdoutDropped?: number
+    stderrDropped?: number
+  }>
+}
+
+/**
+ * Read a child's stream to its end while keeping at most `cap` characters of it - the LAST
+ * `cap`, so the verdict lines survive - and counting what was let go (audit AH-14).
+ *
+ * Before this the adapter did `new Response(stream).text()` and applied the cap afterwards, so a
+ * verbose or runaway script (a dry loop over a big fleet prints thousands of lines; a stuck one
+ * can print forever until its deadline) had the daemon hold the ENTIRE output in memory first
+ * and only then keep 200k of it. The cap now applies as the bytes arrive. Both streams are
+ * drained concurrently by the caller so the child can never block on a full pipe.
+ */
+export async function drainBounded(
+  stream: ReadableStream<Uint8Array> | null | undefined,
+  cap = MAX_OUTPUT_CHARS,
+): Promise<{ text: string; dropped: number }> {
+  if (!stream) return { text: '', dropped: 0 }
+  const decoder = new TextDecoder('utf-8')
+  const reader = stream.getReader()
+  let text = ''
+  let dropped = 0
+  const trim = () => {
+    if (text.length > cap) {
+      dropped += text.length - cap
+      text = text.slice(-cap)
+    }
+  }
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      text += decoder.decode(value, { stream: true })
+      trim()
+    }
+    text += decoder.decode()
+    trim()
+  } catch {
+    // A read error (the child was killed mid-write, the pipe closed under us): what arrived is
+    // still the honest answer, and the exit code says the rest.
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // already released
+    }
+  }
+  return { text, dropped }
 }
 
 /** Kill the WHOLE tree, not just python. An acting script blocks on its actuator (a powershell
@@ -276,13 +335,29 @@ async function realSpawn(command: string[], cwd: string, timeoutMs: number) {
     timedOut = true
     killTree(proc)
   }, timeoutMs)
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  clearTimeout(killer)
-  return { code, stdout, stderr, timedOut }
+  try {
+    // Both streams drained together, bounded as they arrive (drainBounded): a child that fills one
+    // pipe while the other is unread would otherwise deadlock, and one that never stops talking
+    // would otherwise be held whole in memory until its deadline.
+    const [out, err, code] = await Promise.all([
+      drainBounded(proc.stdout),
+      drainBounded(proc.stderr),
+      proc.exited,
+    ])
+    return {
+      code,
+      stdout: out.text,
+      stderr: err.text,
+      timedOut,
+      stdoutDropped: out.dropped,
+      stderrDropped: err.dropped,
+    }
+  } finally {
+    // Whatever happened above (a drain that threw, a rejected exit), the deadline timer must not
+    // fire on a run that is already over, and a child still alive must not outlive its adapter.
+    clearTimeout(killer)
+    if (proc.exitCode === null && !proc.killed) killTree(proc)
+  }
 }
 
 /** Run one script by its menu name. The driver's cwd is the toolbox root, exactly as a person
@@ -325,8 +400,8 @@ export async function runOrchestrator(
       exitMeaning: exitMeaning(script, r.code),
       timedOut: r.timedOut,
       durationMs: Date.now() - started,
-      stdout: tail(r.stdout),
-      stderr: tail(r.stderr),
+      stdout: tail(r.stdout, r.stdoutDropped ?? 0),
+      stderr: tail(r.stderr, r.stderrDropped ?? 0),
     }
   } catch (e) {
     return {

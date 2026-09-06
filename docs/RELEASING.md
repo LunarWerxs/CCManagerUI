@@ -108,11 +108,17 @@ buys nothing a dispatch doesn't already give you.
 
 Pushing a tag matching `v*.*.*` triggers `.github/workflows/release.yml`. It builds one
 self-contained executable for every supported OS (Windows x64, Linux x64/arm64, macOS x64/arm64),
-boots every platform bundle, verifies the health endpoint and an embedded frontend asset, then
-publishes the GitHub Release automatically from the matching changelog section. Windows exposes a
-direct icon-bearing GUI executable for people plus a one-executable ZIP for the updater; Unix
-targets expose one-executable archives. `SHA256SUMS.txt` covers every asset. `workflow_dispatch`
-runs the same build and smoke matrix without publishing a release.
+boots every platform bundle **except darwin-x64**, verifies the health endpoint and an embedded
+frontend asset, then publishes the GitHub Release automatically from the matching changelog
+section. Windows exposes a direct icon-bearing GUI executable for people plus a one-executable ZIP
+for the updater; Unix targets expose one-executable archives. `SHA256SUMS.txt` covers every asset.
+`workflow_dispatch` runs the same build and smoke matrix without publishing a release.
+
+**darwin-x64 (Intel mac) is build-only.** GitHub retired its Intel macOS runners, so the smoke job
+has no honest way to boot that target: it is compiled and archived like every other target, but
+never booted, and every other smoke assertion (tray inventory, orchestrator inventory,
+`/api/health`) skips it too. This is a documented, deliberate gap until a native or self-hosted
+Intel-mac runner exists, not a silent one.
 
 ## The orchestrator rides in the bundle (since 2026-09-03)
 
@@ -125,3 +131,12 @@ checkout's business. Python 3 is the user's own; the daemon does not bundle it, 
 `GET /api/orchestrator` reports whether it answers. `misc/Rebuild.bat` is unaffected: it rebuilds
 the daemon's own SPA, and the orchestrator's web dashboard is built separately with
 `bun run --cwd orchestrator remote:build`.
+
+**The smoke job asserts this inventory (AH-27), on every booted target.** Before boot, an "Assert
+orchestrator payload" step unpacks the archive and checks: `orchestrator/orch.py` and
+`orchestrator/scripts/lib/hydralib.py` are present, at least one `orchestrator/scripts/*.py` tool
+exists, and none of `orchestrator/scripts/tests/`, any `__pycache__/` under `orchestrator/`, or a
+non-empty `orchestrator/state/` made it into the archive. Without this, an archive that silently
+lost `orchestrator/` would still pass every other smoke check (boot, `/api/health`, the SPA);
+the daemon reports the tools unavailable rather than failing to start, so nothing else here would
+ever notice.

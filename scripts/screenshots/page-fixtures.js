@@ -55,6 +55,9 @@
   ].map(([title, p, branch, count, mins, instance, source], i) => ({
     session_id: `s${i}0000000-0000-4000-8000-00000000000${i}`,
     source,
+    // The reader (source) and the product that wrote it (tool) coincide 1:1 for every fixture row
+    // — none of these are a fork sharing another product's format — so the same string covers both.
+    tool: source === 'claude' ? 'claude-code' : source,
     title,
     cwd: proj(p),
     project: projKey(p),
@@ -77,6 +80,19 @@
     // automation case and the ordinary one. Real dispatched-ness comes from a queue row (see
     // server/src/sessions.ts); here it is simply stated.
     dispatched: i === 3 || i === 6,
+    // Only OpenCode reports subagent counts (server/src/sessions.ts collapseSubagents); none of
+    // these rows stand for a fan-out, so zero is the honest value everywhere.
+    subagent_count: 0,
+    // None of these threads hit a rate-limit wall — a fabricated badge here would photograph a
+    // state the sample data never earned.
+    limit_stop: null,
+    // Every row's title reads as a deliberately-set label in the screenshot, not an inferred one —
+    // 'custom' is the source that means exactly that (see TitleSource in server/src/types.ts).
+    title_source: 'custom',
+    title_tag: null, // only used for title_source: 'envelope', which none of these rows are.
+    copy_index: 1,
+    copy_count: 1, // ordinary case: one transcript file per conversation, no interrupt/resume split.
+    ended_because: null, // Claude-only marker for a superseded copy; none of these are superseded.
   }))
   /** The queue only ever holds `claude` runs, so its rows may only point at Claude sessions. */
   const claudeSessions = sessions.filter((s) => s.source === 'claude')
@@ -599,9 +615,26 @@
 
   window.__fixtureEscapes = []
 
+  // Mirrors server/src/headless-policy.ts: headlessRunsAllowed() is permanently false, so a real
+  // queue-create is always refused with this exact shape (see server/src/routes/queue.ts ~line
+  // 169). A fixture that answered 200 here would photograph a write the backend can never perform.
+  // Text duplicated rather than imported — this file is evaluated as a browser string, not a
+  // module — so if the owner-law message in headless-policy.ts ever changes, update it here too.
+  const NO_HEADLESS_REASON =
+    'no-headless: AgentHydra does not run chats you cannot see (owner law, 2026-08-27, restated ' +
+    '2026-08-31 - there is no setting for this). Continue this thread in its desktop app, or land ' +
+    'it in one via import. Nothing was run.'
+
   const realFetch = window.fetch.bind(window)
   window.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input?.url || ''
+    const method = (init?.method || 'GET').toUpperCase()
+    if (method === 'POST' && /\/api\/queue\/?($|\?)/.test(url)) {
+      return new Response(JSON.stringify({ error: NO_HEADLESS_REASON }), {
+        status: 409,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
     if (url.includes('/api/')) {
       for (const [pattern, build] of routes) {
         if (pattern.test(url)) {

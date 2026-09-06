@@ -12,6 +12,15 @@
  */
 import { type ChildProcess, spawn } from 'node:child_process'
 
+/**
+ * Injection point for tests: a fake child (EventEmitter-based, matching just the surface below)
+ * stands in for the real cloudflared process. Deliberately NOT `mock.module('node:child_process')`
+ * - that mock is global for the whole `bun test` run and leaks into every other file loaded beside
+ * this one (switch.ts/switch.test.ts also spawn real children), as already burned once on
+ * desktop-install.test.ts (see tests/monitor.test.ts). Defaults to the real `spawn`.
+ */
+export type SpawnFn = typeof spawn
+
 const URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i
 export const TUNNEL_READY_RE = /registered tunnel connection|connection [0-9a-f-]{6,} registered/i
 
@@ -41,10 +50,11 @@ function spawnCloudflared(
   onUrl: (url: string) => void,
   onError: (message: string) => void,
   extraEnv?: Record<string, string>,
+  spawnFn: SpawnFn = spawn,
 ): TunnelHandle {
   let proc: ChildProcess
   try {
-    proc = spawn(cloudflaredExecutable(), args, {
+    proc = spawnFn(cloudflaredExecutable(), args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       // The connector token goes in the ENVIRONMENT, never in `args` - see startNamedTunnel.
@@ -57,8 +67,15 @@ function spawnCloudflared(
     return { stop() {} }
   }
   let found = false
+  // Set by stop() BEFORE the kill signal goes out, so the exit handler below can tell a
+  // deliberate shutdown from the connector dying on its own. `dead` closes the window for good
+  // once the child is gone: it blocks a late/racing stdout chunk from calling onUrl after exit
+  // (Node's 'exit' can fire before buffered stdio finishes draining) and makes error/exit
+  // mutually exclusive, so a connector that already reported one outage can't report a second.
+  let stopping = false
+  let dead = false
   const scan = (buf: Buffer): void => {
-    if (found) return
+    if (found || dead) return
     const url = detect(buf.toString())
     if (url) {
       found = true
@@ -67,12 +84,28 @@ function spawnCloudflared(
   }
   proc.stdout?.on('data', scan)
   proc.stderr?.on('data', scan)
-  proc.on('error', (err) => onError(launchFailure(err)))
+  proc.on('error', (err) => {
+    if (dead) return
+    dead = true
+    onError(launchFailure(err))
+  })
   proc.on('exit', (code) => {
-    if (!found) onError(`cloudflared exited (code ${code}) before the tunnel was ready`)
+    if (dead) return
+    dead = true
+    if (stopping) return // asked to stop - not an outage, nothing to report
+    if (!found) {
+      onError(`cloudflared exited (code ${code}) before the tunnel was ready`)
+    } else {
+      // Was ready, then died on its own: the connector is gone but nothing cleared the URL it
+      // published. This is the outage remote.ts and the status pill need to hear about.
+      onError(
+        `cloudflared exited unexpectedly (code ${code}) after the tunnel was ready - remote access is down`,
+      )
+    }
   })
   return {
     stop() {
+      stopping = true
       try {
         proc.kill()
       } catch {
@@ -87,12 +120,15 @@ export function startTunnel(
   port: number,
   onUrl: (url: string) => void,
   onError: (message: string) => void,
+  spawnFn?: SpawnFn,
 ): TunnelHandle {
   return spawnCloudflared(
     ['tunnel', '--no-autoupdate', '--url', `http://127.0.0.1:${port}`],
     (chunk) => URL_RE.exec(chunk)?.[0] ?? null,
     onUrl,
     onError,
+    undefined,
+    spawnFn,
   )
 }
 
