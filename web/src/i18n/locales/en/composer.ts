@@ -46,4 +46,6 @@ export default {
     'ChatGPT opened and context downloaded. The task is included in the file.',
   chatGptAttachHint: 'Attach the downloaded context file. It contains {files} source files.',
   chatGptHandoffFailed: 'Failed to prepare the ChatGPT handoff.',
+  // AH-26: fallback only — the server's own error string is preferred when present.
+  sendFailedFallback: 'Failed to send.',
 }

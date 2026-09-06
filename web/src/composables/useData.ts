@@ -1,5 +1,5 @@
 import { useStorage } from '@vueuse/core'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import type {
   Account,
   ArchivedScope,
@@ -78,13 +78,51 @@ registerSharedPref('agenthydra.sessions.shape', sessionShapeScope, SHAPE_SCOPES)
 registerSharedPref('agenthydra.sessions.rateLimited', sessionRateLimitScope, RATE_LIMIT_SCOPES)
 // true once the first queue fetch has settled — gates the queue's first-load skeletons
 const queueLoaded = ref(false)
-const lastError = ref<string | null>(null)
 
-function guard<T>(p: Promise<T>): Promise<T | undefined> {
-  return p.catch((e) => {
-    lastError.value = e instanceof Error ? e.message : String(e)
-    return undefined
-  })
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+// Per-resource poll status (AH-20). Each resource owns its OWN loading/error/lastSuccessAt so one
+// endpoint's outage can never contaminate another's — the single shared `lastError` this replaces
+// looked plausible right up until you noticed nothing ever read it, and a queue failure and a
+// sessions failure were indistinguishable inside it anyway.
+//
+// `stale`: the latest fetch failed but an EARLIER one already succeeded — keep showing what we
+// have, just label it stale, rather than blanking a screen that still has good (if aging) data.
+// `unavailable`: the FIRST fetch ever failed — there is nothing to show, so a consumer should
+// render an "unavailable: <reason>" state with Retry instead of its normal empty-state CTA, which
+// would otherwise read as "you have zero of these" rather than "we couldn't ask".
+function resourceStatus() {
+  const loading = ref(false)
+  const error = ref<string | null>(null)
+  const lastSuccessAt = ref<number | null>(null)
+  const stale = computed(() => error.value !== null && lastSuccessAt.value !== null)
+  const unavailable = computed(() => error.value !== null && lastSuccessAt.value === null)
+  return { loading, error, lastSuccessAt, stale, unavailable }
+}
+type ResourceStatus = ReturnType<typeof resourceStatus>
+
+const sessionsStatus = resourceStatus()
+const queueStatus = resourceStatus()
+const schedulerStatus = resourceStatus()
+const incidentsStatus = resourceStatus()
+const accountsStatus = resourceStatus()
+
+/** Runs `p`, recording success/failure onto `status` and never throwing — but unlike the old
+ *  shared `guard()`, only ever touches the ONE status object it was handed. */
+function guard<T>(p: Promise<T>, status: ResourceStatus): Promise<T | undefined> {
+  return p.then(
+    (v) => {
+      status.error.value = null
+      status.lastSuccessAt.value = Date.now()
+      return v
+    },
+    (e) => {
+      status.error.value = errorMessage(e)
+      return undefined
+    },
+  )
 }
 
 // A slow store can make /api/sessions take longer than the interval that asks for it. Without a
@@ -106,6 +144,7 @@ async function refreshSessions() {
   }
   sessionsInFlight = true
   sessionsLoading.value = true
+  sessionsStatus.loading.value = true
   // try/finally, because guard() only catches a REJECTED promise. If api.getSessions throws
   // synchronously — a bad filter value, a URL that fails to build — it never returns a promise for
   // guard to attach to, so the throw escapes past every line below and the flag stays true for the
@@ -122,10 +161,14 @@ async function refreshSessions() {
         sessionDispatchedScope.value,
         sessionRateLimitScope.value,
       ),
+      sessionsStatus,
     )
+    // A rejected fetch must not touch the sessions the list is already showing — the old data
+    // stays on screen (sessionsStatus.stale says so) rather than being blanked by an outage.
     if (r) sessions.value = r
   } finally {
     sessionsLoading.value = false
+    sessionsStatus.loading.value = false
     sessionsInFlight = false
   }
   if (sessionsRefreshQueued) {
@@ -133,21 +176,42 @@ async function refreshSessions() {
     await refreshSessions()
   }
 }
+// Same hazard as the sessions coalescer above, but the shape that fits is simpler: queue and
+// scheduler refreshes take no filter, so there is nothing to re-run with fresher inputs — the only
+// thing that can go wrong is a slow OLDER request landing after a faster NEWER one and overwriting
+// it. A generation counter is enough: only the response belonging to the most recently ISSUED call
+// may be applied. This is not "last to resolve wins", it is "last to be asked for wins" — an old
+// request that resolves last is still discarded, which is what stops a slow poll from resurrecting
+// a row a post-mutation refresh had already dropped.
+let queueGeneration = 0
 async function refreshQueue() {
-  const r = await guard(api.getQueue())
+  const gen = ++queueGeneration
+  queueStatus.loading.value = true
+  const r = await guard(api.getQueue(), queueStatus)
+  if (gen !== queueGeneration) return
+  queueStatus.loading.value = false
+  // Same rule as sessions: a failed poll leaves the last-known queue on screen (marked stale via
+  // queueStatus.stale) instead of wiping it, and `queueLoaded` still flips once the FIRST attempt
+  // has settled either way, so a first-load failure falls through to queueStatus.unavailable
+  // rather than being read as "queue is empty".
   if (r) queue.value = r
   queueLoaded.value = true
 }
 async function refreshIncidents() {
-  const r = await guard(api.getIncidents())
+  const r = await guard(api.getIncidents(), incidentsStatus)
   if (r) incidents.value = r
 }
 async function refreshAccounts() {
-  const r = await guard(api.getAccounts())
+  const r = await guard(api.getAccounts(), accountsStatus)
   if (r) accounts.value = r
 }
+let schedulerGeneration = 0
 async function refreshScheduler() {
-  const r = await guard(api.getScheduler())
+  const gen = ++schedulerGeneration
+  schedulerStatus.loading.value = true
+  const r = await guard(api.getScheduler(), schedulerStatus)
+  if (gen !== schedulerGeneration) return
+  schedulerStatus.loading.value = false
   if (r) scheduler.value = r
 }
 
@@ -197,7 +261,11 @@ export function useData() {
     sessionRateLimitScope,
     sessionShapeScope,
     queueLoaded,
-    lastError,
+    sessionsStatus,
+    queueStatus,
+    schedulerStatus,
+    incidentsStatus,
+    accountsStatus,
     refreshSessions,
     refreshQueue,
     refreshIncidents,

@@ -112,6 +112,7 @@ import IconTooltip from '@/shell/IconTooltip.vue'
 const {
   sessions,
   sessionsLoading,
+  sessionsStatus,
   refreshSessions,
   queue,
   sessionInstanceFilter,
@@ -844,6 +845,24 @@ function onComposerSent(mode: 'now' | 'queued') {
             </button>
           </template>
 
+          <!-- AH-20: the FIRST session fetch failing is not the same fact as a genuinely empty
+               list — show why, with a Retry, rather than the plain "no sessions" copy that would
+               read as an empty account instead of an outage. -->
+          <div
+            v-else-if="filtered.length === 0 && sessionsStatus.unavailable"
+            class="p-4 text-center text-xs text-muted-foreground"
+          >
+            <CircleAlert class="mx-auto mb-1.5 size-5 text-warning" />
+            <p>{{ $t('sessions.unavailable', { reason: sessionsStatus.error }) }}</p>
+            <button
+              type="button"
+              class="mt-1.5 font-medium text-primary hover:underline"
+              @click="refreshSessions"
+            >
+              {{ $t('sessions.retry') }}
+            </button>
+          </div>
+
           <div v-else-if="filtered.length === 0" class="p-4 text-center text-xs text-muted-foreground">
             <p>{{ $t('sessions.noSessionsFound') }}</p>
             <!-- the window is the most likely reason, and it is invisible until you open the ⋯
@@ -857,6 +876,15 @@ function onComposerSent(mode: 'now' | 'queued') {
               {{ $t('sessions.periodEmptyHint', { period: periodLabel }) }}
             </button>
           </div>
+
+          <!-- a LATER poll failing must not blank a list that already has good (if aging) data —
+               it stays on screen, just labelled stale. Non-modal: a state of the list, not a toast. -->
+          <p
+            v-if="sessionsStatus.stale"
+            class="mb-1.5 rounded-md border border-warning/30 bg-warning/10 px-2 py-1 text-[11px] text-warning"
+          >
+            {{ $t('sessions.staleHint', { reason: sessionsStatus.error }) }}
+          </p>
 
           <template v-if="!bodySearchActive">
             <!-- Each row owns a ContextMenu so right-click acts on the row under the pointer without

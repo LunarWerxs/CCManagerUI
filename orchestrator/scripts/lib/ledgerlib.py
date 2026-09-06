@@ -69,17 +69,26 @@ def locked(name: str):
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
             break
-        except FileExistsError:
-            try:
-                if time.time() - path.stat().st_mtime > LOCK_STALE_SECS:
-                    path.unlink()  # a crashed writer's leftovers - break it and retry
-                    continue
-            except OSError:
-                pass  # it vanished between the check and the stat: just retry
+        except (FileExistsError, PermissionError) as err:
+            # PermissionError IS contention here, not a permissions problem (measured 2026-09-05:
+            # 42 of 1,800 contended acquisitions across 6 threads raised errno 13 on Windows, and
+            # every one of them was a crash where a wait was owed). On Windows a deleted file's
+            # NAME lingers, pending-delete, until the previous holder's handle closes, and an
+            # O_EXCL create landing in that window answers ACCESS_DENIED rather than EEXIST. A
+            # state dir that genuinely cannot be written fails the mkdir above, or fails here
+            # every time until the deadline, where the error is named.
+            if isinstance(err, FileExistsError):
+                try:
+                    if time.time() - path.stat().st_mtime > LOCK_STALE_SECS:
+                        path.unlink()  # a crashed writer's leftovers - break it and retry
+                        continue
+                except OSError:
+                    pass  # it vanished between the check and the stat: just retry
             if time.time() > deadline:
                 raise TimeoutError(
-                    f"could not take the '{name}' state lock within {LOCK_WAIT_SECS}s - "
-                    "another writer is wedged; investigate rather than clobbering"
+                    f"could not take the '{name}' state lock within {LOCK_WAIT_SECS}s "
+                    f"(last answer: {type(err).__name__}) - another writer is wedged; "
+                    "investigate rather than clobbering"
                 ) from None
             time.sleep(0.01)
     try:
@@ -107,15 +116,22 @@ def try_locked(name: str, stale_secs: int = LOCK_STALE_SECS):
     path = _state_dir() / f".lock-{name}"
     path.parent.mkdir(parents=True, exist_ok=True)
     held = False
-    for _attempt in (1, 2):
+    # A handful of attempts, not two: on Windows the previous holder's unlink leaves the name
+    # pending-delete for a few microseconds, during which the O_EXCL create answers
+    # PermissionError (see locked()). That is "wait a tick", not "someone holds it", so it gets a
+    # few short retries before this reports not-ours; a real holder still answers EEXIST at once.
+    for attempt in range(6):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
             held = True
             break
+        except PermissionError:
+            time.sleep(0.005)
+            continue
         except FileExistsError:
             try:
-                if _attempt == 1 and time.time() - path.stat().st_mtime > stale_secs:
+                if attempt == 0 and time.time() - path.stat().st_mtime > stale_secs:
                     path.unlink()
                     continue
             except OSError:

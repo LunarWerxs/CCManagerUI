@@ -33,9 +33,17 @@ import shutil
 import sys
 from pathlib import Path
 
-from lib import clilib, hydralib
+from lib import clilib, hydralib, ledgerlib
 
 CONFIG = Path(os.environ.get("CLAUDE_CONFIG_PATH") or (Path.home() / ".claude.json"))
+
+RETRY_ATTEMPTS = 3
+
+
+class ExternalWriteError(RuntimeError):
+    """CONFIG kept changing under us - a writer outside this toolbox's own lock (the desktop
+    app rewrites this same file) touched it between our read and our replace. Raised instead
+    of clobbering that other write."""
 
 
 def _norm(p: str) -> str:
@@ -49,7 +57,18 @@ def load() -> dict:
     return json.loads(CONFIG.read_text(encoding="utf-8"))
 
 
-def save(cfg: dict) -> None:
+def _filestat(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size) snapshot - cheap enough to take on every read, and it is what lets
+    save() notice a writer that took none of our locks (the desktop app rewrites this exact
+    file on its own schedule)."""
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def save(cfg: dict, expect_stat: tuple[int, int] | None = None) -> None:
     """Atomic, with a one-generation backup. This file holds every project's MCP wiring and
     history - a truncated write would be a bad day, so never write it in place.
 
@@ -59,13 +78,30 @@ def save(cfg: dict) -> None:
     and CONFIG is `~/.claude.json`, shared by every instance on the machine. Copying the
     backup (leaves the original in place on any OSError) before the single os.replace() means
     CONFIG exists at every step: before, mid-copy, and after the one rename that ever touches it.
+
+    The temp name is per-PID (AH-17): a fixed `.trust.tmp` let two concurrent writers
+    interleave their bytes into the same temp file, corrupting it for whichever one replaced
+    CONFIG last. `expect_stat`, when given, is re-checked against CONFIG's live stat
+    IMMEDIATELY before the replace - if it no longer matches, something wrote CONFIG after we
+    read it (an external, non-cooperating writer; our own callers serialize via
+    ledgerlib.locked and never race each other here), and we raise ExternalWriteError instead
+    of overwriting that write with a now-stale merge.
     """
-    tmp = CONFIG.with_name(f"{CONFIG.name}.trust.tmp")
+    tmp = CONFIG.with_name(f"{CONFIG.name}.{os.getpid()}.trust.tmp")
     tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     try:
         shutil.copy2(CONFIG, CONFIG.with_name(f"{CONFIG.name}.bak-trust"))
     except OSError:
         pass
+    if expect_stat is not None and _filestat(CONFIG) != expect_stat:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise ExternalWriteError(
+            f"{CONFIG} changed since it was read (another writer touched it) - "
+            "refusing to overwrite; re-run to retry against the current file"
+        )
     os.replace(tmp, CONFIG)
 
 
@@ -84,8 +120,9 @@ def workspaces_in_use() -> set[str]:
     return out
 
 
-def apply_trust(paths: list[str], act: bool) -> dict:
-    cfg = load()
+def _compute_trust(cfg: dict, paths: list[str], act: bool) -> dict:
+    """The merge, isolated from I/O so apply_trust() can re-run it against a freshly re-read
+    cfg when an external writer beat us to CONFIG. Mutates cfg in place when act is True."""
     projects = cfg.setdefault("projects", {})
     by_norm = {_norm(k): k for k in projects}
     changed, already = [], []
@@ -114,9 +151,46 @@ def apply_trust(paths: list[str], act: bool) -> dict:
             # on first use; the only field that matters here is the trust flag itself.
             projects.setdefault(key, {})["hasTrustDialogAccepted"] = True
         changed.append(key)
-    if act and changed:
-        save(cfg)
-    return {"trusted": changed, "alreadyTrusted": already, "applied": bool(act and changed)}
+    return {"trusted": changed, "alreadyTrusted": already, "applied": False,
+            "_changed": bool(changed)}
+
+
+def apply_trust(paths: list[str], act: bool) -> dict:
+    """Reload/merge/replace CONFIG for the given paths.
+
+    AH-17: two independent trust invocations (a spawn and a migrate, say) used to
+    read-modify-write the whole file with no coordination and a fixed temp-file name, so the
+    loser's project addition could vanish or the two writers could collide mid-write. Writes
+    now serialize on ledgerlib's cross-process lock (same primitive the attempt ledger uses),
+    write through a pid-unique temp file, and re-check CONFIG's stat immediately before the
+    replace so a non-cooperating external writer (the desktop app) is detected and the merge
+    is retried against its update rather than clobbered - bounded, then refused loudly."""
+    if not act:
+        result = _compute_trust(load(), paths, act=False)
+        result.pop("_changed", None)
+        return result
+
+    with ledgerlib.locked("trust-workspace"):
+        cfg = load()
+        stat_before = _filestat(CONFIG)
+        last_err: ExternalWriteError | None = None
+        for attempt in range(RETRY_ATTEMPTS):
+            result = _compute_trust(cfg, paths, act=True)
+            changed = result.pop("_changed")
+            if not changed:
+                result["applied"] = False
+                return result
+            try:
+                save(cfg, expect_stat=stat_before)
+                result["applied"] = True
+                return result
+            except ExternalWriteError as err:
+                last_err = err
+                if attempt == RETRY_ATTEMPTS - 1:
+                    break
+                cfg = load()
+                stat_before = _filestat(CONFIG)
+        raise last_err  # exhausted retries against a writer that never stopped changing CONFIG
 
 
 def main(argv: list[str]) -> int:
@@ -158,7 +232,11 @@ def main(argv: list[str]) -> int:
             return 3
         paths = [args[0]]
 
-    result = apply_trust(paths, act)
+    try:
+        result = apply_trust(paths, act)
+    except ExternalWriteError as err:
+        print(f"refusing to write: {err}", file=sys.stderr)
+        return 2
     if as_json:
         print(json.dumps(result, indent=2))
     else:

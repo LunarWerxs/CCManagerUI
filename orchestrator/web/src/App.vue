@@ -2,6 +2,7 @@
 import { LogOut, Moon, RefreshCw, Sun } from '@lucide/vue'
 import { useStorage } from '@vueuse/core'
 import { computed, onMounted, onUnmounted, watch } from 'vue'
+import { toast } from 'vue-sonner'
 import AccountsStrip from '@/components/AccountsStrip.vue'
 import ArmSwitch from '@/components/ArmSwitch.vue'
 import ChatsTable from '@/components/ChatsTable.vue'
@@ -116,15 +117,30 @@ const statusLine = computed(() => {
   return at
 })
 
-onMounted(async () => {
-  await gateway.loadAuth()
-  if (!gateway.needsSignIn.value) {
-    void gateway.loadStatus()
-    gateway.startPolling()
-    // The accounts strip is deliberately not awaited: the usage survey can take a minute.
-    void dash.loadAccounts()
-    await loadFor(view.value)
-  }
+async function afterAuthReady(): Promise<void> {
+  if (gateway.needsSignIn.value) return
+  void gateway.loadStatus()
+  gateway.startPolling()
+  // The accounts strip is deliberately not awaited: the usage survey can take a minute.
+  void dash.loadAccounts()
+  await loadFor(view.value)
+}
+
+// AH-23: connect() resolves exactly once per call - immediately on success, on an auth refusal,
+// or after its bounded auto-retry backoff gives up - whether that's the very first attempt at
+// mount or a later one kicked off by the Retry button. Either way this is the single place that
+// reacts to "we're in", so the poller/dash bootstrap above only ever runs once per real recovery.
+async function tryConnect(): Promise<void> {
+  const connected = await gateway.connect()
+  if (connected) await afterAuthReady()
+}
+
+function retryConnect(): void {
+  void tryConnect()
+}
+
+onMounted(() => {
+  void tryConnect()
 })
 onUnmounted(() => gateway.stopPolling())
 
@@ -135,14 +151,36 @@ watch(
     if (needs) gateway.stopPolling()
   },
 )
+
+// AH-26: signOut() catches its own rejection rather than pretending the sign-out worked - surface
+// it so the click doesn't just silently do nothing.
+watch(
+  () => gateway.signOutError.value,
+  (msg) => {
+    if (msg) toast.error('Sign-out failed', { description: msg })
+  },
+)
 </script>
 
 <template>
   <TooltipProvider :delay-duration="300">
     <Toaster position="bottom-right" :theme="isDark ? 'dark' : 'light'" close-button />
 
-    <div v-if="!ready" class="grid min-h-dvh place-items-center text-sm text-muted-foreground">
-      <span v-if="gateway.authError.value" class="text-destructive">gateway unreachable: {{ gateway.authError.value }}</span>
+    <div v-if="!ready" class="grid min-h-dvh place-items-center gap-3 px-6 text-center text-sm text-muted-foreground">
+      <template v-if="gateway.authRefused.value">
+        <p class="text-destructive">Sign-in was refused. This orchestrator needs a fresh sign-in, not a reconnect.</p>
+        <Button as-child size="sm" variant="outline">
+          <a href="/oauth/login">Sign in</a>
+        </Button>
+      </template>
+      <template v-else-if="gateway.authError.value">
+        <p class="text-destructive">gateway unreachable: {{ gateway.authError.value }}</p>
+        <p v-if="gateway.reconnecting.value" class="text-xs">retrying automatically…</p>
+        <Button size="sm" variant="outline" @click="retryConnect">
+          <RefreshCw />
+          Retry
+        </Button>
+      </template>
       <span v-else>connecting…</span>
     </div>
 

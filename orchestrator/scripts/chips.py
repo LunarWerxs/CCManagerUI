@@ -77,18 +77,27 @@ def _save_records(rows: list[dict]) -> None:
 
 
 def record(instance: str, chat_title: str, chip_title: str, description: str = "") -> None:
-    """Remember a chip another lane saw (the doctrine pass, after selecting a chat)."""
-    rows = [r for r in load_records()
-            if not (r.get("instance") == instance and r.get("chat") == chat_title)]
-    rows.append({"instance": instance, "chat": chat_title, "title": chip_title,
-                 "description": description, "seenAt": int(time.time() * 1000)})
-    _save_records(rows[-200:])
+    """Remember a chip another lane saw (the doctrine pass, after selecting a chat).
+
+    Load-filter-append-save happens under the "chips" state lock (audit AH-29, reproduced
+    2026-09-05): the doctrine lane's record() and the scheduled lane's forget() run under
+    different scheduler locks, so an unlocked read-modify-replace let each read the same
+    stale snapshot and one's write silently erase the other's - atomic replacement stopped
+    truncation but not this lost update."""
+    with ledgerlib.locked("chips"):
+        rows = [r for r in load_records()
+                if not (r.get("instance") == instance and r.get("chat") == chat_title)]
+        rows.append({"instance": instance, "chat": chat_title, "title": chip_title,
+                     "description": description, "seenAt": int(time.time() * 1000)})
+        _save_records(rows[-200:])
 
 
 def forget(instance: str, chat_title: str) -> None:
-    rows = [r for r in load_records()
-            if not (r.get("instance") == instance and r.get("chat") == chat_title)]
-    _save_records(rows)
+    """See record()'s note: the same lock guards this read-modify-replace."""
+    with ledgerlib.locked("chips"):
+        rows = [r for r in load_records()
+                if not (r.get("instance") == instance and r.get("chat") == chat_title)]
+        _save_records(rows)
 
 
 def _run(args: list[str], timeout: int = 90) -> tuple[int, str]:

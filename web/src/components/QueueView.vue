@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { ChevronDown, FastForward, ListPlus, Plus, Power, PowerOff, Trash2 } from '@lucide/vue'
+import {
+  ChevronDown,
+  CircleAlert,
+  FastForward,
+  ListPlus,
+  Plus,
+  Power,
+  PowerOff,
+  Trash2,
+} from '@lucide/vue'
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
@@ -19,7 +28,7 @@ import IconTooltip from '@/shell/IconTooltip.vue'
 import InfoHint from '@/shell/InfoHint.vue'
 
 const { t } = useI18n()
-const { queue, queueLoaded, accounts, scheduler, refreshQueue } = useData()
+const { queue, queueLoaded, queueStatus, accounts, scheduler, refreshQueue } = useData()
 const { openBuilder, openEditor } = useBuilder()
 const { openSettingsTab } = usePanels()
 // Run-as resolution mirrors QueueBuilder's accountOptions: an item pinned to a signed-in
@@ -118,11 +127,17 @@ async function runDue() {
   await refreshQueue()
 }
 
+/** AH-26: show the server's own error text when present — a bad cwd, a stale session id, a run
+ *  the daemon refused — rather than a fixed generic toast that never says why. */
+function actionErrorText(e: unknown, fallback: string): string {
+  return e instanceof Error && e.message ? e.message : fallback
+}
+
 async function run(item: QueueItem) {
   try {
     await api.runQueueItem(item.id)
-  } catch {
-    /* surfaced via polling */
+  } catch (e) {
+    toast.error(actionErrorText(e, t('queue.toastRunFailed')))
   }
   expanded.value = item.id
   await refreshQueue()
@@ -130,16 +145,16 @@ async function run(item: QueueItem) {
 async function cancel(item: QueueItem) {
   try {
     await api.cancelQueueItem(item.id)
-  } catch {
-    toast.error(t('queue.toastCancelFailed'))
+  } catch (e) {
+    toast.error(actionErrorText(e, t('queue.toastCancelFailed')))
   }
   await refreshQueue()
 }
 async function remove(item: QueueItem) {
   try {
     await api.deleteQueueItem(item.id)
-  } catch {
-    toast.error(t('queue.toastDeleteFailed'))
+  } catch (e) {
+    toast.error(actionErrorText(e, t('queue.toastDeleteFailed')))
   }
   await refreshQueue()
 }
@@ -238,6 +253,17 @@ async function clearFinished() {
     </div>
 
     <div class="min-h-0 flex-1 overflow-y-auto p-3">
+      <!-- AH-20: a rejected fetch is not the same fact as a queue with zero items — the empty-state
+           CTA below used to render identically for both, so an outage read as "you have no queued
+           work". Non-modal, not a toast: this is a state of the panel, not a one-off event. Shown
+           whenever there is OLDER data still on screen but the latest poll failed. -->
+      <p
+        v-if="queueStatus.stale"
+        class="mb-2 rounded-md border border-warning/30 bg-warning/10 px-2 py-1.5 text-[11px] text-warning"
+      >
+        {{ $t('queue.staleHint', { reason: queueStatus.error }) }}
+      </p>
+
       <!-- first-load skeletons so the queue never looks blank -->
       <template v-if="!queueLoaded && queue.length === 0">
         <div v-for="i in 3" :key="i" class="mb-2.5 rounded-xl border border-border bg-card p-3">
@@ -256,6 +282,17 @@ async function clearFinished() {
           </div>
         </div>
       </template>
+
+      <!-- the FIRST fetch failed and there is nothing to show — an error state with a Retry,
+           never the "queue a run" empty-state CTA, which would claim there is genuinely no work. -->
+      <div
+        v-else-if="queue.length === 0 && queueStatus.unavailable"
+        class="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground"
+      >
+        <CircleAlert class="size-8 text-warning opacity-70" />
+        <p>{{ $t('queue.unavailable', { reason: queueStatus.error }) }}</p>
+        <Button size="sm" variant="outline" @click="refreshQueue()">{{ $t('queue.retry') }}</Button>
+      </div>
 
       <div
         v-else-if="queue.length === 0"

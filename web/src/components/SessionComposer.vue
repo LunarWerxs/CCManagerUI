@@ -193,19 +193,26 @@ function createFor(target: ComposerTarget, notBefore: string | null) {
   })
 }
 
+/** AH-26: show the server's real reason a send failed (bad cwd, stale session, a run the daemon
+ *  refused) instead of reducing every failure to a bare count — the count alone gave no way to
+ *  tell what to fix, and made a genuinely broken send look identical to a transient one. */
+function actionErrorText(e: unknown): string {
+  return e instanceof Error && e.message ? e.message : t('composer.sendFailedFallback')
+}
+
 async function submit(mode: 'now' | 'queue', notBefore: string | null = null) {
   if (!canSend.value) return
   sending.value = true
   let started = 0
   let queued = 0
-  let failed = 0
+  const failures: string[] = []
   try {
     for (const target of props.targets) {
       let item: api.QueueItem
       try {
         item = await createFor(target, notBefore)
-      } catch {
-        failed++
+      } catch (e) {
+        failures.push(actionErrorText(e))
         continue
       }
       if (mode === 'now' && !runningIds.value.has(target.session_id)) {
@@ -225,7 +232,16 @@ async function submit(mode: 'now' | 'queue', notBefore: string | null = null) {
     sending.value = false
   }
   await refreshQueue()
-  if (failed) toast.error(t('composer.toastFailed', { n: failed }))
+  if (failures.length) {
+    // One failure: the real error text IS the actionable message. Several: lead with the first
+    // real reason and still say how many others failed, rather than a bare count on its own.
+    toast.error(
+      failures.length === 1 ? failures[0] : t('composer.toastFailed', { n: failures.length }),
+      failures.length > 1 ? { description: failures[0] } : undefined,
+    )
+  }
+  // Not confirmed (nothing started or queued): leave the prompt exactly as the user left it —
+  // clearing it here would lose their message on a total failure.
   if (!started && !queued) return
 
   text.value = ''

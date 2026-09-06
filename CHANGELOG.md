@@ -177,6 +177,48 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
   locked profile) dropped the registry record anyway and reported success, leaving the login on
   disk with no row to manage it from; the record now stays and the real error comes back.
 
+- **Shared journals no longer lose each other's writes, stale UI responses are discarded, and the
+  queue API cannot forge history** (audit AH-13/17/18/21/22/29/31/37, 2026-09-05). Four journals
+  the toolbox's lanes share - the workspace trust file, the chip handoff list, the standing
+  manager's role claim, and every chat's metadata record - were each read whole, changed, and
+  replaced with no lock between lanes, so the last writer silently discarded the other's change
+  (reproduced for chips: a newly seen chip vanished and a dismissed one came back). Each now
+  holds a named lock around read-modify-replace and re-checks the file's revision right before
+  the replace; a record the desktop app rewrote underneath is re-read and re-applied, and one that
+  keeps changing is left alone with an error rather than overwritten from a stale copy. In the
+  browser, queue and scheduler refreshes and the transcript tail carry request generations, so an
+  old slow response can no longer resurrect a deleted row or paint the previous filter's
+  transcript under new controls; the remote app's "refresh every reading" now refreshes the Rules
+  and Scripts it had loaded. The queue API splits what a person may edit (title, position, start
+  time) from what only the runner may write (status, pids, timestamps, exit codes, import state):
+  a client can no longer mark an item running or completed, edit an active row's identity, or
+  delete a row still marked running. And the session export, which by contract renders one whole
+  document, now refuses a transcript over 64 MB up front with a 413 that names both sizes and
+  points at the raw download, instead of claiming to stream while holding it all.
+
+- **An outage no longer looks like an empty account, and every failed action says why** (audit
+  AH-20/23/26, 2026-09-05). With every API read failing, the main app used to show "No sessions
+  found", "Scheduler off" and an empty queue. Each resource now carries its own loading, error,
+  stale and unavailable state: a first-load failure shows "unavailable" with a Retry, a later one
+  keeps the last good data and marks it stale, and one resource's error never touches another.
+  Queue run/cancel/delete and the composer's send now show the server's real error text instead
+  of a bare count, and the prompt survives an unconfirmed send. The remote app retries a failed
+  startup with a bounded backoff and a Retry button, tells an authentication refusal apart from an
+  unreachable gateway (the former goes to login, never a reconnect loop), reports a failed
+  sign-out, and shows a tunnel that died with its reason rather than as "off"; a login whose
+  identity-provider discovery fails gets the gateway's retry page instead of a raw server error.
+
+- **The toolbox's locks no longer crash under contention on Windows** (found while landing the
+  above, 2026-09-05). Every lane's lock - ledgers, holds, the delivery queue, the new journal
+  locks, the naming pass - is an exclusive-create of a lock file, and both helpers tolerated only
+  "already exists". On Windows the previous holder's unlink leaves the file's name pending-delete
+  for a few microseconds, and a create landing in that window answers "permission denied"
+  instead, so a lane that owed a wait crashed: measured 42 crashes in 1,800 contended
+  acquisitions across six threads. The permission-denied answer is now treated as contention
+  (wait, or for the non-blocking lock, defer), and a contention test pins it. The timed-out
+  toolbox run on Linux and macOS now also kills the interpreter's descendants (an actuator it
+  was blocking on), not just the interpreter; Windows already did through taskkill.
+
 - **Updates are verified before they run, long scripts cannot exhaust the daemon, and a dead
   tunnel says so** (audit AH-14/19/24/27/38/41, 2026-09-05). The compiled updater now checks a
   downloaded archive against the release's published SHA-256 manifest before extracting it or

@@ -23,8 +23,9 @@ import { type Account, AMBIENT_RUN_AS, type QueueItem } from '../types'
 import { dropCachedUsage } from '../usage'
 import { dropUsageHistory } from '../usage-history'
 
-/** Row status values a caller may PATCH a queue item into. Kept local: nothing outside this
- *  module's accounts/queue/scheduler routes needs it. */
+/** Row status values that exist. Kept local: nothing outside this module's accounts/queue/scheduler
+ *  routes needs it. NOT every value here is PATCH-able by a caller — see the status handling in the
+ *  PATCH route below (AH-13): only 'canceled', and only from 'queued'. */
 const VALID_QUEUE_STATUSES = new Set([
   'queued',
   'running',
@@ -35,6 +36,45 @@ const VALID_QUEUE_STATUSES = new Set([
   'overloaded',
   'canceled',
 ])
+
+/**
+ * Fields the RUNNER alone may set — spawn/finalize bookkeeping (dispatch.ts). A client naming one
+ * of these in a PATCH body now gets a 400 that names the field, rather than the old silent no-op:
+ * none of these were ever in the `allow` coercion map below, so a forged pid/exit_code/started_at
+ * simply vanished with no signal anything was rejected (AH-13).
+ */
+const RUNNER_OWNED_FIELDS = [
+  'pid',
+  'started_at',
+  'finished_at',
+  'exit_code',
+  'retry_attempts',
+  'import_state',
+  'import_error',
+  'import_to',
+  'import_title',
+  'allow_headless',
+] as const
+
+/**
+ * Fields that define WHAT a run executes — the spec dispatch.ts reads at spawn time (buildArgv,
+ * account/instance resolution). Editable while an item is only PLANNED (queued, not yet dispatched);
+ * locked once the row is active or recovering, because the in-memory runner already captured the old
+ * values — a PATCH here would leave the persisted row describing a different run than the one
+ * actually executing or being reattached (AH-13).
+ */
+const IDENTITY_FIELDS = [
+  'session_id',
+  'cwd',
+  'prompt',
+  'model',
+  'effort',
+  'permission_mode',
+  'account_id',
+  'instance_ref',
+  'new_chat',
+  'fork',
+] as const
 
 function maskSecret(secret: string): string {
   if (secret.length <= 8) return '••••'
@@ -241,9 +281,20 @@ app.post('/api/queue', async (c) => {
 })
 app.patch('/api/queue/:id', async (c) => {
   const id = c.req.param('id')
-  const existing = db.query('select * from queue_items where id = ?').get(id)
+  const existing = db
+    .query<{ status: string }, [string]>('select * from queue_items where id = ?')
+    .get(id)
   if (!existing) return c.json({ error: 'queue item not found' }, 404)
   const body = await jsonBody(c)
+  // AH-13: never even look at a runner-owned field's value — name it and refuse outright.
+  const forbidden = RUNNER_OWNED_FIELDS.filter((f) => f in body)
+  if (forbidden.length)
+    return c.json(
+      {
+        error: `${forbidden.join(', ')} ${forbidden.length > 1 ? 'are' : 'is'} runner-owned and cannot be set via PATCH`,
+      },
+      400,
+    )
   // reject (don't silently coerce) the two fields where a bad value corrupts the item:
   // a cleared schedule dispatches early, a "null" session id reaches the CLI as --resume null
   if (
@@ -264,11 +315,44 @@ app.patch('/api/queue/:id', async (c) => {
     if (field in body && body[field] != null && typeof body[field] !== 'string')
       return c.json({ error: `${field} must be a string or null` }, 400)
   }
-  if (
-    'status' in body &&
-    (typeof body.status !== 'string' || !VALID_QUEUE_STATUSES.has(body.status))
-  )
-    return c.json({ error: `status must be one of: ${[...VALID_QUEUE_STATUSES].join(', ')}` }, 400)
+  // AH-13: status is runner-owned except for ONE client-initiated transition — canceling a PENDING
+  // item. Every other value (running/completed/unverified/failed/rate_limited/overloaded, or
+  // 'canceled' on a row that isn't 'queued') is written only by dispatch.ts as a run actually
+  // progresses; accepting them here let a caller forge a completed/running history, or PATCH a
+  // status the in-memory runner disagrees with. Canceling an ACTIVE run has its own guarded path
+  // (POST /api/queue/:id/cancel -> dispatch.ts cancelItem, which kills the process); this is
+  // deliberately narrower and does not duplicate it.
+  if ('status' in body) {
+    if (typeof body.status !== 'string' || !VALID_QUEUE_STATUSES.has(body.status))
+      return c.json(
+        { error: `status must be one of: ${[...VALID_QUEUE_STATUSES].join(', ')}` },
+        400,
+      )
+    if (body.status !== 'canceled')
+      return c.json(
+        { error: "status can only be set to 'canceled' via PATCH; other values are runner-owned" },
+        400,
+      )
+    if (existing.status !== 'queued')
+      return c.json(
+        {
+          error: `cannot cancel via PATCH: item is '${existing.status}', not 'queued' — use POST /api/queue/:id/cancel for an active run`,
+        },
+        409,
+      )
+  }
+  // AH-13: identity fields describe WHAT the run executes. Once dispatch.ts has captured them — the
+  // row is active (isActive() sees a live tail) OR its status is still 'running' (the boot window
+  // before reattachRuns() re-populates `active`, see boot-state.ts isDispatchReady) — an edit here
+  // would silently desync the persisted row from the run that is actually executing or recovering.
+  if (isActive(id) || existing.status === 'running') {
+    const lockedFields = IDENTITY_FIELDS.filter((f) => f in body)
+    if (lockedFields.length)
+      return c.json(
+        { error: `cannot edit ${lockedFields.join(', ')}: item is active or recovering` },
+        409,
+      )
+  }
   if ('position' in body && (typeof body.position !== 'number' || !Number.isFinite(body.position)))
     return c.json({ error: 'position must be a finite number' }, 400)
   for (const field of ['new_chat', 'fork'] as const) {
@@ -351,7 +435,14 @@ app.patch('/api/queue/:id', async (c) => {
 })
 app.delete('/api/queue/:id', (c) => {
   const id = c.req.param('id')
-  if (isActive(id)) return c.json({ error: 'cannot delete a running item; cancel it first' }, 409)
+  // AH-13: isActive() alone misses the boot window before reattachRuns() re-populates `active` — a
+  // row whose status is still 'running' at that point is exactly as live (or as recovering-in-place)
+  // as one already in the map, and deleting it out from under a reattach would orphan its runner.
+  const row = db
+    .query<{ status: string }, [string]>('select status from queue_items where id = ?')
+    .get(id)
+  if (isActive(id) || row?.status === 'running')
+    return c.json({ error: 'cannot delete a running item; cancel it first' }, 409)
   db.query('delete from queue_items where id = ?').run(id)
   return c.json({ ok: true })
 })

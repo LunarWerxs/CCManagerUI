@@ -17,7 +17,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { scanSessionAnalytics } from '../src/analytics'
-import { exportSession } from '../src/session-export'
+import { exportSession, isExportRefused } from '../src/session-export'
 import { scanMeta } from '../src/sessions'
 import { listTranscriptFiles, tailTranscript } from '../src/transcript'
 
@@ -108,8 +108,8 @@ test('list metadata is scanned from the Kilo database', async () => {
 
 test('export renders the Kilo session, not an empty document', async () => {
   const doc = await exportSession(SID, 'markdown', 'opencode')
-  expect(doc).not.toBeNull()
-  expect(doc?.body).toContain('from Kilo')
+  if (!doc || isExportRefused(doc)) throw new Error(`export did not render: ${JSON.stringify(doc)}`)
+  expect(doc.body).toContain('from Kilo')
 })
 
 test('analytics totals come from the Kilo row', async () => {

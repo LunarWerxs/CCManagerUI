@@ -232,4 +232,8 @@ export default {
   // The chat list inside the bulk-move dialog: grouped by project, each row opens that chat.
   groupCount: '{n} chat(s)',
   dialogRowHint: 'Grouped by project. Click a chat to open it.',
+  // AH-20: the first fetch failing is not the same fact as a genuinely empty list.
+  unavailable: 'Could not load sessions: {reason}.',
+  retry: 'Retry',
+  staleHint: 'Showing the last known list — updates unavailable: {reason}.',
 }

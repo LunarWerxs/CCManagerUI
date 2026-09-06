@@ -93,6 +93,48 @@ describe('ownership can only be claimed at the machine', () => {
   })
 })
 
+describe('handleLogin surfaces a retryable page instead of throwing', () => {
+  // AH-23: discovery used to be unguarded - a rejected fetch escaped handleLogin as an uncaught
+  // throw, which Hono turns into a bare 500 instead of the gateway's own bounded error page.
+  test('a rejecting discovery fetch returns the retryable error page, not a throw', async () => {
+    const app = new Hono()
+    const rejectingFetch: typeof fetch = (async () => {
+      throw new Error('network is down')
+    }) as unknown as typeof fetch
+    // A unique issuer per test bypasses auth.ts's module-level discovery cache, which is keyed by
+    // issuer and shared across every test in this file - reusing CONNECTIONS_OAUTH.issuer here
+    // would risk silently serving another test's already-cached (successful) discovery doc.
+    app.get('/oauth/login', (c) =>
+      handleLogin(c, oauth({ issuer: 'https://discovery-rejects.test' }), {
+        fetchImpl: rejectingFetch,
+      }),
+    )
+
+    const res = await app.request('http://127.0.0.1:7790/oauth/login')
+    expect([502, 503]).toContain(res.status)
+    const body = await res.text()
+    expect(body.toLowerCase()).toContain('try again')
+  })
+
+  test('a discovery document missing authorization_endpoint also returns the retryable page', async () => {
+    const app = new Hono()
+    const incompleteFetch: typeof fetch = (async (input: string | URL | Request) => {
+      if (String(input).endsWith('/.well-known/openid-configuration')) {
+        return Response.json({ token_endpoint: discovery.token_endpoint })
+      }
+      throw new Error(`unexpected fetch ${String(input)}`)
+    }) as unknown as typeof fetch
+    app.get('/oauth/login', (c) =>
+      handleLogin(c, oauth({ issuer: 'https://discovery-incomplete.test' }), {
+        fetchImpl: incompleteFetch,
+      }),
+    )
+
+    const res = await app.request('http://127.0.0.1:7790/oauth/login')
+    expect([502, 503]).toContain(res.status)
+  })
+})
+
 describe('handleComplete', () => {
   test('rejects a missing code, a tampered state, and an unknown transaction before touching the IdP', async () => {
     const app = new Hono()

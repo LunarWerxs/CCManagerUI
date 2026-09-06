@@ -410,26 +410,22 @@ def _drive_archive(inst_dir: str, title: str, recheck=None) -> tuple[int, str]:
 
 
 def _flag_archived(path: str) -> str | None:
-    """Flip isArchived on one meta record on disk. Read, change, write to a temp file named for
-    THIS writer, replace, read back. The temp name carries the pid (audit AH-32): a fixed
-    `.json.tmp` let two writers interleave bytes into one scratch file - the same defect
-    stamplib closed on 2026-09-01. The read-back is what earns the word "archived"."""
-    p = Path(path)
-    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-    try:
-        meta = json.loads(p.read_text(encoding="utf-8"))
+    """Flip isArchived on one meta record on disk through the shared meta mutator
+    (stamplib.mutate_meta, audit AH-18/AH-32): per-record lock, pid-named temp, and a revision
+    check right before the replace so a record the app rewrote underneath us is re-read rather
+    than clobbered. The read-back is what earns the word "archived"."""
+    def _apply(meta: dict) -> bool:
+        if meta.get("isArchived") is True:
+            return False
         meta["isArchived"] = True
-        tmp.write_text(json.dumps(meta), encoding="utf-8")
-        os.replace(tmp, p)
-        if not json.loads(p.read_text(encoding="utf-8")).get("isArchived"):
-            return "the flag did not stick (another writer replaced the record)"
-        return None
-    except (OSError, ValueError) as err:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return str(err)
+        return True
+
+    r = stamplib.mutate_meta(path, _apply)
+    if r["error"]:
+        return r["error"]
+    if r["meta"] is None or not r["meta"].get("isArchived"):
+        return "the flag did not stick (another writer replaced the record)"
+    return None
 
 
 def _archive_copy(instance: str, path: str, title: str, recheck=None) -> str:

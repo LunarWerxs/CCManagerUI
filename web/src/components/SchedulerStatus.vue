@@ -4,7 +4,7 @@
 // when does the next scheduled item fire. Built for peace-of-mind ("I'm going to bed — will
 // this actually run?"). Reads the same polled data the queue uses; a 1s local tick keeps the
 // countdown live between polls.
-import { Loader2, PowerOff, SlidersHorizontal } from '@lucide/vue'
+import { CircleAlert, Loader2, PowerOff, SlidersHorizontal } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
@@ -16,7 +16,7 @@ import * as api from '@/lib/api'
 import IconTooltip from '@/shell/IconTooltip.vue'
 
 const { t } = useI18n()
-const { queue, scheduler, refreshScheduler } = useData()
+const { queue, scheduler, refreshScheduler, schedulerStatus } = useData()
 // The header chip is the one place people SEE the scheduler state (especially "off"), so it is also
 // where it gets switched. It used to deep-link into Settings → Scheduler, which is a strange trip
 // for a single boolean: you left the screen you were on, a settings page scrolled and flashed a
@@ -79,9 +79,15 @@ function humanizeUntil(ms: number): string {
   return `${d}d ${h % 24}h`
 }
 
-// One of: off · running · dispatching (due items waiting for the next poll) · countdown · idle
-type State = 'off' | 'running' | 'dispatching' | 'countdown' | 'idle'
+// One of: unavailable (AH-20 — couldn't even read the scheduler's state) · off · running ·
+// dispatching (due items waiting for the next poll) · countdown · idle
+type State = 'unavailable' | 'off' | 'running' | 'dispatching' | 'countdown' | 'idle'
 const state = computed<State>(() => {
+  // Checked FIRST: `scheduler` is null both before the first poll lands and after every poll has
+  // failed, and `!enabled.value` reads exactly like a real off switch either way — that is the
+  // "outage renders as Scheduler off" bug. `unavailable` only turns true once the very first
+  // fetch has actually rejected, so an ordinary not-yet-loaded moment never trips it.
+  if (schedulerStatus.unavailable.value) return 'unavailable'
   if (!enabled.value) return 'off'
   if (runningCount.value > 0) return 'running'
   if (dueNow.value > 0) return 'dispatching'
@@ -91,6 +97,8 @@ const state = computed<State>(() => {
 
 const label = computed(() => {
   switch (state.value) {
+    case 'unavailable':
+      return t('scheduler.unavailable')
     case 'off':
       return t('scheduler.off')
     case 'running':
@@ -104,16 +112,19 @@ const label = computed(() => {
   }
 })
 
-const tooltip = computed(
-  () =>
-    `${enabled.value ? t('scheduler.onTooltip') : t('scheduler.offTooltip')} ${t('scheduler.clickToToggle')}`,
-)
+const tooltip = computed(() => {
+  if (state.value === 'unavailable') {
+    return `${t('scheduler.unavailableHint', { reason: schedulerStatus.error.value ?? '' })} ${t('scheduler.clickToToggle')}`
+  }
+  return `${enabled.value ? t('scheduler.onTooltip') : t('scheduler.offTooltip')} ${t('scheduler.clickToToggle')}`
+})
 
 const queuedCount = computed(() => queued.value.length)
 
-// green when actively working, dim-green when on-but-idle, amber when off so it draws the eye.
+// green when actively working, dim-green when on-but-idle, amber when off OR unavailable so
+// either one draws the eye.
 const tone = computed(() => {
-  if (state.value === 'off') return 'text-warning'
+  if (state.value === 'off' || state.value === 'unavailable') return 'text-warning'
   if (state.value === 'idle') return 'text-success/70'
   return 'text-success'
 })
@@ -135,6 +146,7 @@ const tone = computed(() => {
           :aria-label="label"
         >
           <Loader2 v-if="state === 'running'" class="size-3.5 animate-spin" />
+          <CircleAlert v-else-if="state === 'unavailable'" class="size-3.5" />
           <span
             v-else-if="state !== 'off'"
             class="relative flex size-2"
@@ -150,6 +162,9 @@ const tone = computed(() => {
         </button>
         </PopoverTrigger>
         <PopoverContent align="end" class="w-60 p-3">
+          <p v-if="state === 'unavailable'" class="mb-2 text-[11px] text-warning">
+            {{ $t('scheduler.unavailableHint', { reason: schedulerStatus.error ?? '' }) }}
+          </p>
           <div class="flex items-center justify-between gap-3">
             <div class="min-w-0">
               <p class="text-xs font-medium">{{ $t('scheduler.enabledLabel') }}</p>

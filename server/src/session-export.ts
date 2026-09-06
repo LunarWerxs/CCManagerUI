@@ -6,8 +6,16 @@
 //
 // IT READS THE WHOLE TRANSCRIPT, not the tail window the viewer shows. An export of "the last 40
 // turns" would be a quietly truncated document, which is worse than no export: the reader has no
-// way to know what is missing. Streamed line by line for the same reason session-usage.ts is —
-// these files reach hundreds of megabytes and must never be held in memory whole.
+// way to know what is missing.
+//
+// WHAT "STREAMED" MEANS HERE, honestly (audit AH-37): the FILE is read line by line, so the raw
+// bytes are never held whole - but every parsed turn is kept, and the rendered document is one
+// string, because `SessionExport.body: string` is the contract the route and the MCP tool hand
+// out. A transcript of a few hundred megabytes therefore costs the parsed events plus one or two
+// complete serialized copies at once. So there is a CEILING (EXPORT_MAX_BYTES): a transcript over
+// it is refused up front with a reason that names both numbers, and the raw `.jsonl` download -
+// which really is a stream - is the path for it. Constant memory would need a chunked response;
+// that is not built, and this file does not claim it.
 //
 // SECRETS ARE REDACTED, ALWAYS, ON THIS PATH. An export exists to be sent somewhere, so the
 // omission pass is not optional here the way it is for viewing your own transcript on your own
@@ -229,14 +237,54 @@ function exportFilename(title: string, sessionId: string, ext: string): string {
   return `${slug}-${sessionId.slice(0, 8)}.${ext}`
 }
 
+/** The largest transcript this path will render into one document. 64 MB of JSONL renders to a
+ *  document of roughly the same size on top of its parsed events; past that the raw download is
+ *  the honest answer. `AGENTHYDRA_EXPORT_MAX_MB` raises or lowers it for an operator who knows
+ *  their machine. */
+export const EXPORT_MAX_BYTES_DEFAULT = 64 * 1024 * 1024
+
+export function exportMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
+  const mb = Number(env.AGENTHYDRA_EXPORT_MAX_MB)
+  return Number.isFinite(mb) && mb > 0 ? Math.floor(mb * 1024 * 1024) : EXPORT_MAX_BYTES_DEFAULT
+}
+
+/** An export that was not produced because the transcript is over the ceiling - a distinct answer
+ *  from "not found", so the route can say what to do instead. */
+export interface ExportRefused {
+  refused: 'too-large'
+  sizeBytes: number
+  limitBytes: number
+  message: string
+}
+
+export function isExportRefused(x: unknown): x is ExportRefused {
+  return !!x && typeof x === 'object' && (x as { refused?: unknown }).refused === 'too-large'
+}
+
 export async function exportSession(
   sessionId: string,
   format: ExportFormat,
   source?: SessionSource,
   meta: { title?: string; cwd?: string; thinking?: boolean } = {},
-): Promise<SessionExport | null> {
-  const tf = await findTranscriptAsync(sessionId, source)
+  deps: { findTranscript?: typeof findTranscriptAsync; maxBytes?: number } = {},
+): Promise<SessionExport | ExportRefused | null> {
+  const tf = await (deps.findTranscript ?? findTranscriptAsync)(sessionId, source)
   if (!tf) return null
+
+  // The ceiling, checked BEFORE a byte of the transcript is parsed (see the file header). The
+  // index already carries the file size; an OpenCode/Hermes row's is its database's, which is the
+  // right thing to bound on too.
+  const limitBytes = deps.maxBytes ?? exportMaxBytes()
+  const sizeBytes = tf.size_bytes ?? 0
+  if (sizeBytes > limitBytes) {
+    const mb = (n: number) => `${Math.round((n / 1048576) * 10) / 10} MB`
+    return {
+      refused: 'too-large',
+      sizeBytes,
+      limitBytes,
+      message: `export refused: this transcript is ${mb(sizeBytes)}, over the ${mb(limitBytes)} export ceiling (rendering it would hold the whole document in memory). Download the raw transcript instead, or raise AGENTHYDRA_EXPORT_MAX_MB on a machine that can take it.`,
+    }
+  }
 
   // Reasoning is left out unless asked for, matching the viewer: it is the bulkiest part of a
   // transcript and the least useful part of a document someone else is going to read.

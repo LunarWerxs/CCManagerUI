@@ -30,10 +30,17 @@ class TrustTest(unittest.TestCase):
         }}), encoding="utf-8")
         self._old = trust_workspace.CONFIG
         trust_workspace.CONFIG = self.cfg
+        # apply_trust(act=True) now serializes on ledgerlib's cross-process lock, which lives
+        # under ORCHESTRATOR_STATE_DIR - isolate it so the test never touches this machine's
+        # real orchestrator state.
+        self._state = tempfile.TemporaryDirectory()
+        os.environ["ORCHESTRATOR_STATE_DIR"] = self._state.name
 
     def tearDown(self):
         trust_workspace.CONFIG = self._old
         self._tmp.cleanup()
+        os.environ.pop("ORCHESTRATOR_STATE_DIR", None)
+        self._state.cleanup()
 
     def test_trusting_an_existing_project_keeps_its_other_settings(self):
         res = trust_workspace.apply_trust(["D:/Repos/Cold"], act=True)

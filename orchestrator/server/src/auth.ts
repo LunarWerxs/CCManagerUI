@@ -231,7 +231,24 @@ export async function handleLogin(
       503,
     )
   }
-  const doc = await discover(oauth.issuer, opts?.fetchImpl ?? authFetch)
+  // AH-23: discovery reaches out to the IdP over the network, same as the redirect resolution
+  // above - it used to be unguarded, so a rejected fetch (or a malformed discovery document)
+  // escaped as an uncaught throw and Hono turned it into a bare 500 instead of the gateway's own
+  // bounded, retryable error page.
+  let doc: Record<string, string>
+  try {
+    doc = await discover(oauth.issuer, opts?.fetchImpl ?? authFetch)
+    if (!doc.authorization_endpoint)
+      throw new Error('discovery document has no authorization_endpoint')
+  } catch (error) {
+    console.error(`[orchestrator-remote] OIDC discovery failed: ${String(error)}`)
+    return c.html(
+      errPage(
+        'Could not reach Connections to start sign-in. This is usually temporary - try again in a few seconds.',
+      ),
+      502,
+    )
+  }
   const { verifier, challenge } = pkce()
   const nonce = randomBytes(16).toString('base64url')
   txs.set(nonce, { verifier, ts: Date.now() })

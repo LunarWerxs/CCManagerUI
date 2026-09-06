@@ -2,13 +2,16 @@
 // What the page is standing on: the daemon (every fact comes from it), the Python data layer
 // (every verdict is computed there), and the tunnel this page arrived through.
 import { Check, Copy, Globe, Link2 } from '@lucide/vue'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { Badge } from '@/components/ui/badge'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { GatewayStatus } from '@/lib/api'
+import { tunnelBadgeFor } from '@/lib/tunnelBadge'
 
 const props = defineProps<{ status: GatewayStatus | null; error: string | null }>()
 const copied = ref<string | null>(null)
+
+const tunnelBadge = computed(() => (props.status ? tunnelBadgeFor(props.status.remote) : null))
 
 async function copy(text: string): Promise<void> {
   try {
@@ -72,9 +75,11 @@ const shortUrl = (u: string) => u.replace(/^https?:\/\//, '')
           </TooltipContent>
         </Tooltip>
       </template>
-      <Badge v-else-if="props.status.remote.tunnel === 'off'" variant="secondary">tunnel off · loopback only</Badge>
-      <Badge v-else-if="props.status.remote.tunnelError" variant="destructive" :title="props.status.remote.tunnelError">tunnel failed</Badge>
-      <Badge v-else variant="secondary">tunnel starting…</Badge>
+      <!-- AH-26: which badge a stalled tunnel gets (a recorded failure reason vs a plain,
+           intentional "off") is decided by tunnelBadgeFor() - see src/lib/tunnelBadge.ts. -->
+      <Badge v-else-if="tunnelBadge" :variant="tunnelBadge.variant" :title="tunnelBadge.title ?? undefined">
+        {{ tunnelBadge.text }}
+      </Badge>
       <Badge v-if="props.status.remote.relayError" variant="warning" :title="props.status.remote.relayError">relay: {{ props.status.remote.relayError }}</Badge>
     </template>
     <Badge v-else variant="secondary">connecting…</Badge>

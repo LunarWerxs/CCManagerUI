@@ -76,6 +76,19 @@ export function useOpenSession(deps: {
   // intent and always runs.
   let tailInFlight = 0
 
+  // Explicit loads (a click, a display-option toggle) are allowed to overlap — unlike the silent
+  // poll below, nothing skips them — so network order need not match call order. Matching only
+  // provider+session (the old guard) misses the case where the SAME session gets two reads with
+  // DIFFERENT view options (textOnly/thinking/humanOnly): an older read requested under the
+  // previous options can still land after a newer one and repaint the transcript under controls
+  // the reader has since changed away from. A monotonic sequence number fixes that — only the
+  // response belonging to the most recently ISSUED call may be applied, options included.
+  //
+  // The id/source check stays alongside it rather than being replaced: closing the transcript
+  // (SessionsView sets selectedId to null directly, with no loadTail call to bump the sequence)
+  // must still blank a straggling response for the session that's no longer open.
+  let tailRequestSeq = 0
+
   async function loadTail(opts: { silent?: boolean } = {}) {
     const id = selectedId.value
     const source = selectedSource.value
@@ -84,6 +97,9 @@ export function useOpenSession(deps: {
     // measured BEFORE the fetch: whether the reader was already at the conversation's end
     const el = chatEl.value
     const nearBottom = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 120
+    const seq = ++tailRequestSeq
+    const stale = () =>
+      seq !== tailRequestSeq || selectedId.value !== id || selectedSource.value !== source
     if (!opts.silent) tailLoading.value = true
     tailInFlight++
     try {
@@ -93,19 +109,22 @@ export function useOpenSession(deps: {
         thinking: deps.showThinking.value,
         humanOnly: deps.humanOnly.value,
       })
-      if (selectedId.value !== id || selectedSource.value !== source) return
+      if (stale()) return
       tail.value = r
     } catch {
       // Same staleness test the success path makes. A read that fails AFTER the reader moved on
-      // belongs to a conversation nobody is looking at any more, and blanking on its behalf would
-      // clear the chat they ARE looking at.
-      if (!opts.silent && selectedId.value === id && selectedSource.value === source)
-        tail.value = null
+      // (or after a newer read has been issued for the same session) belongs to a conversation
+      // nobody is currently waiting on, and blanking on its behalf would clear what they ARE
+      // looking at.
+      if (!opts.silent && !stale()) tail.value = null
     } finally {
       tailInFlight--
-      if (!opts.silent) tailLoading.value = false
+      // Only the LATEST request may clear the pending flag. A straggling older request finishing
+      // after a newer one was issued must not report "not loading" while that newer fetch is still
+      // outstanding.
+      if (!opts.silent && seq === tailRequestSeq) tailLoading.value = false
     }
-    if (selectedId.value !== id || selectedSource.value !== source) return
+    if (stale()) return
     if (!opts.silent) expandedMsgs.value = new Set()
     // chat convention: land at the bottom; silent refreshes only stick if already there
     await nextTick()

@@ -50,6 +50,7 @@ Exit:  0 nudged-and-confirmed, or honestly nothing to do - 2 no overlord chat ex
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -262,20 +263,26 @@ def rebirth(argv: list[str], as_json: bool, why: str) -> int:
                    as_json, 2)
     import spawn_chat
 
+    # AH-31 precedence: snapshot the decision moment BEFORE reading the fleet, so a manual
+    # --claim landing while this function decides is caught by _write_claim below.
+    decided_at_ms = int(time.time() * 1000)
     try:
         existing = manager_chats()
     except hydralib.DaemonError as err:
         return out({"ok": False, "report": f"rebirth NOT attempted: cannot read the fleet ({err})"},
                    as_json, 1)
-    p = _claim_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
     homeless = ""
     if existing and existing[0].get("instance"):
         # manager_chats puts a manager with a desktop home first - the only kind a composer
         # wake can reach. Claim it; never spawn beside it.
         pick = existing[0]
         sid = str(pick.get("sessionId") or pick.get("session_id") or "")
-        p.write_text(json.dumps({"sessionId": sid, "title": pick.get("title")}), encoding="utf-8")
+        wrote, defer_why = _write_claim(sid, pick.get("title"), manual=False,
+                                        since_ms=decided_at_ms)
+        if not wrote:
+            return out({"ok": True, "report": (
+                f"NO overlord chat was reachable ({why}) - a manager exists ('{pick.get('title')}', "
+                f"{sid[:8]}) but not claimed: {defer_why}. Nothing spawned.")}, as_json, 0)
         return out({"ok": True, "report": (
             f"NO overlord chat was reachable ({why}) - but a manager already exists: claimed "
             f"'{pick.get('title')}' ({sid[:8]}) on {pick.get('instance') or 'console'}. Nothing spawned.")},
@@ -305,15 +312,20 @@ def rebirth(argv: list[str], as_json: bool, why: str) -> int:
                     "report": f"NO overlord chat is reachable ({why}) and the rebirth was REFUSED: "
                               f"{got.get('why')}"}, as_json, 1)
     sid = str(got.get("sessionId") or "")
+    claim_note = "Not claimed: no session id registered yet - next tick finds it by its prompt."
     if sid:
-        p.write_text(json.dumps({"sessionId": sid, "title": got.get("title") or "Orchestrate"}),
-                     encoding="utf-8")
-        ledgerlib.note("surface", sid, note=f"rebirth: manager respawned ({why[:80]})")
+        wrote, defer_why = _write_claim(sid, got.get("title") or "Orchestrate", manual=False,
+                                        since_ms=decided_at_ms)
+        if wrote:
+            ledgerlib.note("surface", sid, note=f"rebirth: manager respawned ({why[:80]})")
+            claim_note = "Claimed."
+        else:
+            claim_note = f"Not claimed: {defer_why} - the new chat is left as a protected spare."
     return out({"ok": bool(sid), "spawn": got, "report": (
         f"NO overlord chat was reachable ({why}){homeless} - REBORN: a new manager chat is "
         f"{'running' if str(got.get('started', '')).startswith('running') else 'starting'} in "
         f"{got.get('instance')} ({sid[:8] or 'id pending'}); mode: {got.get('modeSet')}. "
-        + ("Claimed." if sid else "Not claimed: no session id registered yet - next tick finds it by its prompt."))},
+        + claim_note)},
         as_json, 0 if sid else 1)
 
 
@@ -331,6 +343,65 @@ def _ms_of(iso) -> int:
 
 def _claim_path() -> Path:
     return ledgerlib._state_dir() / "overlord.json"
+
+
+def _read_claim() -> dict | None:
+    """The current claim file, or None if absent/unparseable. No lock needed to READ:
+    _write_claim below always writes via a pid-unique temp file + os.replace (mirrors
+    ledgerlib/deliverylib), which is atomic on Windows and POSIX alike, so a reader here can
+    never observe a partial/interleaved write."""
+    try:
+        return json.loads(_claim_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_claim(sid: str, title: str | None, *, manual: bool,
+                  since_ms: int | None = None) -> tuple[bool, str]:
+    """THE ONE PLACE overlord.json is written (AH-31). A person's `--claim`, an adopted
+    existing manager, and a freshly reborn one all used to `write_text` overlord.json
+    directly and unconditionally, with no mutex - a manual claim and the scheduled tick's
+    own adoption/rebirth could race, and whichever direct write landed last silently became
+    the role owner. Every writer now goes through here, under
+    ledgerlib.locked('overlord-claim'), with a pid-unique temp file + os.replace so a reader
+    never sees a partial/empty file mid-write.
+
+    PRECEDENCE (documented here and in the caller's report): a MANUAL claim (manual=True,
+    a person's `--claim`) always wins and always writes. An AUTOMATIC writer (manual=False -
+    adoption or rebirth) must pass `since_ms`, the epoch-ms moment IT decided to write, taken
+    before it read the fleet. Inside the lock this re-reads the current claim; if that claim
+    is itself manual and was written at or after `since_ms`, a person claimed the role during
+    this automatic writer's own decision window, so the automatic write is DROPPED - returns
+    (False, why) - rather than clobbering the person's deliberate choice. Returns (True, "")
+    when it wrote.
+    """
+    p = _claim_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with ledgerlib.locked("overlord-claim"):
+        if not manual and since_ms is not None:
+            current = _read_claim()
+            if current and current.get("manual") and int(current.get("at") or 0) >= since_ms:
+                return False, (
+                    f"a manual claim on '{current.get('title')}' "
+                    f"({str(current.get('sessionId'))[:8]}) landed first - a person's claim "
+                    "always wins over an automatic adoption/rebirth")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"sessionId": sid, "title": title, "manual": bool(manual),
+                                   "at": int(time.time() * 1000)}), encoding="utf-8")
+        # Windows' file locking is mandatory, not advisory (POSIX rename never blocks on an
+        # open reader; MoveFileEx can transiently refuse with WinError 5 if a reader has `p`
+        # open the instant this fires - a Path.read_text() elsewhere does not set
+        # FILE_SHARE_DELETE). Under this lock only one writer is ever mid-replace, so a few
+        # short retries ride out a reader's fleeting handle instead of surfacing a false crash.
+        for attempt in range(30):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError:
+                if attempt == 29:
+                    raise
+                time.sleep(0.02)
+    return True, ""
 
 
 # A delivery that landed this recently counts as the wake: the automatic lanes do not send a
@@ -688,9 +759,9 @@ def _cmd_claim(argv: list[str], as_json: bool) -> int:
             f"claim refused: '{match.get('title')}' ({sid[:8]}) has no desktop record and no "
             "live process - it is not a chat anyone can wake. Claim the chat you are in by its "
             "session id.")}, as_json, 2)
-    p = _claim_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"sessionId": sid, "title": match.get("title")}), encoding="utf-8")
+    # A MANUAL claim always wins (AH-31 precedence): write unconditionally, through the same
+    # locked + atomic path an automatic adoption/rebirth uses, so the two can never interleave.
+    _write_claim(sid, match.get("title"), manual=True)
     return out({"ok": True, "report": f"claimed: '{match.get('title')}' ({sid[:8]}) is the overlord"},
                as_json, 0)
 
@@ -699,6 +770,9 @@ def _locate_or_rebirth(argv: list[str], as_json: bool) -> tuple[dict | None, int
     """Find the overlord chat, or handle its absence. Returns (row, None) when the caller
     should continue with `row`, or (None, exit_code) when the caller must return that code
     immediately."""
+    # AH-31 precedence: snapshot BEFORE find_overlord() reads the fleet, so a manual --claim
+    # landing during this call is detected by _write_claim's adopted-pin below.
+    snapshot_ms = int(time.time() * 1000)
     try:
         row = find_overlord()
     except hydralib.DaemonError as err:
@@ -713,11 +787,13 @@ def _locate_or_rebirth(argv: list[str], as_json: bool) -> tuple[dict | None, int
         return None, rebirth(argv, as_json, why)
     if row.get("adopted") and "--status" not in argv:
         # Found by its birth prompt alone: pin it, so the role never ping-pongs between two
-        # managers on activity order (a person can still --claim another).
-        p = _claim_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"sessionId": row.get("session_id"), "title": row.get("title")}),
-                     encoding="utf-8")
+        # managers on activity order (a person can still --claim another). AH-31 precedence:
+        # an automatic pin that loses to a newer manual claim is silently dropped here - the
+        # found row still serves THIS tick, only the persisted claim file is left alone.
+        wrote, defer_why = _write_claim(row.get("session_id"), row.get("title"), manual=False,
+                                        since_ms=snapshot_ms)
+        if not wrote:
+            print(f"overlord: adoption pin deferred - {defer_why}", file=sys.stderr)
     return row, None
 
 

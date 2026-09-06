@@ -264,10 +264,49 @@ export async function drainBounded(
   return { text, dropped }
 }
 
+/** Hard cap on how deep the Unix descendant walk goes. An actuator chain is python -> shell ->
+ *  tool, three or four levels; twelve bounds a pathological fork tree without ever mattering. */
+const UNIX_TREE_MAX_DEPTH = 12
+
+/**
+ * Every descendant of `pid` on a Unix host, DEEPEST FIRST, read from `pgrep -P` one level at a
+ * time (pgrep ships with procps on Linux and with macOS). Exported for the test; returns [] when
+ * pgrep is missing or the process has no children.
+ *
+ * WHY THIS EXISTS (audit AH-15): on Windows the deadline kill is `taskkill /T`, the whole tree; on
+ * Linux/macOS it was `proc.kill()` - the interpreter alone. The interpreter's own child (the
+ * actuator it was blocking on, a `subprocess.run` in migrate_chat / chips / courier) kept running
+ * unsupervised, still holding the stdout/stderr pipes, so the adapter's drain could not finish
+ * until that grandchild happened to exit. A process group would be the canonical answer, but
+ * Bun.spawn offers no `detached`, so the tree is enumerated and killed leaf-first instead.
+ */
+export function unixDescendants(pid: number, maxDepth = UNIX_TREE_MAX_DEPTH): number[] {
+  const out: number[] = []
+  const walk = (parent: number, depth: number): void => {
+    if (depth >= maxDepth) return
+    let stdout: string
+    try {
+      const r = Bun.spawnSync(['pgrep', '-P', String(parent)], { stdout: 'pipe', stderr: 'ignore' })
+      stdout = r.stdout.toString()
+    } catch {
+      return // no pgrep on this host: the parent kill below is all we can do
+    }
+    for (const line of stdout.split('\n')) {
+      const child = Number.parseInt(line.trim(), 10)
+      if (!Number.isFinite(child) || child <= 0 || child === parent) continue
+      walk(child, depth + 1) // grandchildren first, so a parent cannot respawn what we killed
+      out.push(child)
+    }
+  }
+  walk(pid, 0)
+  return out
+}
+
 /** Kill the WHOLE tree, not just python. An acting script blocks on its actuator (a powershell
  *  driving a window, `subprocess.run` in migrate_chat / chips / courier); killing only the
  *  interpreter would leave that actuator running unsupervised while the caller reads "timed
- *  out". The toolbox itself uses `taskkill /T /F` for the same reason (lib/enginelib.py). */
+ *  out". The toolbox itself uses `taskkill /T /F` for the same reason (lib/enginelib.py). On
+ *  Unix the tree is walked with pgrep and killed leaf-first (see unixDescendants). */
 function killTree(proc: ReturnType<typeof Bun.spawn>): void {
   try {
     if (process.platform === 'win32' && proc.pid) {
@@ -277,7 +316,16 @@ function killTree(proc: ReturnType<typeof Bun.spawn>): void {
         windowsHide: true,
       })
     } else {
-      proc.kill()
+      if (proc.pid) {
+        for (const child of unixDescendants(proc.pid)) {
+          try {
+            process.kill(child, 'SIGKILL')
+          } catch {
+            // already gone
+          }
+        }
+      }
+      proc.kill('SIGKILL')
     }
   } catch {
     // already gone

@@ -37,4 +37,7 @@ export default {
   scheduleUseTime: 'Use this time',
   scheduleClear: 'Clear',
   scheduleNotSet: 'Run as soon as it can',
+  // AH-20: distinct from `off` — the daemon could not even be asked.
+  unavailable: 'Scheduler unavailable',
+  unavailableHint: 'Could not read scheduler status: {reason}.',
 }

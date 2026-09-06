@@ -52,4 +52,9 @@ export default {
   exitLostHint:
     'The run was cut off before it finished. The process was killed, or AgentHydra restarted under it. Whatever it had already done is on disk; open the session to see how far it got.',
   deletedInstance: '(deleted instance)',
+  // AH-20: an outage must not read as an empty queue.
+  unavailable: 'Could not load the queue: {reason}.',
+  retry: 'Retry',
+  staleHint: 'Showing the last known queue — updates unavailable: {reason}.',
+  toastRunFailed: 'Failed to start the run.',
 }

@@ -58,7 +58,7 @@ def _instance_lock(instance: str):
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
-    except FileExistsError:
+    except (FileExistsError, PermissionError):  # PermissionError = the previous holder's pending delete (Windows); busy, not broken - see ledgerlib.locked
         yield False
         return
     try:

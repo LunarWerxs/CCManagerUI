@@ -10,7 +10,12 @@ import { findDesktopChat } from '../instance-sessions'
 import { readLiveRegistry } from '../live-registry'
 import { boundedQueryInt, jsonBody } from '../route-helpers'
 import { dropSearchIndex, searchIndexStatus } from '../search-index'
-import { type ExportFormat, exportSession, scanSessionSecrets } from '../session-export'
+import {
+  type ExportFormat,
+  exportSession,
+  isExportRefused,
+  scanSessionSecrets,
+} from '../session-export'
 import { resumeSessionInTerminal } from '../session-resume'
 import { searchSessionBodies } from '../session-search'
 import { sessionUsage } from '../session-usage'
@@ -239,6 +244,13 @@ app.get('/api/sessions/:id/export', async (c) => {
     cwd: session?.cwd,
   })
   if (!result) return c.json({ error: 'session not found' }, 404)
+  // Over the export ceiling (audit AH-37): a 413 that says why and what to do instead, rather than
+  // a daemon quietly holding a few hundred megabytes and hoping.
+  if (isExportRefused(result))
+    return c.json(
+      { error: result.message, sizeBytes: result.sizeBytes, limitBytes: result.limitBytes },
+      413,
+    )
   return new Response(result.body, {
     headers: {
       'content-type': result.contentType,

@@ -28,6 +28,8 @@ import json
 import os
 from pathlib import Path
 
+from lib import ledgerlib
+
 ULTRACODE_EFFORT = "xhigh"
 
 
@@ -135,32 +137,90 @@ def stamp_doctrine(meta_path: str | Path) -> dict:
     over this. The durable moment is while the chat is DORMANT, which is why the courier
     stamps immediately before a wake and the doctrine sweep re-applies on a clock.
     """
-    p = Path(meta_path)
-    try:
-        meta = read_meta(p)
-    except (OSError, ValueError) as err:
-        return {"changed": False, "bypass": False, "ultracode": False, "error": str(err)}
-    before = (is_bypass(meta), is_stamped(meta))
-    if all(before):
+    r = mutate_meta(meta_path, _apply_doctrine)
+    if r["error"]:
+        return {"changed": False, "bypass": False, "ultracode": False, "error": r["error"]}
+    if not r["changed"]:
         return {"changed": False, "bypass": True, "ultracode": True, "error": None}
+    got = r["meta"]
+    return {"changed": True, "bypass": is_bypass(got), "ultracode": is_stamped(got),
+            "error": None}
+
+
+def _apply_doctrine(meta: dict) -> bool:
+    """Both doctrine stamps onto one record; False when it already carries them."""
+    if is_bypass(meta) and is_stamped(meta):
+        return False
     meta["permissionMode"] = BYPASS
     settings = dict(meta.get("sessionSettings") or {})
     settings["ultracode"] = True
     meta["sessionSettings"] = settings
     meta["effort"] = ULTRACODE_EFFORT
+    return True
+
+
+META_WRITE_ATTEMPTS = 3
+
+
+def mutate_meta(meta_path: str | Path, apply, *, _between=None) -> dict:
+    """Read-modify-replace ONE meta record, without losing anyone else's fields (audit AH-18).
+
+    `apply(meta)` edits the dict in place and returns True when it changed something. Around it:
+
+      * a per-record lock (`ledgerlib.locked("meta-<stem>")`) so the toolbox's own mutators - the
+        doctrine sweep, the courier's pre-wake stamp, migrate_chat's landing stamp, twin
+        cleanup's archive flag - take turns instead of each replacing the whole document from
+        its own snapshot;
+      * a revision check IMMEDIATELY before the replace: the file's (mtime_ns, size) at read time
+        must still be what is on disk. The desktop app is not a cooperating writer and rewrites
+        this file from memory whenever it likes; if it did so between the read and the write,
+        the document is re-read and `apply` runs again on the fresh copy, up to
+        META_WRITE_ATTEMPTS times. A record that keeps changing is left exactly as its other
+        writer left it, with an error saying so - never replaced from a stale snapshot.
+
+    The temp name is pid-unique and the swap is os.replace, as before (a fixed temp name let two
+    stampers interleave bytes into one file; review finding, 2026-09-01).
+
+    Returns {changed, meta, error}: `meta` is the record as read back after a write (or as read
+    when nothing needed changing); `error` is a string when the record could not be read, could
+    not be written, or would not hold still. Never raises for those.
+
+    `_between` is a test seam invoked after the read and before the revision check, standing in
+    for the app writing underneath us.
+    """
+    p = Path(meta_path)
     try:
-        # Unique temp name per writer + os.replace: a fixed temp name lets two concurrent
-        # stampers (the sweep vs courier/migrate_chat, no shared lock between lanes) interleave
-        # bytes into the same temp file and leave a truncated meta record on disk (review
-        # finding, 2026-09-01). Same idiom as ledgerlib._save.
-        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(meta), encoding="utf-8")
-        os.replace(tmp, p)
-        got = read_meta(p)
-    except (OSError, ValueError) as err:
-        return {"changed": False, "bypass": False, "ultracode": False, "error": str(err)}
-    return {"changed": True, "bypass": is_bypass(got), "ultracode": is_stamped(got),
-            "error": None}
+        with ledgerlib.locked(f"meta-{p.stem}"):
+            for _attempt in range(META_WRITE_ATTEMPTS):
+                try:
+                    st = p.stat()
+                    meta = read_meta(p)
+                except (OSError, ValueError) as err:
+                    return {"changed": False, "meta": None, "error": str(err)}
+                revision = (st.st_mtime_ns, st.st_size)
+                if not apply(meta):
+                    return {"changed": False, "meta": meta, "error": None}
+                if _between is not None:
+                    _between()
+                try:
+                    now = p.stat()
+                except OSError as err:
+                    return {"changed": False, "meta": None, "error": str(err)}
+                if (now.st_mtime_ns, now.st_size) != revision:
+                    continue  # someone wrote underneath us: re-read, re-apply, never clobber
+                try:
+                    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps(meta), encoding="utf-8")
+                    os.replace(tmp, p)
+                    return {"changed": True, "meta": read_meta(p), "error": None}
+                except (OSError, ValueError) as err:
+                    return {"changed": False, "meta": None, "error": str(err)}
+            return {"changed": False, "meta": None,
+                    "error": (f"{p.name} kept changing underneath the write ({META_WRITE_ATTEMPTS} "
+                              "attempts); another writer is active, so it was left as they wrote "
+                              "it rather than replaced from a stale copy")}
+    except TimeoutError as err:
+        return {"changed": False, "meta": None, "error": str(err)}
 
 
 # THE ENGINE-SIDE HALF OF THE DOCTRINE (owner, 2026-09-02: "regarding the manual mode - no, I am
@@ -248,24 +308,18 @@ def stamp_ultracode(meta_path: str | Path) -> dict:
     reproduction of the app's own compact formatting. Returns {stamped, already, verified,
     error} - never raises for a missing/corrupt file, because a failed stamp must be reportable
     without unwinding the act that preceded it."""
-    p = Path(meta_path)
-    try:
-        meta = read_meta(p)
-    except (OSError, ValueError) as err:
-        return {"stamped": False, "already": False, "verified": False, "error": str(err)}
-    if is_stamped(meta):
+    def _apply(meta: dict) -> bool:
+        if is_stamped(meta):
+            return False
+        settings = dict(meta.get("sessionSettings") or {})
+        settings["ultracode"] = True
+        meta["sessionSettings"] = settings
+        meta["effort"] = ULTRACODE_EFFORT
+        return True
+
+    r = mutate_meta(meta_path, _apply)
+    if r["error"]:
+        return {"stamped": False, "already": False, "verified": False, "error": r["error"]}
+    if not r["changed"]:
         return {"stamped": False, "already": True, "verified": True, "error": None}
-    settings = dict(meta.get("sessionSettings") or {})
-    settings["ultracode"] = True
-    meta["sessionSettings"] = settings
-    meta["effort"] = ULTRACODE_EFFORT
-    try:
-        # Unique temp name per writer + os.replace: see stamp_doctrine for why a fixed temp
-        # name is unsafe under concurrent stampers.
-        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(meta), encoding="utf-8")
-        os.replace(tmp, p)
-        verified = is_stamped(read_meta(p))
-    except (OSError, ValueError) as err:
-        return {"stamped": False, "already": False, "verified": False, "error": str(err)}
-    return {"stamped": True, "already": False, "verified": verified, "error": None}
+    return {"stamped": True, "already": False, "verified": is_stamped(r["meta"]), "error": None}

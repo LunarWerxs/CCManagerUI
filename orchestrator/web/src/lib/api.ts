@@ -243,8 +243,16 @@ export class ApiError extends Error {
   }
 }
 
+// Test-only injection seam: lets a test swap in a fake fetch scoped to this module instead of
+// patching globalThis.fetch, which would otherwise leak across test files. Never set in app code.
+type FetchFn = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+let fetchImpl: FetchFn = fetch
+export function __setFetchForTests(fn: FetchFn | null): void {
+  fetchImpl = fn ?? fetch
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetchImpl(path, {
     ...init,
     headers: { accept: 'application/json', ...(init?.headers ?? {}) },
   })

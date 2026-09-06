@@ -64,6 +64,8 @@ export function useDashboard() {
     if (chats.data) jobs.push(loadChats(true))
     if (instances.data) jobs.push(loadInstances(true))
     if (suppressed.data) jobs.push(loadSuppressed(true))
+    if (rules.data) jobs.push(loadRules(true))
+    if (scripts.data) jobs.push(loadScripts(true))
     await Promise.all(jobs)
   }
 
