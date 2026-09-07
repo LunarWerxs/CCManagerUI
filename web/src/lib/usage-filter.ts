@@ -2,7 +2,8 @@
 //
 // Pure derivation over a UsageSnapshot, in the same spirit as lib/usage.ts and lib/usage-reset.ts:
 // nothing here touches Vue, the network or a clock, so the rule the tables act on is unit-testable
-// on its own. The reactive, persisted knobs live in composables/useUsageFilter.ts.
+// on its own. The reactive, persisted knobs live in composables/useInstanceFilter.ts, which
+// composes this with the status and plan facets (see lib/instance-filter.ts).
 //
 // The question the filter answers is "which accounts can I still work on", and there are two ways
 // to be unable to: the WEEKLY cap (the Usage column) decides whether an account is worth starting
@@ -142,7 +143,7 @@ export function ruleFromLegacyScope(scope: string | null, threshold: number): Us
  * its default the first time it is read, so a migration expressed in terms of those refs could never
  * tell "never set" from "just defaulted". Seeing the legacy key at all is the signal; removing it is
  * what makes this run once. Values go out in vueuse's own wire format (String() for booleans and
- * numbers alike) so composables/useUsageFilter.ts reads back exactly what it would have written.
+ * numbers alike) so composables/useInstanceFilter.ts reads back exactly what it would have written.
  *
  * A value already in the new shape WINS over the legacy key — same rule as the rebrand migration,
  * and for the same downgrade-then-upgrade case.

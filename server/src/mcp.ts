@@ -553,6 +553,16 @@ export const TOOLS: McpEngineTool[] = [
           'Narrow to sessions that hit a usage/quota wall ("only"), or to the ones still stopped ' +
           'at one right now ("pending"). Default all.',
       },
+      fields: {
+        type: 'string',
+        description:
+          'Narrow each row to the columns you need. "compact" keeps session_id, source, title, ' +
+          'cwd, instance, archived, last_activity_at and message_count — about a tenth the size ' +
+          'of a full row, which is 27 fields and roughly 2KB. Or give your own comma-separated ' +
+          'list; session_id is always included, and an unknown name is an error listing the valid ' +
+          'ones rather than a silently missing field. Reach for this BEFORE lowering `limit`: a ' +
+          'smaller limit hides sessions, a projection hides only columns.',
+      },
     }),
     run: (a) =>
       api(
@@ -568,6 +578,7 @@ export const TOOLS: McpEngineTool[] = [
           archived: a.archived,
           dispatched: a.dispatched,
           ratelimited: a.rateLimited,
+          fields: a.fields,
         })}`,
       ),
   },
@@ -709,6 +720,46 @@ export const TOOLS: McpEngineTool[] = [
       }),
   },
   {
+    name: 'list_chats',
+    description:
+      // The tool that did not exist on 2026-09-06, when "what chats does this account hold?" cost
+      // five round trips, blew a token cap, and produced a wrong number off a hand-read of the
+      // private store. Named in the FIRST sentence as the thing to call before a migration,
+      // because the tools that could half-answer it are a listing tool that returns 2KB rows and
+      // a MUTATING move tool run with dry_run.
+      'EVERY CHAT ON ONE DESKTOP ACCOUNT, compactly — start here before moving, auditing or counting chats. Returns one small row per chat (chatId, sessionId, title, isArchived, lastActivityAt, cwd) plus `live`/`livePid`, which say whether an engine is hosting it RIGHT NOW: that is the single fact that decides whether move_chat will refuse it, and before this tool the only way to learn it was to attempt the move and read the refusal. Do NOT use list_sessions for this — its rows carry 27 fields each and one 206-chat account came to 117KB, refused by the caller\'s token cap before a single row was read. `counts` describes the WHOLE account regardless of the filters ({all, unarchived, archived, live}), so "1 row" can never be misread as "this account is empty": an account is typically 200+ chats of which one or two are unarchived, because archived is Claude Desktop\'s resting state, not a sign a chat is finished. `total` is the matches BEFORE limit/offset. `instances` lists every label the scan saw, so a mistyped instance shows up beside the real names instead of as an empty answer. Read-only: it touches nothing.',
+    inputSchema: S({
+      instance: {
+        type: ['string', 'number'],
+        description:
+          "Which desktop account: its permanent NUMBER (13 or '#13'), its account email, its name, or its directory label ('3claude'). Omit to list every instance at once. A CLI or Codex instance is an error - desktop chats exist only on desktop instances.",
+      },
+      archived: {
+        type: 'string',
+        enum: ['hide', 'include', 'only'],
+        description:
+          'Default "hide", matching move_chats: archived is the resting state and the majority of any account, so including it buries the live work. Pass "include" to see the whole history, "only" for the archive alone.',
+      },
+      q: {
+        type: 'string',
+        description:
+          'Optional title fragment or session/chat id, matched exactly as chat_dossier matches.',
+      },
+      limit: { type: 'number', description: 'Max rows to return (default 200, max 1000).' },
+      offset: { type: 'number', description: 'Skip this many matching rows first.' },
+    }),
+    run: (a) =>
+      api(
+        `/api/chats${qs({
+          instance: a.instance,
+          archived: a.archived,
+          q: a.q,
+          limit: a.limit,
+          offset: a.offset,
+        })}`,
+      ),
+  },
+  {
     name: 'chat_dossier',
     description:
       'ONE query, everything the system knows about a chat: which desktop instance holds it, its ' +
@@ -716,7 +767,11 @@ export const TOOLS: McpEngineTool[] = [
       'done-mark, and the live process hosting it (if any). Use this FIRST for any "what ' +
       'happened to chat X / is it alive / who archived it" question — it replaces hand-joining ' +
       'the metadata stores, the marks table and the live registry. Query by a title fragment or ' +
-      'by ANY session/chat id, current or prior.',
+      'by ANY session/chat id, current or prior. For a whole account rather than one chat, use ' +
+      'list_chats. The archive flag is returned under BOTH `archived` and `isArchived`, the ' +
+      'second being the name the metadata file on disk uses: an agent that hand-read the store ' +
+      "for the documented name got every chat wrong (206 read as unarchived when 205 weren't) " +
+      'and nothing errored, so the two names are kept deliberately in sync.',
     inputSchema: S(
       { q: { type: 'string', description: 'Title fragment or any session/chat id (substring).' } },
       ['q'],

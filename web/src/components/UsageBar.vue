@@ -17,11 +17,29 @@
 import { computed } from 'vue'
 import type { WaitSeverity } from '@/lib/usage-reset'
 
+/**
+ * A wait band, or `'neutral'` — a bar drawn in greys.
+ *
+ * The usage-mode row carries four quota cells, and when every one of them is coloured the row has
+ * no emphasis left to give: four hues side by side average out to "busy", and the eye has to read
+ * each one to find out which is the alarming one. The two 5-HOUR cells are the ones that give up
+ * their colour, because a spent session comes back the same afternoon while a spent WEEK is the
+ * reading that decides whether an account is worth starting on at all. So the week keeps the
+ * colour, the session keeps its length and its number, and a red row means something again.
+ */
+export type UsageBarVariant = WaitSeverity | 'neutral'
+
 const props = defineProps<{
   /** 0-100. Drives the bar's LENGTH. */
   fillPct: number
-  /** Drives the bar's COLOUR. */
-  variant: WaitSeverity
+  /**
+   * Drives the bar's COLOUR.
+   *
+   * `'neutral'` is a bar that keeps its LENGTH but spends no colour: greys, the same weight the
+   * Plan chip carries. It exists because colour is a scarce channel across a whole row — see
+   * UsageBarVariant below.
+   */
+  variant: UsageBarVariant
   /** What is written inside the bar — a countdown for a time window, a percentage for a plain one. */
   label: string
   /** Small caption under the bar (the burn percentage, or the model name). */
@@ -43,15 +61,22 @@ const width = computed(() => Math.min(100, Math.max(0, Math.round(props.fillPct)
 // against the FILL, measured on this palette. Amber is the constraint — it is the lightest of the
 // three hues, so a fill dense enough to look right in red washes the label out in warning. Raising
 // these is the change that quietly breaks legibility on the one row that matters.
+//
+// `neutral` is the same two weights in the palette's own grey rather than a hue: it has to read as
+// a deliberate absence of colour (a bar that is not telling you anything urgent), not as a fourth,
+// even calmer severity. `muted-foreground` at these alphas is the ONE grey that separates from the
+// track in both themes — `border` disappears into the row in dark, `muted` into the card in light.
 const FILL: Record<string, string> = {
   success: 'bg-success/30 dark:bg-success/32',
   warning: 'bg-warning/30 dark:bg-warning/32',
   destructive: 'bg-destructive/35 dark:bg-destructive/45',
+  neutral: 'bg-muted-foreground/25 dark:bg-muted-foreground/30',
 }
 const TRACK: Record<string, string> = {
   success: 'bg-success/10 dark:bg-success/20',
   warning: 'bg-warning/10 dark:bg-warning/20',
   destructive: 'bg-destructive/10 dark:bg-destructive/20',
+  neutral: 'bg-muted-foreground/10 dark:bg-muted-foreground/15',
 }
 // The label is NEUTRAL, not the hue.
 //

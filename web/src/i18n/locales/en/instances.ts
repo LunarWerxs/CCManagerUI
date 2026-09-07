@@ -113,38 +113,56 @@ export default {
   usageModeOff: 'Show process columns',
   usageModeHint:
     'Swap PID, uptime and memory for what is left of each quota window and how long until it resets.',
-  // Usage filter (toolbar flyout, usage mode only) — see composables/useUsageFilter.ts.
-  usageFilterTitle: 'Usage filter',
-  usageFilterHint:
-    'Set aside the accounts you have already spent, so the ones you can still work on stand out.',
-  usageFilterEnable: 'Filter by usage',
-  usageFilterThreshold: 'Threshold',
-  usageFilterThresholdValue: '{pct}%',
-  usageFilterHide: 'Hide instead of dim',
-  usageFilterHideHint:
+  // The Filter flyout (toolbar) — three facets, OR-ed. See composables/useInstanceFilter.ts.
+  filterTitle: 'Filter',
+  filterHint:
+    'Narrow these tables to the accounts you are after — whether the app is open, which plan it is on, and how much quota is left.',
+  filterEnable: 'Filter instances',
+  filterThreshold: 'Threshold',
+  filterThresholdValue: '{pct}%',
+  filterHide: 'Hide instead of dim',
+  filterHideHint:
     'Matching instances leave the table entirely. The section heading still says how many are hidden.',
+  filterNothingSelected:
+    'The filter is on but nothing is selected, so nothing is being filtered. Pick a status, a plan, or a quota window.',
   // Section captions inside the flyout.
-  usageFilterWindows: 'Quota windows',
-  usageFilterDisplay: 'Display behaviour',
+  filterStatusSection: 'Status',
+  filterPlanSection: 'Plan',
+  filterWindows: 'Quota windows',
+  filterDisplay: 'Display behaviour',
+  // Status facet: is the instance's app open?
+  filterStatusAny: 'Any',
+  filterStatusOpen: 'Open',
+  filterStatusClosed: 'Closed',
+  filterStatusHint:
+    'Whether an instance is running right now. Rows that cannot be open or closed — an unlinked CLI login has no window of its own — are never set aside by this.',
+  // Plan facet: which account types to keep.
+  filterPlanAll: 'Any plan',
+  filterPlanHint:
+    'Keep only the accounts on the plans you pick; picking none means every plan. An account whose plan has not been read yet is never set aside — an unknown plan is not a different one.',
+  filterPlanEmpty: 'No plans read yet. They appear here as accounts resolve.',
   // One switch + one threshold per quota window; an instance is set aside when it crosses either.
-  usageFilterWeek: 'Weekly usage',
-  usageFilterWeekHint:
+  filterWeek: 'Weekly usage',
+  filterWeekHint:
     'The Usage column — the cap that decides whether an account is worth starting on at all. Instances at or above the threshold are set aside. Instances that have never been checked are never filtered: an unknown reading is not a full one.',
-  usageFilterWeekThresholdLabel: 'Weekly usage threshold, percent',
-  usageFilterSession: 'Also 5-hour usage',
-  usageFilterSessionHint:
+  filterWeekThresholdLabel: 'Weekly usage threshold, percent',
+  filterSession: 'Also 5-hour usage',
+  filterSessionHint:
     'Also set an instance aside when its 5-hour session window is at or above its own threshold, even if there is weekly quota left — a spent session means you cannot use the account right now. Off by default: this window refills the same day, so instances leave the table and come back over an afternoon.',
-  usageFilterSessionThresholdLabel: '5-hour usage threshold, percent',
-  usageFilterNoWindows: 'Both windows are off, so nothing is being filtered. Turn one back on.',
+  filterSessionThresholdLabel: '5-hour usage threshold, percent',
+  filterNoWindows: 'Both quota windows are off, so quota is not part of the filter.',
+  filterQuotaNeedsUsageMode:
+    'Quota filtering waits for the usage columns — turn them on with the stopwatch button, and these thresholds start applying again.',
   // Compact form of the rule, on the toolbar button. A bare percentage is the weekly cap.
-  usageFilterChipWeek: '{pct}%',
-  usageFilterChipSession: '5h {pct}%',
-  usageFilterChipBoth: '{week}% · 5h {session}%',
-  usageFilterChipNone: 'Off',
-  usageFilterHiddenCount: '{count} hidden',
-  usageFilterAllHidden: 'Every instance is at or above the usage filter.',
-  usageFilterAllHiddenHint:
-    'Raise the thresholds, or turn the usage filter off in the toolbar. It says what it is filtering on.',
+  filterChipWeek: '{pct}%',
+  filterChipSession: '5h {pct}%',
+  filterChipBoth: '{week}% · 5h {session}%',
+  filterChipPlans: '{count} plans',
+  filterChipNone: 'Off',
+  filterHiddenCount: '{count} hidden',
+  filterAllHidden: 'Every instance is filtered out.',
+  filterAllHiddenHint:
+    'Loosen the filter in the toolbar, or turn it off. The button says what it is filtering on.',
   // "x of y" for a heading whose table is showing fewer rows than it has.
   countOfTotal: '{shown} of {total}',
   // Sections flyout (toolbar) — the same provider switches Settings shows, where they apply.

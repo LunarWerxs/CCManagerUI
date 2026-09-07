@@ -112,6 +112,28 @@ ELIDED = ("…", "...")
 IDLE_WAIT_CAP = 360
 # How often to re-ask while waiting, when the deficit is not itself the answer.
 IDLE_WAIT_POLL_SECS = 15
+# How many consecutive naps may pass with the quiet counter FAILING TO GROW before the wait
+# gives up and calls the engine what it is: writing.
+#
+# ⛔ THIS IS THE DIFFERENCE BETWEEN "YOUNG" AND "WORKING", AND R_TOO_SOON CANNOT TELL THEM
+# APART (found in the field, 2026-09-06). idle_report answers R_TOO_SOON for a chat whose
+# tail the gate has not read yet - "quiet for only 1s, the gate reads the tail at 15s" - and
+# that refusal really is one time cures, for a chat that has finished. For a chat that is
+# STREAMING it is a lie that renews itself: every token written resets quiet_secs to ~1, the
+# deficit is 14s again on every lap, and the loop sleeps out its entire budget before
+# refusing anyway. Measured on a real sweep: three refused chats cost 65s, 66s and 18s of
+# pure waiting and moved nothing - a third of the batch's wall clock.
+#
+# The tell is not the quiet reading itself but its TRAJECTORY. Sleep n seconds over a silent
+# transcript and quiet_secs comes back roughly n higher; come back to the SAME reading and
+# something wrote during the nap. Two consecutive naps like that is proof of an engine
+# producing output, and no amount of further waiting is bounded - which is exactly R_WORKING.
+#
+# Why two and not one: a single reset can be one last flush as a turn ends, and refusing
+# there would invent a refusal for a chat that was 15 seconds from being movable. A false
+# refusal is worse than a slow success, because the chat does not move at all. Two costs one
+# extra nap and cannot fire on a chat that has genuinely stopped writing.
+IDLE_WAIT_STREAMING_LAPS = 2
 # How long to give the source app to write its archive flag after its own control settled
 # the row. Polled, not slept: the usual case lands in well under a second.
 SETTLE_CONFIRM_SECS = 3.0
@@ -730,6 +752,8 @@ def _stop_idle_engine_or_raise(match: dict, query: str, chat_title, session_id: 
     # today's speed, because no amount of sleeping makes those safe.
     deadline = time.time() + idle_wait
     waited_for = 0
+    # Consecutive naps the transcript was written during - see IDLE_WAIT_STREAMING_LAPS.
+    streaming_laps = 0
     # The budget is bounded TWO ways on purpose - by the wall clock and by the seconds we
     # have actually slept. Either alone is a way to hang: a clock that does not advance (a
     # suspended host, a frozen mock) defeats the deadline, and a sleep that returns early
@@ -743,6 +767,9 @@ def _stop_idle_engine_or_raise(match: dict, query: str, chat_title, session_id: 
         deficit = int(stopped.get("needs_secs") or 0) - int(stopped.get("quiet_secs") or 0)
         left = min(idle_wait - waited_for, max(0, int(deadline - time.time())))
         nap = max(1, min(deficit if deficit > 0 else IDLE_WAIT_POLL_SECS, left))
+        # The quiet reading going INTO this nap. Compared against the reading coming out to
+        # tell a chat that is running down its clock from one that keeps resetting it.
+        quiet_before = stopped.get("quiet_secs")
         time.sleep(nap)
         waited_for += nap
         # ⛔ RE-RESOLVE, never re-use the pre-sleep match: stop_idle_engine taskkills
@@ -772,6 +799,32 @@ def _stop_idle_engine_or_raise(match: dict, query: str, chat_title, session_id: 
             if bg is not None:
                 notes["backgroundTasks"] = bg
         stopped = enginelib.stop_idle_engine(match, min_quiet, idle_after)
+        # ⛔ DID THE CLOCK ACTUALLY RUN DOWN, OR DID SOMETHING WRITE? A silent transcript comes
+        # back about `nap` seconds quieter; a reading that did not GROW means the engine wrote
+        # during the sleep, so the deficit this loop is chasing will simply be re-created on
+        # every lap until the budget is gone. Count those laps, and once there are enough to
+        # be evidence rather than a coincidence, stop calling it R_TOO_SOON - a refusal time
+        # cures - and call it what it is. Only R_TOO_SOON is compared: any other code already
+        # exits the loop on its own terms, and a None reading proves nothing either way.
+        quiet_after = stopped.get("quiet_secs")
+        if (stopped.get("reason") == enginelib.R_TOO_SOON
+                and isinstance(quiet_before, int) and isinstance(quiet_after, int)
+                and quiet_after <= quiet_before):
+            streaming_laps += 1
+            if streaming_laps >= IDLE_WAIT_STREAMING_LAPS:
+                stopped = {
+                    **stopped,
+                    "reason": enginelib.R_WORKING,
+                    "why": (f"the engine is alive and WRITING - quiet was {quiet_before}s, slept "
+                            f"{nap}s, and it came back {quiet_after}s ({streaming_laps} naps in a "
+                            f"row), so it is producing output rather than running down its window; "
+                            f"more waiting is unbounded"),
+                }
+                break
+        else:
+            # Any lap that made real progress clears the count: two NON-consecutive resets are
+            # a chat that wrote twice, not a chat that is streaming.
+            streaming_laps = 0
     if stopped.get("stopped"):
         waited = f" after waiting {int(waited_for)}s" if waited_for else ""
         ledgerlib.annotate("migrate", session_id,

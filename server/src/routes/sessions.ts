@@ -1,8 +1,9 @@
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
-import { chatDossier } from '../chat-dossier'
+import { chatDossier, listChats } from '../chat-dossier'
 import { CLIPBOARD_DIR } from '../config'
+import { resolveInstance } from '../core/instance-ref'
 import { db, getSetting } from '../db'
 import { contentDispositionAttachment, safeTranscriptFilename } from '../filenames'
 import { app } from '../http-app'
@@ -53,6 +54,64 @@ function queryEpoch(raw: string | undefined): number | null {
 /** Session, transcript and chat-management routes: listing, search, export, tail, secrets scan,
  *  file/clipboard delivery, and the desktop chat rename + dossier lookups. See index.ts for the
  *  app-wide middleware these routes run behind. */
+
+// The columns `fields=compact` keeps: which session, what it is called, where it ran, when it
+// last moved, and whether it is archived. Everything a caller needs to CHOOSE a session; nothing
+// it needs only after choosing one.
+//
+// ⛔ WHY A PROJECTION EXISTS AT ALL (2026-09-06): a full row is 27 fields and ~2KB, of which
+// transcript_path, last_text_preview, queue_status and limit_stop are most of the weight. One
+// 206-session account came to 117,432 characters and was refused by an agent's token cap before
+// a single row was read — a list nobody can receive answers nothing, and lowering `limit` to fit
+// silently hides sessions instead. Opt-in, so the web UI's full rows are untouched.
+const COMPACT_SESSION_FIELDS = [
+  'session_id',
+  'source',
+  'title',
+  'cwd',
+  'instance',
+  'archived',
+  'last_activity_at',
+  'message_count',
+] as const
+
+/** Narrow each row to the requested columns, or return them untouched when none were asked for.
+ *  An unknown column name is a 400 rather than a silently missing field: a caller that asked for
+ *  `titel` and got rows without it would read that as "these sessions have no title". */
+function projectSessionRows(
+  rows: unknown,
+  spec: string | undefined,
+): { rows: unknown } | { error: string } {
+  if (!spec?.trim() || !Array.isArray(rows)) return { rows }
+  const asked =
+    spec.trim() === 'compact'
+      ? [...COMPACT_SESSION_FIELDS]
+      : spec
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+  const first = rows[0]
+  if (first && typeof first === 'object') {
+    const known = new Set(Object.keys(first as Record<string, unknown>))
+    const unknown = asked.filter((k) => !known.has(k))
+    if (unknown.length)
+      return {
+        error: `unknown field(s): ${unknown.join(', ')}. Valid: ${[...known].sort().join(', ')}`,
+      }
+  }
+  // session_id always survives, whatever was asked for: a row nobody can address again is not a
+  // cheaper row, it is a useless one.
+  const keep = new Set<string>(['session_id', ...asked])
+  return {
+    rows: rows.map((r) =>
+      r && typeof r === 'object'
+        ? Object.fromEntries(
+            Object.entries(r as Record<string, unknown>).filter(([k]) => keep.has(k)),
+          )
+        : r,
+    ),
+  }
+}
 // --- sessions -----------------------------------------------------------------
 app.get('/api/sessions', async (c) => {
   const limit = c.req.query('limit')
@@ -80,20 +139,25 @@ app.get('/api/sessions', async (c) => {
   // filter client-side is how a 1,200-session store gets streamed to answer a 20-row question.
   const since = queryEpoch(c.req.query('since'))
   const until = queryEpoch(c.req.query('until'))
-  return c.json(
-    await listSessions({
-      limit: boundedQueryInt(limit, 200, 500),
-      offset: boundedQueryInt(c.req.query('offset'), 0, 100_000, 0),
-      instance: instance || undefined,
-      archived: scope,
-      sinceMs: since ?? periodCutoffMs(period),
-      untilMs: until,
-      source,
-      dispatched,
-      rateLimited,
-      project: c.req.query('project') || undefined,
-    }),
-  )
+  const rows = await listSessions({
+    limit: boundedQueryInt(limit, 200, 500),
+    offset: boundedQueryInt(c.req.query('offset'), 0, 100_000, 0),
+    instance: instance || undefined,
+    archived: scope,
+    sinceMs: since ?? periodCutoffMs(period),
+    untilMs: until,
+    source,
+    dispatched,
+    rateLimited,
+    project: c.req.query('project') || undefined,
+  })
+  // ⛔ PROJECTED AFTER listSessions, never inside it. listSessions owns the paging contract -
+  // offset is paid in REAL rows so page 2 starts where page 1 stopped - and narrowing columns
+  // before that slice would change nothing about which rows are returned but would put the
+  // projection on the wrong side of the one invariant this list has.
+  const projected = projectSessionRows(rows, c.req.query('fields'))
+  if ('error' in projected) return c.json({ error: projected.error }, 400)
+  return c.json(projected.rows)
 })
 // Every folder that has conversations in it, from the index alone (no transcript reads). This is
 // how a client that was told "search all my chat histories" finds out what "all" is: the session
@@ -167,6 +231,52 @@ app.get('/api/chats/dossier', (c) => {
   if (!q.trim())
     return c.json({ error: 'q required: a title fragment or any session/chat id' }, 400)
   return c.json(chatDossier(q.trim()))
+})
+// One desktop instance's chats, compactly — the read that did not exist until 2026-09-06, when
+// answering "what does this account hold" cost five round trips and produced a wrong number.
+// See listChats in chat-dossier.ts for why it lives beside the dossier rather than in sessions.ts.
+app.get('/api/chats', async (c) => {
+  const raw = (c.req.query('instance') ?? '').trim()
+  let instances: string[] | undefined
+  if (raw) {
+    // Any spelling move_chat accepts — number, email, account name, ref, or the directory label
+    // itself. A label that the registry does not know is passed through rather than rejected:
+    // the result carries every label the scan saw, so a typo shows up as an empty list beside
+    // the real names instead of as a 404 with no clue in it.
+    const hit = await resolveInstance(raw)
+    if (hit && hit.kind !== 'desktop')
+      return c.json(
+        {
+          error: `instance ${raw} is a ${hit.kind} instance; desktop chats live only on desktop instances`,
+        },
+        400,
+      )
+    instances = [hit ? basename(hit.handle.replace(/[\\/]+$/, '')) : raw]
+  }
+  const archived = c.req.query('archived')
+  const got = listChats({
+    instances,
+    // Same defensive read as /api/sessions: an unrecognized scope shows the live list rather
+    // than silently burying it under the archived majority.
+    archived: archived === 'include' || archived === 'only' ? archived : 'hide',
+    q: c.req.query('q') || undefined,
+    limit: boundedQueryInt(c.req.query('limit'), 200, 1000),
+    offset: boundedQueryInt(c.req.query('offset'), 0, 100_000, 0),
+  })
+  // ⛔ AN INSTANCE THAT DOES NOT EXIST MUST NOT LOOK LIKE AN INSTANCE WITH NO CHATS. Both are
+  // `{rows: [], counts: {all: 0}}`, and the second is a real and reassuring answer, so a typo or
+  // an ambiguous email would read as "that account is empty" - the exact class of silently-wrong
+  // answer this whole endpoint exists to stop. Only fires when the scan saw NOTHING under the
+  // label, so a real but genuinely empty account still answers 200.
+  if (instances && !got.instances.includes(instances[0] as string))
+    return c.json(
+      {
+        error: `no desktop instance matched "${raw}". Known chat-store labels: ${got.instances.join(', ')}`,
+        instances: got.instances,
+      },
+      404,
+    )
+  return c.json(got)
 })
 // How many sessions hold a LIVE engine process right now — ONE cheap authoritative read of
 // the same pid-checked registry the dossier's `live` field answers from, so the two can

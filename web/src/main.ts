@@ -35,7 +35,7 @@ async function mountApp(): Promise<void> {
   }
 
   // Pull the cross-window preferences (usage mode + usage filter). AFTER the mount above, and it
-  // has to be after: registration happens when composables/useUsageFilter.ts and useUsageMode.ts
+  // has to be after: registration happens when composables/useInstanceFilter.ts and useUsageMode.ts
   // are first imported, which is part of loading the view chunk. Hoisted to module scope this would
   // run against an empty registry and silently apply nothing.
   //

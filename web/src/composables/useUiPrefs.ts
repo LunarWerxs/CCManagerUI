@@ -6,7 +6,7 @@
 // mount's ref is ever the mirrored one, and a view behind a tab unmounts the moment you switch
 // away — after which that ref is detached and every later change to the preference goes nowhere.
 // Module scope is what makes "one ref per preference, for the life of the window" true, the same
-// reasoning composables/useUsageMode.ts and useUsageFilter.ts already carry.
+// reasoning composables/useUsageMode.ts and useInstanceFilter.ts already carry.
 //
 // Why mirror them at all: the full daemon HOPS to 7788/7789/… whenever its preferred port is busy,
 // and a browser scopes localStorage to scheme+host+PORT. Every hop is therefore a new origin with

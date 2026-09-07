@@ -48,7 +48,16 @@ const noData = computed(() => !props.snapshot || isNoDataSnap(props.snapshot))
 // `now` is threaded through so a chip whose window resets while the table is open drops to "—" on
 // the next tick, instead of asserting a superseded percentage until someone clicks refresh.
 const label = computed(() => usageCellLabel(props.snapshot, props.scope, false, now.value))
+// COLOUR IS SPENT ON THE WEEKLY CHIP ONLY.
+//
+// A usage-mode row carries four quota cells, and colouring all four leaves the row with no
+// emphasis to give: the eye has to read each hue to find the one that matters. The 5-hour window
+// is the one that gives its colour up, because it refills the same afternoon — a spent session
+// says "not right now", a spent WEEK says "not at all", and only the second is worth an alarm.
+// The session chip keeps its number and its popover; it just stops shouting. Same rule, same
+// reason, as UsageBar's `neutral` variant on the Session column beside it.
 const variant = computed(() => {
+  if (props.scope === 'session') return 'outline'
   const pct = usagePctFor(props.snapshot, props.scope, now.value)
   return pct == null ? 'outline' : usageBadgeVariant(pct)
 })

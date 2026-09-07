@@ -5,7 +5,13 @@ import { describe, expect, test } from 'bun:test'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { chatDossier, chatMatches, collectChats, lineageIdsOf } from '../src/chat-dossier'
+import {
+  chatDossier,
+  chatMatches,
+  collectChats,
+  lineageIdsOf,
+  listChats,
+} from '../src/chat-dossier'
 
 function fixtureRoot(): { dir: string; label: string } {
   const dir = join(tmpdir(), `dossier-fixture-${Math.random().toString(36).slice(2)}`)
@@ -78,5 +84,73 @@ describe('chat-dossier', () => {
   test('a blank-ish query still behaves: no match means an empty list, never a throw', () => {
     const { matches } = chatDossier('zzz-not-a-chat', { roots: [root] })
     expect(matches).toEqual([])
+  })
+
+  test('the archive flag is emitted under BOTH names, and they cannot disagree', () => {
+    // The store calls it isArchived; this API has always called it archived. Reading the
+    // documented name off the raw store returned undefined for all 206 chats on a real
+    // account - "not archived" - when 205 were archived, and nothing errored (2026-09-06).
+    for (const c of collectChats([root])) expect(c.isArchived).toBe(c.archived)
+  })
+})
+
+describe('listChats', () => {
+  const root = fixtureRoot()
+  const opts = { roots: [root], liveIds: new Map<string, number>() }
+
+  test('archived is hidden by default, matching move_chats', () => {
+    const got = listChats({}, opts)
+    expect(got.rows.map((r) => r.title)).toEqual(['Unrelated work'])
+    expect(got.total).toBe(1)
+  })
+
+  test('counts describe the WHOLE account, never just the filtered page', () => {
+    // ⛔ THE REGRESSION THIS EXISTS TO PREVENT. One unarchived row on a 206-chat account is
+    // the normal case, and a caller that sees only that row concludes the account is empty -
+    // which is exactly the wrong answer that motivated this tool. The counts must not move
+    // when the archive scope does.
+    const hidden = listChats({}, opts)
+    const included = listChats({ archived: 'include' }, opts)
+    const only = listChats({ archived: 'only' }, opts)
+    for (const got of [hidden, included, only])
+      expect(got.counts).toEqual({ all: 2, unarchived: 1, archived: 1, live: 0 })
+    expect(included.rows.length).toBe(2)
+    expect(only.rows.map((r) => r.title)).toEqual(['Rolling thread'])
+  })
+
+  test('live is read from the registry index and lands on the right chat, by ANY lineage id', () => {
+    // 'prior-id-b' is a rolled-away id: a live engine registered under it still belongs to
+    // this chat, and a move would still be refused for it.
+    const got = listChats(
+      { archived: 'include' },
+      { roots: [root], liveIds: new Map([['prior-id-b', 4242]]) },
+    )
+    const rolling = got.rows.find((r) => r.title === 'Rolling thread')
+    const other = got.rows.find((r) => r.title === 'Unrelated work')
+    expect(rolling?.live).toBe(true)
+    expect(rolling?.livePid).toBe(4242)
+    expect(other?.live).toBe(false)
+    expect(other?.livePid).toBe(null)
+    expect(got.counts.live).toBe(1)
+  })
+
+  test('an unknown instance label returns nothing but names the labels that do exist', () => {
+    const got = listChats({ instances: ['typo'], archived: 'include' }, opts)
+    expect(got.rows).toEqual([])
+    expect(got.counts.all).toBe(0)
+    expect(got.instances).toEqual(['fixture'])
+  })
+
+  test('rows are newest-first, an UNDATED chat sorts last, and paging slices that order', () => {
+    // 'Unrelated work' carries no lastActivityAt. The dossier's sort compares (x ?? ''), where
+    // an empty string beats every real ISO timestamp - fine for a handful of query matches,
+    // wrong for a list, where it would head the first page a caller reads with the chat we
+    // know least about.
+    const all = listChats({ archived: 'include' }, opts)
+    expect(all.rows.map((r) => r.title)).toEqual(['Rolling thread', 'Unrelated work'])
+    const page2 = listChats({ archived: 'include', limit: 1, offset: 1 }, opts)
+    expect(page2.rows.map((r) => r.title)).toEqual(['Unrelated work'])
+    // total is the match count, NOT the page size - a capped page must never read as the whole set.
+    expect(page2.total).toBe(2)
   })
 })

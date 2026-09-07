@@ -11,6 +11,9 @@ export default {
   colPlan: 'Plan',
   colHome: 'CODEX_HOME',
   colActions: 'Actions',
+  /** "x of y" for a heading whose table is showing fewer rows than it has — the filter is hiding
+   *  the rest. */
+  countOfTotal: '{shown} of {total}',
   /** An OPENAI_API_KEY login: a valid Codex auth, but no ChatGPT subscription and so no plan
    *  or quota to report. */
   authApiKey: 'API key',

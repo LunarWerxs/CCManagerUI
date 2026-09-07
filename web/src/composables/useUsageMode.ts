@@ -23,7 +23,7 @@ import { registerSharedPref } from './useSharedPrefs'
  * memory answer "is the process healthy", which is the rarer follow-up. The toolbar toggle is one
  * click away for anyone who wants the process columns back.
  *
- * `.usageMode2`, not `.usageMode` — the same reasoning as useUsageFilter's `.scope2`, and it is
+ * `.usageMode2`, not `.usageMode` — the same reasoning as useInstanceFilter's `.scope2`, and it is
  * the whole reason a new key exists rather than a flipped default. useStorage WRITES its default
  * on first read, so every install that has ever rendered this tab already has an explicit `false`
  * on disk; changing the default alone would reach nobody who has used the app. The stale key is a

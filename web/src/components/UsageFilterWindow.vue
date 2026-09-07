@@ -2,7 +2,7 @@
 // One quota window inside the usage flyout: a switch that says whether the window is measured at
 // all, and — only once it is — the line it is measured against.
 //
-// A component rather than two copies in UsageFilterMenu.vue because the weekly cap and the 5-hour
+// A component rather than two copies in InstanceFilterMenu.vue because the weekly cap and the 5-hour
 // session are the SAME control twice over. They are also the two halves of one comparison, so any
 // drift between them (a preset row on one, a differently-sized readout on the other) reads as the
 // two windows working differently rather than as a styling slip.
@@ -20,7 +20,7 @@ import ExpandTransition from '@/shell/ExpandTransition.vue'
 import InfoHint from '@/shell/InfoHint.vue'
 
 // Every string arrives as a PROP — there is not a t() or $t() left in here. The quick-instances
-// window (QuickUsageFilter.vue) renders these same two windows and deliberately runs without
+// window (QuickInstanceFilter.vue) renders these same two windows and deliberately runs without
 // vue-i18n installed, so a translate call anywhere in this subtree would throw there. Taking the
 // last two literals ("Set aside at" / the preset captions) as props is what lets both surfaces
 // share one slider, one preset row and one clamped setter instead of growing a second copy of the

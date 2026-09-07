@@ -92,6 +92,78 @@ class WaitOnlyForTooSoonTest(unittest.TestCase):
         self.assertLessEqual(sum(sleeps), 60, f"slept past the budget: {sleeps}")
 
 
+class StreamingEngineIsNotAYoungOneTest(unittest.TestCase):
+    """⛔ A deficit that never shrinks is a WRITING engine, not one about to settle.
+
+    Measured on a real sweep (2026-09-06): three chats refused after 65s, 66s and 18s of
+    pure waiting - a third of the batch's wall clock - because idle_report answers
+    R_TOO_SOON ("quiet for only 1s, the gate reads the tail at 15s") for a chat that is
+    STREAMING just as it does for one that has finished. Every token written resets
+    quiet_secs, so the deficit is re-created on every lap and the loop sleeps out its whole
+    budget before refusing anyway.
+
+    The tell is the TRAJECTORY, not the reading: sleep n seconds over a silent transcript
+    and quiet comes back ~n higher. These pin both directions - the guard must fire on a
+    reading that keeps resetting, and must NOT fire on one that is genuinely counting up."""
+
+    def setUp(self):
+        isolate_state_dir(self)
+
+    def _run(self, stop_returns, argv_extra):
+        sleeps = []
+        stops = list(stop_returns)
+        with mock.patch.object(migrate_chat, "resolve_for_migrate", return_value=_match()), \
+             mock.patch.object(hydralib, "fleet", return_value=FLEET), \
+             mock.patch.object(migrate_chat, "resolve_instance", return_value=TARGET), \
+             mock.patch.object(holdlib, "why_blocked", return_value=None), \
+             mock.patch.object(enginelib, "stop_idle_engine",
+                               side_effect=lambda *a, **k: stops.pop(0) if len(stops) > 1 else stops[0]), \
+             mock.patch.object(migrate_chat.time, "sleep", side_effect=sleeps.append):
+            code = migrate_chat.main(["sid-1", "--to", "11", "--stop-idle", "--json"] + argv_extra)
+        return code, sleeps
+
+    def test_a_streaming_engine_gives_up_in_two_naps_not_the_whole_budget(self):
+        """quiet stuck at 1s forever: refuse after IDLE_WAIT_STREAMING_LAPS, not after 300s."""
+        code, sleeps = self._run([_refusal(enginelib.R_TOO_SOON, 1, 15)], ["--idle-wait", "300"])
+        self.assertEqual(code, 4)
+        self.assertEqual(len(sleeps), migrate_chat.IDLE_WAIT_STREAMING_LAPS,
+                         f"expected {migrate_chat.IDLE_WAIT_STREAMING_LAPS} naps then a refusal, got {sleeps}")
+        self.assertLessEqual(sum(sleeps), 30,
+                             f"a streaming engine must not cost the whole budget: {sleeps}")
+
+    def test_one_reset_is_not_enough_to_refuse(self):
+        """A single write can be a turn's last flush. Refusing there invents a refusal for a
+        chat that was seconds from movable, and a false refusal means it never moves at all."""
+        stops = [_refusal(enginelib.R_TOO_SOON, 1, 15),
+                 _refusal(enginelib.R_TOO_SOON, 1, 15),
+                 _refusal(enginelib.R_TOO_SOON, 200, 300)]
+        code, sleeps = self._run(stops, ["--idle-wait", "300"])
+        # A no-regression pin, not a bug reproduction: this one stays green with the guard
+        # removed, and that is the point - it fails only if the guard OVER-fires. The literal
+        # 2 is the two-consecutive-resets threshold; comparing against the constant instead
+        # would make the assertion move whenever the constant did, which pins nothing.
+        self.assertGreater(len(sleeps), 2,
+                           f"one reset followed by real progress must keep waiting: {sleeps}")
+        self.assertEqual(sleeps[:2], [14, 14], f"the first two naps are the deficit: {sleeps}")
+
+    def test_an_engine_counting_up_is_still_waited_out(self):
+        """The ordinary case the flag exists for must be untouched: quiet grows every lap."""
+        stops = [_refusal(enginelib.R_TOO_SOON, 253, 300),
+                 _refusal(enginelib.R_TOO_SOON, 290, 300),
+                 {"stopped": True, "pid": 4242, "reason": enginelib.R_IDLE,
+                  "quiet_secs": 300, "needs_secs": 300, "why": "idle"}]
+        with mock.patch.object(migrate_chat, "_land", create=True):
+            code, sleeps = self._run(stops, ["--idle-wait", "300"])
+        self.assertEqual(sleeps, [47, 10],
+                         f"a growing quiet reading must not be read as streaming: {sleeps}")
+
+    def test_the_lap_count_is_small_enough_to_be_worth_having(self):
+        self.assertGreaterEqual(migrate_chat.IDLE_WAIT_STREAMING_LAPS, 2,
+                                "one lap cannot tell a last flush from a stream")
+        self.assertLessEqual(migrate_chat.IDLE_WAIT_STREAMING_LAPS, 3,
+                             "more laps than this and the guard costs more than it saves")
+
+
 class WaitArgumentTest(unittest.TestCase):
     def test_the_cap_is_enforced_and_bad_values_are_deterministic(self):
         for bad in (["--idle-wait"], ["--idle-wait", "abc"], ["--idle-wait", "-5"]):

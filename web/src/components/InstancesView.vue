@@ -36,13 +36,13 @@ import CreateInstanceDialog from '@/components/CreateInstanceDialog.vue'
 import DeleteInstanceDialog from '@/components/DeleteInstanceDialog.vue'
 import EditInstanceDialog from '@/components/EditInstanceDialog.vue'
 import ExpandArea from '@/components/ExpandArea.vue'
+import InstanceFilterMenu from '@/components/InstanceFilterMenu.vue'
 import InstanceNumber from '@/components/InstanceNumber.vue'
 import InstanceSectionsMenu from '@/components/InstanceSectionsMenu.vue'
 import LogoutInstanceDialog from '@/components/LogoutInstanceDialog.vue'
 import QuitExternalInstanceDialog from '@/components/QuitExternalInstanceDialog.vue'
 import UsageBadge from '@/components/UsageBadge.vue'
 import UsageBar from '@/components/UsageBar.vue'
-import UsageFilterMenu from '@/components/UsageFilterMenu.vue'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -76,11 +76,12 @@ import {
 } from '@/components/ui/table'
 import { useAppSettings } from '@/composables/useAppSettings'
 import { useCliInstances } from '@/composables/useCliInstances'
+import { useCodexInstances } from '@/composables/useCodexInstances'
+import { useInstanceFilter } from '@/composables/useInstanceFilter'
 import { useInstances } from '@/composables/useInstances'
 import { useSortable } from '@/composables/useSortable'
 import { useUiPrefs } from '@/composables/useUiPrefs'
 import { useUsage } from '@/composables/useUsage'
-import { useUsageFilter } from '@/composables/useUsageFilter'
 import { useUsageMode } from '@/composables/useUsageMode'
 import type { CliInstance, CMDesktopInstall, CMInstance, SessionSummary } from '@/lib/api'
 import {
@@ -102,6 +103,7 @@ import {
   resolveColorKey,
   resolveIconKey,
 } from '@/lib/instance-appearance'
+import type { InstanceFacts } from '@/lib/instance-filter'
 import { groupByProject } from '@/lib/session-groups'
 import { requestSessionJump } from '@/lib/session-jump'
 import { useTooltipConfig } from '@/lib/tooltip-config'
@@ -165,18 +167,17 @@ function sessionResetFor(inst: CMInstance): string | null {
 function weeklyResetFor(inst: CMInstance): string | null {
   return resetLabel(usageFor(inst)?.weekAll, now.value)
 }
-// How much of each window is still to run. This ONE number drives both the bar's length and its
-// colour (waitSeverity bands it as a fraction of its own window), so short+green = nearly back and
-// long+red = most of the window still ahead — on a 5-hour session exactly as on a 7-day week.
+// How much of each window is still to run — the bar's LENGTH, on both windows.
 function sessionRemaining(inst: CMInstance): number {
   return windowRemainingPct(usageFor(inst)?.session, SESSION_WINDOW_MS, now.value) ?? 0
 }
 function weeklyRemaining(inst: CMInstance): number {
   return windowRemainingPct(usageFor(inst)?.weekAll, WEEK_WINDOW_MS, now.value) ?? 0
 }
-function sessionWait(inst: CMInstance) {
-  return waitSeverity(sessionRemaining(inst))
-}
+// Colour, on the WEEKLY window only. Same number as the length (waitSeverity bands it as a
+// fraction of its own window), so short+green = nearly back and long+red = most of the week still
+// ahead. The 5-hour bar beside it is drawn `neutral` — see UsageBar's UsageBarVariant for why the
+// row spends its colour on the window that decides whether an account is worth starting on.
 function weeklyWait(inst: CMInstance) {
   return waitSeverity(weeklyRemaining(inst))
 }
@@ -215,13 +216,24 @@ const { sortedRows, toggleSort, indicatorFor } = useSortable(
   ],
 )
 
-// --- usage filter ---------------------------------------------------------------------------
-// "Set aside the accounts I've already spent" (composables/useUsageFilter.ts). It runs AFTER the
-// sort — it removes or greys rows, it never reorders them — and only in usage mode, which is also
-// the only mode where its toolbar control is on screen.
-const { dimmed: filterDimmed, visible: filterVisible } = useUsageFilter()
+// --- filter -----------------------------------------------------------------------------------
+// "Show me the rows I'm after" (composables/useInstanceFilter.ts): open or closed, which plan, how
+// much quota is left. It runs AFTER the sort — it removes or greys rows, it never reorders them.
+const { dimmed: filterDimmed, visible: filterVisible } = useInstanceFilter()
 
-const visibleRows = computed(() => filterVisible(sortedRows.value, usageFor))
+/** What one row is, as far as the filter is concerned. A desktop instance knows all three facts:
+ *  it has a window that is open or shut, and an account with a plan and a quota reading. */
+const filterFacts = (inst: CMInstance): InstanceFacts => ({
+  usage: usageFor(inst),
+  open: inst.isRunning,
+  plan: inst.account?.planLabel ?? null,
+  // `loginUuid`, not `account`: account is resolved lazily and is null for a second after every
+  // refresh, which would make signed-in rows flicker out of a filtered table. loginUuid is read
+  // straight off config.json with every list.
+  signedIn: inst.loginUuid != null,
+})
+
+const visibleRows = computed(() => filterVisible(sortedRows.value, filterFacts))
 /** How many rows the filter took out of this table — the heading has to say so, or an instance
  *  that quietly stopped being listed reads as a bug rather than as the filter working. */
 const hiddenByFilter = computed(() => sortedRows.value.length - visibleRows.value.length)
@@ -230,6 +242,22 @@ const hiddenByFilter = computed(() => sortedRows.value.length - visibleRows.valu
 const allHiddenByFilter = computed(
   () => instances.value.length > 0 && visibleRows.value.length === 0,
 )
+
+/**
+ * The plan labels the FILTER FLYOUT offers, gathered from every table it can act on.
+ *
+ * Read from the module-scope singletons rather than passed down, because the plans on offer are a
+ * property of the whole tab, not of this table: filtering to "Pro" has to be possible when the only
+ * Pro account on the machine is a Codex one. Reading `instances` does not start that section's
+ * polling — it is rendered below and does its own — so an unused provider simply contributes
+ * nothing. (CLI logins have no plan of their own: a linked one shares its desktop row's account,
+ * and an unlinked one carries no account record at all.)
+ */
+const { instances: codexInstances } = useCodexInstances()
+const presentPlans = computed(() => [
+  ...instances.value.map((i) => i.account?.planLabel),
+  ...codexInstances.value.map((i) => i.account?.planLabel),
+])
 
 // Collapse state, persisted: someone who only uses the desktop app (or only the CLI) collapses the
 // other table once and expects it to stay that way. Owned by composables/useUiPrefs.ts, which is
@@ -876,7 +904,7 @@ onUnmounted(() => {
           v-if="showDesktopInstances && hiddenByFilter > 0"
           class="text-xs font-normal text-muted-foreground"
         >
-          {{ $t('instances.usageFilterHiddenCount', { count: hiddenByFilter }) }}
+          {{ $t('instances.filterHiddenCount', { count: hiddenByFilter }) }}
         </span>
         <ChevronDown
           v-if="showDesktopInstances"
@@ -902,10 +930,11 @@ onUnmounted(() => {
             <component :is="usageMode ? Cpu : Timer" />
           </Button>
         </IconTooltip>
-        <!-- The usage filter appears WITH the quota columns and disappears with them, because that
-             is exactly when it is allowed to act (see composables/useUsageFilter.ts): a dimmed or
-             short table always has the control that explains it visible in the same toolbar. -->
-        <UsageFilterMenu v-if="usageMode" />
+        <!-- Always here, in both column modes: status and plan are true whichever columns are on
+             screen, and only the QUOTA facet stands down with them (see
+             composables/useInstanceFilter.ts). A dimmed or short table must always have the
+             control that explains it visible in the same toolbar. -->
+        <InstanceFilterMenu :present-plans="presentPlans" />
         <!-- Which tables this tab draws. Settings still has these switches; this is the copy that
              is one click from the gap where a hidden table used to be. -->
         <InstanceSectionsMenu />
@@ -1108,14 +1137,14 @@ onUnmounted(() => {
               <p class="font-medium text-foreground">
                 {{
                   allHiddenByFilter
-                    ? $t('instances.usageFilterAllHidden')
+                    ? $t('instances.filterAllHidden')
                     : $t('instances.empty')
                 }}
               </p>
               <p class="text-xs text-muted-foreground">
                 {{
                   allHiddenByFilter
-                    ? $t('instances.usageFilterAllHiddenHint')
+                    ? $t('instances.filterAllHiddenHint')
                     : $t('instances.emptyHint')
                 }}
               </p>
@@ -1163,7 +1192,7 @@ onUnmounted(() => {
             v-for="inst in visibleRows"
             :key="inst.dir"
             class="transition-opacity"
-            :class="filterDimmed(usageFor(inst)) ? 'opacity-25 hover:bg-transparent' : ''"
+            :class="filterDimmed(filterFacts(inst)) ? 'opacity-25 hover:bg-transparent' : ''"
             @contextmenu.prevent="rowMenuOpen = inst.dir"
           >
             <TableCell>
@@ -1322,7 +1351,7 @@ onUnmounted(() => {
                 <UsageBar
                   v-if="sessionResetFor(inst)"
                   :fill-pct="sessionRemaining(inst)"
-                  :variant="sessionWait(inst)"
+                  variant="neutral"
                   :label="sessionResetFor(inst) ?? ''"
                   :aria-label="$t('instances.resetsIn', { when: sessionResetFor(inst) })"
                 />

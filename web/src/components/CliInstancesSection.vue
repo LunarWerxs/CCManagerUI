@@ -58,11 +58,11 @@ import {
 } from '@/components/ui/table'
 import { useCliInstances } from '@/composables/useCliInstances'
 import { useData } from '@/composables/useData'
+import { useInstanceFilter } from '@/composables/useInstanceFilter'
 import { useInstances } from '@/composables/useInstances'
 import { useSortable } from '@/composables/useSortable'
 import { useUiPrefs } from '@/composables/useUiPrefs'
 import { useUsage } from '@/composables/useUsage'
-import { useUsageFilter } from '@/composables/useUsageFilter'
 import { useUsageMode } from '@/composables/useUsageMode'
 import type { CliInstance } from '@/lib/api'
 import { bindingWeeklyPct, usageReasonMessageKey } from '@/lib/usage'
@@ -109,12 +109,12 @@ const usageFor = (inst: CliInstance) => snapshotFor(usageKey(inst))
 const { usageMode, now } = useUsageMode(true)
 const sessionResetFor = (inst: CliInstance) => resetLabel(usageFor(inst)?.session, now.value)
 const weeklyResetFor = (inst: CliInstance) => resetLabel(usageFor(inst)?.weekAll, now.value)
-// One number per window drives both the bar's length and its colour — see InstancesView above.
+// One number per window drives the bar's length; the WEEKLY one also drives its colour, and the
+// 5-hour bar is drawn `neutral` — see InstancesView and UsageBar's UsageBarVariant.
 const sessionRemaining = (inst: CliInstance) =>
   windowRemainingPct(usageFor(inst)?.session, SESSION_WINDOW_MS, now.value) ?? 0
 const weeklyRemaining = (inst: CliInstance) =>
   windowRemainingPct(usageFor(inst)?.weekAll, WEEK_WINDOW_MS, now.value) ?? 0
-const sessionWait = (inst: CliInstance) => waitSeverity(sessionRemaining(inst))
 const weeklyWait = (inst: CliInstance) => waitSeverity(weeklyRemaining(inst))
 
 /**
@@ -170,12 +170,24 @@ const { sortedRows, toggleSort, indicatorFor } = useSortable(
   ],
 )
 
-// The usage filter is tab-wide too (composables/useUsageFilter.ts): "which accounts have I already
-// spent" is asked of every table at once, so a CLI login over the threshold is set aside here on
+// The filter is tab-wide too (composables/useInstanceFilter.ts): "show me the rows I'm after" is
+// asked of every table at once, so a CLI login over the quota threshold is set aside here on
 // exactly the same terms as a desktop instance up above.
-const { dimmed: filterDimmed, visible: filterVisible } = useUsageFilter()
+const { dimmed: filterDimmed, visible: filterVisible } = useInstanceFilter()
 
-const visibleRows = computed(() => filterVisible(sortedRows.value, usageFor))
+/**
+ * What one CLI row is, as far as the filter is concerned.
+ *
+ * `open` is deliberately absent, not `false`: an unlinked CLI login is a CLAUDE_CONFIG_DIR, not an
+ * app, so it is never open OR closed, and the filter's "an unknown fact never sets a row aside"
+ * rule leaves this table alone when you filter by status. Claiming `false` would empty it the
+ * moment someone asked for the open accounts. Its plan is unknown for the same kind of reason —
+ * a CLI login carries no account record of its own; the linked ones live on their desktop row,
+ * which has the plan.
+ */
+const filterFacts = (inst: CliInstance) => ({ usage: usageFor(inst), signedIn: inst.loggedIn })
+
+const visibleRows = computed(() => filterVisible(sortedRows.value, filterFacts))
 /** Rows this table dropped for the filter — said out loud in the heading beside the count. */
 const hiddenByFilter = computed(() => sortedRows.value.length - visibleRows.value.length)
 /** There ARE unlinked CLI instances, the filter just took all of them. */
@@ -422,7 +434,7 @@ onUnmounted(stopPolling)
           {{ $t('cliInstances.linkedElsewhere', { count: linkedCount }) }}
         </span>
         <span v-if="hiddenByFilter > 0" class="text-xs font-normal text-muted-foreground">
-          {{ $t('instances.usageFilterHiddenCount', { count: hiddenByFilter }) }}
+          {{ $t('instances.filterHiddenCount', { count: hiddenByFilter }) }}
         </span>
         <ChevronDown
           class="size-4 text-muted-foreground transition-transform duration-200"
@@ -539,7 +551,7 @@ onUnmounted(stopPolling)
               <p class="font-medium text-foreground">
                 {{
                   allHiddenByFilter
-                    ? $t('instances.usageFilterAllHidden')
+                    ? $t('instances.filterAllHidden')
                     : linkedCount > 0
                       ? $t('cliInstances.allLinked')
                       : $t('cliInstances.empty')
@@ -548,7 +560,7 @@ onUnmounted(stopPolling)
               <p class="text-xs text-muted-foreground">
                 {{
                   allHiddenByFilter
-                    ? $t('instances.usageFilterAllHiddenHint')
+                    ? $t('instances.filterAllHiddenHint')
                     : linkedCount > 0
                       ? $t('cliInstances.allLinkedHint')
                       : $t('cliInstances.emptyHint')
@@ -580,7 +592,7 @@ onUnmounted(stopPolling)
             v-for="inst in visibleRows"
             :key="inst.id"
             class="transition-opacity"
-            :class="filterDimmed(usageFor(inst)) ? 'opacity-25 hover:bg-transparent' : ''"
+            :class="filterDimmed(filterFacts(inst)) ? 'opacity-25 hover:bg-transparent' : ''"
           >
             <TableCell>
               <span
@@ -615,7 +627,7 @@ onUnmounted(stopPolling)
                 <UsageBar
                   v-if="sessionResetFor(inst)"
                   :fill-pct="sessionRemaining(inst)"
-                  :variant="sessionWait(inst)"
+                  variant="neutral"
                   :label="sessionResetFor(inst) ?? ''"
                   :aria-label="$t('instances.resetsIn', { when: sessionResetFor(inst) })"
                 />

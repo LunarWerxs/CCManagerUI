@@ -6,6 +6,7 @@ import {
   ChevronDown,
   Copy,
   EllipsisVertical,
+  Funnel,
   LogIn,
   Pencil,
   Play,
@@ -16,7 +17,7 @@ import {
   Terminal,
   Trash2,
 } from '@lucide/vue'
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
 import CliInstanceNameDialog from '@/components/CliInstanceNameDialog.vue'
@@ -45,10 +46,12 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useCodexInstances } from '@/composables/useCodexInstances'
+import { useInstanceFilter } from '@/composables/useInstanceFilter'
 import { useSortable } from '@/composables/useSortable'
 import { useUiPrefs } from '@/composables/useUiPrefs'
 import { useUsage } from '@/composables/useUsage'
 import type { CodexInstance } from '@/lib/api'
+import type { InstanceFacts } from '@/lib/instance-filter'
 
 const props = defineProps<{
   desktopEnabled: boolean
@@ -133,6 +136,31 @@ const { sortedRows, toggleSort, indicatorFor } = useSortable(
     },
     { key: 'codexHome', accessor: (instance: CodexInstance) => instance.codexHome },
   ],
+)
+
+// --- filter -------------------------------------------------------------------------------------
+// The tab's filter is tab-wide (composables/useInstanceFilter.ts), and a Codex row is an account
+// like any other: it has a desktop profile that is open or shut, a plan, and a quota reading. It
+// runs AFTER the sort — it removes or greys rows, it never reorders them.
+const { dimmed: filterDimmed, visible: filterVisible } = useInstanceFilter()
+
+/** `open` is left UNKNOWN when the Codex desktop surface is switched off in Settings: the column
+ *  is not on screen then, and "closed" would be a claim about a profile this view is not even
+ *  reporting on. An unknown fact never sets a row aside (see lib/instance-filter.ts). */
+const filterFacts = (instance: CodexInstance): InstanceFacts => ({
+  usage: usageFor(instance),
+  open: props.desktopEnabled ? instance.isDesktopRunning : null,
+  plan: instance.account?.planLabel ?? null,
+  signedIn: instance.loggedIn,
+})
+
+const visibleRows = computed(() => filterVisible(sortedRows.value, filterFacts))
+/** Rows this table dropped for the filter — said out loud in the heading, or a row that quietly
+ *  stopped being listed reads as a bug rather than as the filter working. */
+const hiddenByFilter = computed(() => sortedRows.value.length - visibleRows.value.length)
+/** There ARE Codex instances, the filter just took all of them. */
+const allHiddenByFilter = computed(
+  () => instances.value.length > 0 && visibleRows.value.length === 0,
 )
 
 const createOpen = ref(false)
@@ -261,7 +289,18 @@ onUnmounted(stopPolling)
       >
         <AppWindow class="size-4" />
         {{ $t('codexInstances.title') }}
-        <span class="text-muted-foreground">({{ instances.length }})</span>
+        <!-- "x of y" once the filter is hiding rows, so the count never silently disagrees with
+             the number of Codex instances that exist. -->
+        <span class="text-muted-foreground">
+          ({{
+            hiddenByFilter > 0
+              ? $t('codexInstances.countOfTotal', { shown: visibleRows.length, total: instances.length })
+              : instances.length
+          }})
+        </span>
+        <span v-if="hiddenByFilter > 0" class="text-xs font-normal text-muted-foreground">
+          {{ $t('instances.filterHiddenCount', { count: hiddenByFilter }) }}
+        </span>
         <ChevronDown
           class="size-4 text-muted-foreground transition-transform duration-200"
           :class="open ? '' : '-rotate-90'"
@@ -346,8 +385,22 @@ onUnmounted(stopPolling)
           <TableCell><div class="flex justify-end"><Skeleton class="h-6 w-20" /></div></TableCell>
         </TableRow>
       </TableBody>
+      <TableBody v-else-if="allHiddenByFilter">
+        <TableEmpty :colspan="7">
+          <div class="flex flex-col items-center gap-1 text-center">
+            <Funnel class="mb-1 size-6 opacity-40" />
+            <p class="font-medium text-foreground">{{ $t('instances.filterAllHidden') }}</p>
+            <p class="text-xs text-muted-foreground">{{ $t('instances.filterAllHiddenHint') }}</p>
+          </div>
+        </TableEmpty>
+      </TableBody>
       <TableBody v-else>
-        <TableRow v-for="instance in sortedRows" :key="instance.id">
+        <TableRow
+          v-for="instance in visibleRows"
+          :key="instance.id"
+          class="transition-opacity duration-200"
+          :class="filterDimmed(filterFacts(instance)) ? 'opacity-25 hover:bg-transparent' : ''"
+        >
           <TableCell>
             <div class="flex items-center gap-2 text-xs">
               <span

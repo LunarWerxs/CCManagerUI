@@ -13,10 +13,10 @@ import {
   X,
 } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import QuickUsageFilter from '@/components/QuickUsageFilter.vue'
+import QuickInstanceFilter from '@/components/QuickInstanceFilter.vue'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { useUsageFilter } from '@/composables/useUsageFilter'
+import { useInstanceFilter } from '@/composables/useInstanceFilter'
 import { useUsageMode } from '@/composables/useUsageMode'
 import type {
   CliInstance,
@@ -74,17 +74,36 @@ const { isDark, toggle: toggleTheme } = useTheme()
 
 // --- quota columns + the filter -----------------------------------------------------------------
 // Both are the SAME shared singletons the full manager's Instances tab uses, not a private copy:
-// composables/useUsageMode.ts and composables/useUsageFilter.ts. So a filter set over there is
+// composables/useUsageMode.ts and composables/useInstanceFilter.ts. So a filter set over there is
 // already set here — and via composables/useSharedPrefs.ts that holds even when this window is
 // served from its own port (a different browser origin, and therefore its own empty localStorage),
 // which is exactly the case where it used to forget.
 //
 // `usageMode` gates the quota badges here the same way it swaps columns there. This window has no
-// process columns to swap TO, so off simply means a plainer list — but it stays gated because the
-// filter itself is gated on it (see useUsageFilter's `active`), and a filter quietly dimming rows
-// with no visible control that explains it is the one outcome to avoid.
+// process columns to swap TO, so off simply means a plainer list — and it also stands the QUOTA
+// facet of the filter down (see useInstanceFilter), since those percentages are then not on screen
+// to be filtered against. The status and plan facets are true either way, so the filter button is
+// always here: a filter quietly dimming rows with no visible control that explains it is the one
+// outcome to avoid.
 const { usageMode, toggle: toggleUsageMode } = useUsageMode()
-const { active: filterActive, dimmed, hidden, visible } = useUsageFilter()
+const { dimmed, hidden, visible } = useInstanceFilter()
+
+/** What one row is, as far as the filter is concerned — see lib/instance-filter.ts. A desktop
+ *  instance knows all three facts; an unlinked CLI login has neither a window to be open nor an
+ *  account record of its own, and an absent fact never sets a row aside. */
+const factsForClaude = (instance: CMInstance) => ({
+  usage: usageForClaude(instance),
+  open: instance.isRunning,
+  plan: instance.account?.planLabel ?? null,
+})
+const factsForClaudeCli = (instance: CliInstance) => ({ usage: usageForClaudeCli(instance) })
+/** A Codex row's desktop profile is the thing that is open or shut, and its account carries the
+ *  plan; quota is keyed the same way the full manager keys it. */
+const factsForCodex = (instance: CodexInstance) => ({
+  usage: usageSnapshots.value.get(`codex:${instance.id}`),
+  open: instance.isDesktopRunning,
+  plan: instance.account?.planLabel ?? null,
+})
 
 const sortedClaude = computed(() =>
   [...claude.value].sort(
@@ -135,15 +154,16 @@ const sortedClaudeCli = computed(() =>
 )
 
 // Sort first, then filter: the filter REMOVES rows, it never reorders them.
-const visibleClaude = computed(() => visible(sortedClaude.value, usageForClaude))
-const visibleClaudeCli = computed(() => visible(sortedClaudeCli.value, usageForClaudeCli))
+const visibleClaude = computed(() => visible(sortedClaude.value, factsForClaude))
+const visibleClaudeCli = computed(() => visible(sortedClaudeCli.value, factsForClaudeCli))
 
 /** Rows the filter is holding back, so a short table never reads as a discovery failure. Counted
  *  across both Claude tables, which is how the flyout reports it. */
 const hiddenCount = computed(
   () =>
-    sortedClaude.value.filter((i) => hidden(usageForClaude(i))).length +
-    sortedClaudeCli.value.filter((i) => hidden(usageForClaudeCli(i))).length,
+    sortedClaude.value.filter((i) => hidden(factsForClaude(i))).length +
+    sortedClaudeCli.value.filter((i) => hidden(factsForClaudeCli(i))).length +
+    sortedCodex.value.filter((i) => hidden(factsForCodex(i))).length,
 )
 const sortedCodex = computed(() =>
   [...codex.value].sort(
@@ -151,11 +171,17 @@ const sortedCodex = computed(() =>
       Number(b.isDesktopRunning) - Number(a.isDesktopRunning) || a.name.localeCompare(b.name),
   ),
 )
+const visibleCodex = computed(() => visible(sortedCodex.value, factsForCodex))
 // Counts ROWS, not records: a CLI login folded onto its desktop row is one instance shown once, so
 // counting claudeCli in full would report a machine as having more instances than it has rows.
 const total = computed(
   () => claude.value.length + unlinkedClaudeCli.value.length + codex.value.length,
 )
+/** The plan labels the filter flyout offers. Blanks are fine — planOptions drops them. */
+const presentPlans = computed(() => [
+  ...claude.value.map((i) => i.account?.planLabel),
+  ...codex.value.map((i) => i.account?.planLabel),
+])
 
 function usageForClaude(instance: CMInstance): UsageSnapshot | undefined {
   return usageSnapshots.value.get(`desktop:${instance.dir}`)
@@ -165,13 +191,20 @@ function usageForClaudeCli(instance: CliInstance): UsageSnapshot | undefined {
   return instance.lastUsageCheck ?? usageSnapshots.value.get(`cli:${instance.id}`)
 }
 
-/** Badge colour for one window's reading. Outline (neutral) whenever there is no CURRENT number —
- *  never checked, checked-but-empty, or a window that has since reset. A missing reading is
- *  unknown, not healthy and not spent, so it must not borrow either colour. */
+/**
+ * Badge colour for one window's reading. Outline (neutral) whenever there is no CURRENT number —
+ * never checked, checked-but-empty, or a window that has since reset. A missing reading is
+ * unknown, not healthy and not spent, so it must not borrow either colour.
+ *
+ * The 5-HOUR window is neutral even when it does have a number, matching the full manager's chips
+ * (components/UsageBadge.vue): a spent session refills the same afternoon, a spent week does not,
+ * so the row spends its one colour on the week and the session keeps its number without shouting.
+ */
 function usageVariant(
   snapshot: UsageSnapshot | undefined,
   scope: UsageScope,
 ): 'success' | 'warning' | 'destructive' | 'outline' {
+  if (scope === 'session') return 'outline'
   const pct = usagePctFor(snapshot, scope)
   return pct == null ? 'outline' : usageBadgeVariant(pct)
 }
@@ -405,7 +438,7 @@ onBeforeUnmount(() => {
         >
           <Gauge />
         </Button>
-        <QuickUsageFilter v-if="usageMode" :hidden-count="hiddenCount" />
+        <QuickInstanceFilter :hidden-count="hiddenCount" :present-plans="presentPlans" />
         <Button
           variant="ghost"
           size="icon-sm"
@@ -478,13 +511,13 @@ onBeforeUnmount(() => {
             v-else-if="visibleClaude.length === 0"
             class="px-4 py-6 text-center text-sm text-muted-foreground"
           >
-            Every instance is set aside by the usage filter.
+            Every instance is set aside by the filter.
           </div>
           <div
             v-for="instance in visibleClaude"
             :key="instance.dir"
             class="flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0 transition-opacity"
-            :class="dimmed(usageForClaude(instance)) ? 'opacity-25' : ''"
+            :class="dimmed(factsForClaude(instance)) ? 'opacity-25' : ''"
           >
             <span
               class="size-2.5 shrink-0 rounded-full"
@@ -596,13 +629,13 @@ onBeforeUnmount(() => {
             v-if="visibleClaudeCli.length === 0"
             class="px-4 py-6 text-center text-sm text-muted-foreground"
           >
-            Every CLI instance is set aside by the usage filter.
+            Every CLI instance is set aside by the filter.
           </div>
           <div
             v-for="instance in visibleClaudeCli"
             :key="instance.id"
             class="flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0 transition-opacity"
-            :class="dimmed(usageForClaudeCli(instance)) ? 'opacity-25' : ''"
+            :class="dimmed(factsForClaudeCli(instance)) ? 'opacity-25' : ''"
           >
             <span
               class="size-2.5 shrink-0 rounded-full"
@@ -657,9 +690,16 @@ onBeforeUnmount(() => {
             No Codex instances found.
           </div>
           <div
-            v-for="instance in sortedCodex"
+            v-else-if="visibleCodex.length === 0"
+            class="px-4 py-6 text-center text-sm text-muted-foreground"
+          >
+            Every Codex instance is set aside by the filter.
+          </div>
+          <div
+            v-for="instance in visibleCodex"
             :key="instance.id"
-            class="flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0"
+            class="flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0 transition-opacity"
+            :class="dimmed(factsForCodex(instance)) ? 'opacity-25' : ''"
           >
             <span
               class="size-2.5 shrink-0 rounded-full"

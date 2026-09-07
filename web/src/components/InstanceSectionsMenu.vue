@@ -17,7 +17,7 @@ import IconTooltip from '@/shell/IconTooltip.vue'
 </script>
 
 <template>
-  <!-- Popover root INSIDE the tooltip slot, wrapped in a span — see UsageFilterMenu.vue and
+  <!-- Popover root INSIDE the tooltip slot, wrapped in a span — see InstanceFilterMenu.vue and
        scripts/checks/reka-popper-root-inside-tooltip.mjs for why the other nesting breaks. -->
   <IconTooltip :label="$t('instances.sectionsTitle')" :description="$t('instances.sectionsHint')">
     <span class="inline-flex">

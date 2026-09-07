@@ -205,8 +205,24 @@ export function parseInstanceNumber(input: unknown): number | null {
  * should say so rather than silently acting on a different row.
  */
 export async function resolveInstance(input: unknown): Promise<ResolvedInstance | null> {
-  const all = await listAllInstances()
+  return pickInstance(await listAllInstances(), input)
+}
 
+/**
+ * The matching rule itself, over a list handed in — every spelling, in priority order.
+ *
+ * Split out from resolveInstance so it can be TESTED. It could not be before: the only entry point
+ * awaited listAllInstances(), which reads this machine's real fleet, so the rule that decides which
+ * account a tool is about to act on had no unit coverage at all. That is how the email case below
+ * stayed broken while several tool descriptions promised it (2026-09-06).
+ *
+ * Order is deliberate and goes from unambiguous to inferred: number, exact ref, handle/dir, then
+ * the two human-typed spellings (name, email) which only count when they name exactly one row.
+ */
+export function pickInstance(
+  all: readonly ResolvedInstance[],
+  input: unknown,
+): ResolvedInstance | null {
   const num = parseInstanceNumber(input)
   if (num !== null) {
     const direct = all.find((r) => r.num === num)
@@ -241,6 +257,21 @@ export async function resolveInstance(input: unknown): Promise<ResolvedInstance 
   const needle = raw.toLowerCase()
   const byName = all.filter((r) => r.name.toLowerCase() === needle)
   if (byName.length === 1) return byName[0]!
+
+  // The signed-in ACCOUNT EMAIL, same one-row rule.
+  //
+  // ⛔ THE TOOLS ALREADY PROMISED THIS AND IT WAS NOT TRUE (found by probing the /api/chats route
+  // with an address). move_chat's `from` is documented as "instance number, name, label or email";
+  // an email fell all the way through to `null` here, and null is indistinguishable from "that
+  // instance is gone", so the caller got an empty answer rather than an error. An email is also
+  // the identifier a person is most likely to know for an account.
+  //
+  // Last, and only when unambiguous, for the same reason `name` is: two instances can be signed
+  // into the SAME account (a second profile on one login is an ordinary setup), and silently
+  // picking either would be worse than declining. Ambiguous stays null, which resolveInstanceError
+  // below reports as unknown.
+  const byEmail = all.filter((r) => r.email?.toLowerCase() === needle)
+  if (byEmail.length === 1) return byEmail[0]!
 
   return null
 }
