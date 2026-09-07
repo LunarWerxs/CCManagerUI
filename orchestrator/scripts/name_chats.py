@@ -27,7 +27,6 @@ Exit:  0 nothing nameless, or every reachable one named - 2 some rows unreachabl
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
@@ -37,34 +36,24 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from lib import clilib, hydralib
-from lib import ledgerlib
+from lib import clilib, hydralib, windowlib
 
 PS1 = Path(__file__).resolve().parent / "actuator" / "rename_first.ps1"
 MAX_PASSES = 20
 PROBE_PREFIX = "naming pass probe"
-# One naming pass per instance at a time: two processes driving the same window race the
-# probes and can misattribute names (review finding). Stale locks release after this long.
-LOCK_STALE_SECS = 15 * 60
 
-
-@contextlib.contextmanager
-def _instance_lock(instance: str):
-    lock = ledgerlib._state_dir() / f"naming-{instance.lower()}.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if lock.exists() and time.time() - lock.stat().st_mtime > LOCK_STALE_SECS:
-            lock.unlink(missing_ok=True)
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-    except (FileExistsError, PermissionError):  # PermissionError = the previous holder's pending delete (Windows); busy, not broken - see ledgerlib.locked
-        yield False
-        return
-    try:
-        yield True
-    finally:
-        lock.unlink(missing_ok=True)
+# ONE DRIVER PER WINDOW, and it is windowlib's lock, not a private one. This module used to
+# keep its own `naming-<instance>.lock`, which excluded a second NAMING PASS and nothing else:
+# the courier's composer send, archive_chat's sidebar control, migrate_chat's settle and
+# spawn_chat's deeplink all take windowlib.instance_lock, so a naming pass could drive the same
+# Electron window at the same time as any of them - the exact interleaved sidebar click both
+# locks exist to prevent, missed because there were two of them. The private copy also carried
+# the two defects windowlib's has since had fixed (AH-16): it reclaimed on AGE alone, so a
+# legitimately long pass was stolen from mid-probe, and it unlinked its lock file
+# unconditionally on exit, deleting whatever successor had replaced it.
+#
+# wait_secs=0 keeps this lane's posture unchanged: a naming pass never queues behind another
+# driver, it steps back and says so, and the scheduler brings it round again.
 
 # The naming law's deny-list, mirroring the daemon's chat-title.ts patterns plus this
 # toolbox's own probe/quarantine names. A None/empty title is generic by definition.
@@ -292,10 +281,10 @@ def name_pass(
     # never persisted: the win is the poll loop's per-second rescans, not cross-run reuse.
     meta_cache: dict = {}
 
-    with _instance_lock(instance) as got_lock:
+    with windowlib.instance_lock(instance, wait_secs=0) as got_lock:
         if not got_lock:
             return _empty_pass_result(
-                f"another naming pass is already driving '{instance}' - refusing to race it")
+                f"another lane is already driving '{instance}' - refusing to race it")
 
         state = _PassState()
         state.named.extend(_rename_quarantined_chats(store, meta_cache, titles, daemon_rename))

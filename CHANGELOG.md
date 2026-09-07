@@ -7,6 +7,27 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ## [Unreleased]
 
+### Fixed
+
+- **The per-window UI lock is reclaimed on proof of death, not on age** (`orchestrator/scripts/
+  lib/windowlib.py`). `instance_lock` deleted any lock directory older than 15 minutes without
+  checking who held it, so a lane that legitimately ran long had its lock taken mid-gesture and
+  two lanes then drove one Electron window: the interleaved sidebar click the lock exists to
+  prevent. The actuator alone runs up to 240s per press and `spawn_chat` stacks several behind a
+  120s wait, so the ceiling was reachable in normal work. The lock now carries an owner record
+  (pid plus that pid's OS creation time, so a recycled pid cannot impersonate the holder) and
+  reuses `joblocklib`'s proof-of-death check: a provably live holder keeps its lock at any age, a
+  provably dead one is reclaimed at once instead of waiting the clock out, and age remains only
+  where liveness cannot be determined so a crash still cannot wedge a lane. Release is
+  token-checked, closing the second half of the same defect, where the original holder removed
+  the directory unconditionally on exit and deleted its successor's lock.
+- **The naming pass now takes that same lock instead of a private one it alone respected**
+  (`orchestrator/scripts/name_chats.py`). It kept its own `state/naming-<instance>.lock`, which
+  excluded a second naming pass and nothing else, so it could drive a window while the courier,
+  `archive_chat`, `migrate_chat` or `spawn_chat` was already driving it. The private copy carried
+  both age-reclaim defects above. Its non-blocking posture is unchanged (`wait_secs=0`): a pass
+  that finds the window busy steps back and says so.
+
 ## [0.39.1] - 2026-09-06
 
 ### Added

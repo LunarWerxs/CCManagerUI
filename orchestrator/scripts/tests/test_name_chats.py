@@ -5,7 +5,9 @@ import json
 import os
 import sys
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -16,6 +18,12 @@ from stubdaemon import StubDaemon  # noqa: E402
 
 from lib import hydralib  # noqa: E402
 import name_chats  # noqa: E402
+
+
+@contextmanager
+def _no_placement(_instance, note=None):
+    """The window-placement courtesy, minus the two PowerShell starts it costs per pass."""
+    yield
 
 SID_A = "aaaa0001-0000-0000-0000-000000000000"
 SID_B = "bbbb0002-0000-0000-0000-000000000000"
@@ -39,13 +47,22 @@ class NamePassTest(unittest.TestCase):
         self.stub = StubDaemon()
         hydralib.BASE = self.stub.url
         self._tmp = tempfile.TemporaryDirectory()
-        # The pass takes state/naming-<instance>.lock under the STATE DIR. Without this line that
-        # is the checkout's own state/, shared with a scheduled pass running from the same checkout
-        # and with any other copy of this suite: the second holder finds the lock taken, names
-        # nothing, and four tests here read "nothing named" as a bug (four suites side by side,
-        # 2026-09-05: three of them red exactly this way).
+        # The pass takes the per-window UI lock (windowlib.instance_lock, state/locks/ui-<key>)
+        # under the STATE DIR. Without this line that is the checkout's own state/, shared with a
+        # scheduled pass running from the same checkout and with any other copy of this suite: the
+        # second holder finds the lock taken, names nothing, and four tests here read "nothing
+        # named" as a bug (four suites side by side, 2026-09-05: three of them red exactly this
+        # way).
         os.environ["ORCHESTRATOR_STATE_DIR"] = str(Path(self._tmp.name) / "state")
         self.addCleanup(os.environ.pop, "ORCHESTRATOR_STATE_DIR", None)
+        # That lock also wraps the pass in windowlib.keep_placement, which SHELLS OUT to the
+        # window actuator twice per pass. Against these fixture instances it can only fail, but
+        # it still pays two PowerShell starts each time: measured 6.4s -> 17.1s for this file
+        # when the naming pass moved onto the shared lock. Stubbed, because a unit test must not
+        # drive the real actuator (see the memory about an importer test launching the app).
+        placement = mock.patch.object(name_chats.windowlib, "keep_placement", _no_placement)
+        placement.start()
+        self.addCleanup(placement.stop)
         self.store = Path(self._tmp.name) / "claude-code-sessions"
         d = self.store / "org" / "user"
         d.mkdir(parents=True)
