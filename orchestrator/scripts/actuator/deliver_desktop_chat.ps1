@@ -32,13 +32,17 @@
 #      not interrupt live work.
 # Reach limit (same as Manage-DesktopChat.ps1): only a RENDERED sidebar row can be actioned.
 #
-# Exit: 0 delivered - 1 error - 3 target row not rendered - 4 wrong chat / unverified -
+# Exit: 0 delivered - 1 error, INCLUDING -Instance blank or matching zero/more-than-one
+#       running instance (2026-09-06: -Instance is now required, matched by EXACT leaf-name
+#       equality) - 3 target row not rendered - 4 wrong chat / unverified -
 #       5 composer did not accept the text - 6 chat busy (turn in flight) -
-#       7 the composer already holds a draft that is not ours (never overwritten).
+#       7 the composer already holds a draft that is not ours (never overwritten) -
+#       8 more than one running window survived the -Instance filter (refuse rather than
+#       iterate and click in each).
 param(
   [Parameter(Mandatory = $true)][string]$Title,
   [Parameter(Mandatory = $true)][string]$Message,
-  [string]$Instance = '',
+  [Parameter(Mandatory = $true)][string]$Instance,
   # A snippet that MUST be visible in the target's conversation after selecting it.
   [Parameter(Mandatory = $true)][string]$VerifyText,
   [switch]$IfBusyAbort,
@@ -82,7 +86,7 @@ $STOP_NAMES = @('Stop', 'Stopp', 'Anhalten', 'Detener', 'Arrêter', 'Interrompi'
 # list exists solely to pick between two writable boxes when both are on screen.
 $PROMPT_NAMES = @('Prompt', 'Eingabe', 'Nachricht', 'Message', 'Mensaje', 'Messaggio', 'Bericht')
 
-$mains = Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
+$allMains = Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
   Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' } |
   ForEach-Object {
     # ⛔ SAME PARSE, SAME BUG - see the long note in Manage-DesktopChat.ps1. Windows quotes the
@@ -96,13 +100,26 @@ $mains = Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
     $dir = if ($m.Success) { $m.Groups[1].Value.Trim() } else { Join-Path $env:APPDATA 'Claude' }
     [pscustomobject]@{ ProcId = $_.ProcessId; Dir = $dir }
   }
-if ($Instance) {
-  $mains = @($mains | Where-Object {
-      if ($Instance -match '[\\/]') { $_.Dir.TrimEnd('\') -eq $Instance.TrimEnd('\') }
-      else { $_.Dir -like "*$Instance*" }
-    })
+# AIM BY IDENTITY (2026-09-06): -Instance is REQUIRED - a blank value used to mean "every
+# running instance", which is exactly how an actuator can act in the wrong account's window.
+# A path-shaped -Instance matches --user-data-dir EXACTLY; a bare -Instance matches the
+# profile dir's LEAF folder name EXACTLY (never a substring - "pap3r rotate" must never hit
+# "pap3r rotate2"). Zero or more than one surviving match is a refusal, every candidate dir
+# printed, never "take the first".
+if ([string]::IsNullOrWhiteSpace($Instance)) {
+  Write-Output ("REFUSED: -Instance is required (blank refused) - running candidates: " +
+    (($allMains | ForEach-Object { $_.Dir }) -join ', '))
+  exit 1
 }
-if (-not $mains) { Write-Output "FAIL: no running Claude desktop instance matches '$Instance'"; exit 1 }
+$mains = @($allMains | Where-Object {
+    if ($Instance -match '[\\/]') { $_.Dir.TrimEnd('\') -eq $Instance.TrimEnd('\') }
+    else { (Split-Path -Leaf $_.Dir) -eq $Instance }
+  })
+if ($mains.Count -ne 1) {
+  Write-Output ("REFUSED: -Instance '$Instance' matched " + $mains.Count + " running instance(s) - candidates: " +
+    (($allMains | ForEach-Object { $_.Dir }) -join ', '))
+  exit 1
+}
 
 # LEAVE THE SIDEBAR AS IT WAS FOUND (owner, 2026-09-04: "something keeps clicking interface
 # buttons on my Claude desktop, like the repo names or whatever"). The expansion below opens the
@@ -117,6 +134,11 @@ function RestoreGroups {
   if ($n -gt 0) { Write-Output "collapsed $n sidebar group(s) back the way they were" }
 }
 try {
+# ONE WINDOW, PROVEN ABOVE (2026-09-06). The -Instance filter refuses anything but exactly one
+# running window before this point, so this loop runs at most once. The old shape ITERATED
+# every surviving window, expanding sidebar groups (a click-generating action) and probing rows
+# in each one until something matched - precisely the "act in the wrong window" failure mode
+# this pass closes. The loop shape is kept only so the per-window scoping below reads as it is.
 foreach ($m in $mains) {
   $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty, [int]$m.ProcId)
   $win = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)

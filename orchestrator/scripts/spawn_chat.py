@@ -163,21 +163,27 @@ def _live_session_ids() -> set:
         return set()
 
 
-def _poll_trust_dialog(folder: str) -> str:
+def _poll_trust_dialog(folder: str, inst: dict) -> str:
     """...and answer the desktop app's own trust modal for `folder`, if one appears. The file
     write the caller already did is the CLI's list; the DESKTOP app keeps its own and asks
     anyway (measured 2026-09-01), so the honest mechanical answer is the app's own control -
-    scoped to THIS folder, never a blind click (see actuator/trust_dialog.ps1's aim rail).
-    Returns 'not-seen' (no actuator, or the modal never appeared), 'answered', or
-    'refused-other-folder' (someone else's dialog - never touched)."""
+    scoped to THIS folder AND THIS instance (-Instance, same as _set_mode_live and
+    _submit_composer pass), never a blind click (see actuator/trust_dialog.ps1's aim rail).
+    Returns 'not-seen' (no actuator, no dir to aim at, or the modal never appeared),
+    'answered', or 'refused-other-folder' (someone else's dialog - never touched)."""
     if not TRUST_ACTUATOR.exists():
+        return "not-seen"
+    if not inst.get("dir"):
+        # No --user-data-dir to aim the actuator's -Instance at - nothing to scope the scan
+        # to, so don't guess (2026-09-06).
         return "not-seen"
     deadline = time.time() + 20
     while time.time() < deadline:
         time.sleep(3)
         r = clilib.run_text(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", str(TRUST_ACTUATOR), "-Folder", folder],
+             "-File", str(TRUST_ACTUATOR), "-Folder", folder,
+             "-Instance", str(inst.get("dir") or "")],
             timeout=120,
         )
         if r.returncode == 0:
@@ -196,6 +202,10 @@ def _submit_composer(inst: dict, prompt: str) -> tuple[str, str]:
     verify against. Returns (submitted, submit_note)."""
     if not SUBMIT_ACTUATOR.exists():
         return "not-attempted", ""
+    if not inst.get("dir"):
+        # REFUSE rather than pass an empty -Instance: an unscoped actuator call can hit a
+        # DIFFERENT window's composer, not merely fail (2026-09-06).
+        return "refused: instance has no --user-data-dir to aim the actuator at", ""
     time.sleep(6)  # let the deeplink paint the composer
     submitted = "not-attempted"
     submit_note = ""
@@ -237,6 +247,13 @@ def _drive_spawn_window(inst: dict, folder: str, prompt: str, binary: str) -> di
     lands in the wrong pane. The window placement is restored afterward regardless of outcome.
     Returns {'ok': False, 'why': ...} if the window was busy, else {'ok': True, 'url',
     'dialog', 'submitted', 'submit_note', 'window_note'}."""
+    if not inst.get("dir"):
+        # REFUSE rather than lock on an empty key - instance_lock(None, ...) would not be
+        # keyed to anything real, so it could not actually stop a second lane driving the
+        # SAME window this one is about to poke (2026-09-06).
+        return {"ok": False,
+                "why": f"instance '{inst.get('name')}' has no --user-data-dir - refusing to "
+                       "drive its window"}
     with windowlib.instance_lock(inst.get("dir"), wait_secs=120) as mine:
         if not mine:
             return {"ok": False, "why": (f"{inst.get('name')}'s window is busy - another lane "
@@ -253,7 +270,7 @@ def _drive_spawn_window(inst: dict, folder: str, prompt: str, binary: str) -> di
                    f"&folder={urllib.parse.quote(folder)}")
             subprocess.Popen([binary, f"--user-data-dir={inst.get('dir')}", url],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            dialog = _poll_trust_dialog(folder)
+            dialog = _poll_trust_dialog(folder, inst)
             submitted, submit_note = _submit_composer(inst, prompt)
         finally:
             window_note = windowlib.restore(inst.get("dir"), placement) or "unchanged"

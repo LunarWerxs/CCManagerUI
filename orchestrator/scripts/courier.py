@@ -507,9 +507,9 @@ def run(max_deliveries: int, only: str | None, act: bool, running_now: int | Non
         # gate cost more than the deliveries it guards.
         bands_snapshot = bandlib.snapshot()
         try:
-            _live, per_instance = hydralib.running_by_instance()
+            live_ids, per_instance = hydralib.running_by_instance()
         except hydralib.DaemonError:
-            per_instance = None
+            live_ids, per_instance = None, None
         open_accounts = len({str(i.get("name")) for i in hydralib.fleet().get("instances", [])
                              if i.get("isRunning")})
         share = bandlib.per_account_share(open_accounts, hydralib.MAX_RUNNING_CHATS)
@@ -524,13 +524,30 @@ def run(max_deliveries: int, only: str | None, act: bool, running_now: int | Non
         # second row stays staged and is re-judged next cycle, when the first has landed and
         # the chat is no longer dormant.
         chats_planned: set[str] = set()
+        # ⛔ THE CAP COUNTS WAKES, NOT MESSAGES (found live 2026-09-06, and the inconsistency was
+        # already visible in this very loop). The cap exists because "every delivery can wake a
+        # chat", so N deliveries could add N runners - but a delivery to a chat that is ALREADY
+        # RUNNING adds nobody. It is a message into an engine the snapshot has already counted.
+        # Counting it anyway refused to talk to two chats that were themselves inside the 18 the
+        # cap was measuring, which is the cap declining to deliver on its own arithmetic.
+        #
+        # The notion needed was already here and already documented: deliverable() returns
+        # `wakes` (verdict state != running) precisely so run()'s planning knows whether a
+        # delivery ADDS a runner - and the PER-ACCOUNT share below honours it while this
+        # machine-wide gate did not. Now both rails count the same thing.
+        wakes_planned = 0
         for entry in queue:
             if len(planned) >= max_deliveries:
                 break
-            if len(planned) >= allowed_new:
+            # The cheap half of the gate, so a capped queue does not pay for a transcript read
+            # per row: a chat with no live engine can ONLY be a wake, so it is refused here.
+            # ⛔ FAIL CLOSED. live_ids is None when the daemon read failed - unknown liveness is
+            # treated as a wake, which is exactly the behaviour this gate had before.
+            if wakes_planned >= allowed_new and (live_ids is None or entry["session"] not in live_ids):
                 skipped.append({**entry, "why": (
-                    f"concurrency cap: {running_now} chat(s) running plus {len(planned)} "
-                    f"planned reaches the machine-wide {hydralib.MAX_RUNNING_CHATS} - "
+                    f"concurrency cap: {running_now} chat(s) running plus {wakes_planned} "
+                    f"wake(s) planned reaches the machine-wide {hydralib.MAX_RUNNING_CHATS} "
+                    "and this chat has no live engine, so delivering would add one - "
                     "deferred, stays staged; the next 5-minute cycle retries it")})
                 continue
             if entry["session"] in chats_planned:
@@ -545,8 +562,19 @@ def run(max_deliveries: int, only: str | None, act: bool, running_now: int | Non
             if not ok:
                 skipped.append({**entry, "why": why})
                 continue
+            # The authoritative half: `wakes` is the gate's own verdict, not our liveness
+            # snapshot, so a chat that looked live a moment ago but is not running by the time
+            # it is gated still counts against the cap.
+            if match.get("wakes") and wakes_planned >= allowed_new:
+                skipped.append({**entry, "why": (
+                    f"concurrency cap: {running_now} chat(s) running plus {wakes_planned} "
+                    f"wake(s) planned reaches the machine-wide {hydralib.MAX_RUNNING_CHATS} - "
+                    "deferred, stays staged; the next 5-minute cycle retries it")})
+                continue
             planned.append((entry, match))
             chats_planned.add(entry["session"])
+            if match.get("wakes"):
+                wakes_planned += 1
             if would_run is not None and match.get("wakes"):
                 k = str(match.get("instance"))
                 would_run[k] = would_run.get(k, 0) + 1

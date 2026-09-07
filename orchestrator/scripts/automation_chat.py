@@ -26,8 +26,14 @@ chats are stamped too (a hold blocks work on a chat, never its configuration), a
 chats are left alone, and every row reports which stamp it was missing and whether its
 app's re-save can lag the result. The single-target path below applies the same rule.
 
-Usage: python automation_chat.py <title fragment | session id> [--json]
+Usage: python automation_chat.py <title fragment | session id> [--force] [--json]
        python automation_chat.py --all [--yes] [--json]     # fleet-wide: plan, then enforce
+
+--force on ONE chat drives the target app's OWN permission picker (set_mode_via_app), which
+is the only thing that can set the mode of a chat in a RUNNING app - a disk stamp is invisible
+to it until that app's next process boot. It is the remedy migrate_chat names when a move ends
+`disk-only`. Gated on --force for the same reason the fleet pass gates its picker on the icon:
+selecting the chat's row flips what the owner is looking at, so it takes a by-hand act.
 Exit:  0 both stamps verified on disk (running-app caveat reported when it applies; a held
          chat is stamped and noted, never refused for the hold alone), or --all found
          nothing missing / stamped everything it tried -
@@ -245,18 +251,26 @@ def _finalize_mode_attempt(sid: str, returncode: int, last: str) -> None:
         ledgerlib.annotate("mode", sid, last, failure=True)
 
 
-def set_mode_via_app(row: dict, fleet: dict) -> str:
+def set_mode_via_app(row: dict, fleet: dict, force: bool = False) -> str:
     """THE ROUTE FOR A LIVE CHAT (2026-09-01): a running app holds the chat's record in memory
     and re-saves it over any disk stamp, so a live chat off-doctrine stays off-doctrine until
     the app itself is told. The app's own permission picker (a Button in the composer toolbar
     named for the current mode) IS that telling - approve_prompt.ps1 -SetMode drives it with
     the same aim rails as a press (exact instance dir, the chat open, its own words on screen).
-    Returns the actuator's last line; never raises."""
+    Returns the actuator's last line; never raises.
+
+    `force` skips the MODE_RETRY_SECS rate limit, and ONLY a by-hand act may pass it. That
+    limit exists because -Select flips what the owner is looking at, so a LANE must not drive
+    the same chat twice in ten minutes. A migration is not a lane tick: the human asked for
+    this chat to move, right now, and a move that cannot set the mode is the whole defect
+    being fixed here (owner, 2026-09-05: "moving the chats is required to set the permissions
+    to bypass permissions ... I had to do that manually"). Same carve-out the fleet pass
+    already grants `--force` (_run_fleet_pass)."""
     if not MODE_ACTUATOR.exists():
         return "actuator missing"
 
     sid = str(row.get("sessionId") or "")
-    retry = _mode_retry_status(sid)
+    retry = None if force else _mode_retry_status(sid)
     if retry is not None:
         return retry
     ledgerlib.note("mode", sid, note=f"picker -> {REQUIRED_MODE} for '{row.get('title') or ''}'")
@@ -459,7 +473,7 @@ def _run_fleet_pass(argv: list[str], as_json: bool) -> int:
     return enforce_all(act="--yes" in argv, as_json=as_json, ui_ok=ui_ok)
 
 
-def _stamp_single_target(match: dict, fleet: dict, as_json: bool) -> int:
+def _stamp_single_target(match: dict, fleet: dict, as_json: bool, force: bool = False) -> int:
     """The single-chat doctrine stamp (both halves, one disk write) plus the daemon's own
     primitive as a best-effort extra - the same shape as the fleet pass's `_stamp_rows`, for
     exactly one chat, with the fuller report a single target warrants."""
@@ -516,9 +530,27 @@ def _stamp_single_target(match: dict, fleet: dict, as_json: bool) -> int:
         pass
     got = {"error": got_disk.get("error") or "disk stamp did not verify"}
 
+    # ⛔ --force ON ONE CHAT DRIVES THE APP'S OWN PICKER, because for a RUNNING app nothing
+    # else can set the mode (set_mode_via_app). Without this the single-target path could only
+    # ever write disk and then print a caveat saying so, which made it useless as the remedy
+    # migrate_chat points at - the caller ran it, got exit 0, and the chat still opened on a
+    # prompting mode. Gated on --force for the same reason the fleet pass gates its picker on
+    # the icon: -Select flips what the owner is looking at, so it takes a by-hand act.
+    via_app = ""
+    if app_running and force:
+        via_app = set_mode_via_app(
+            {"sessionId": session_id, "title": title,
+             "instance": match.get("instance") or "", "metaPath": meta_path},
+            fleet, force=True)
+    app_confirmed = session_id in load_confirmed()
+
     caveat = (
-        " CAVEAT: its app is RUNNING, so the in-memory record can re-save over these until "
-        "the app next re-reads its store - disk is stamped, the live chat may lag."
+        (f" APP-CONFIRMED via its own picker ({via_app})." if app_confirmed else
+         (f" ⚠ its app is RUNNING and the picker did not confirm ({via_app}) - disk is "
+          "stamped, the live chat may still open on a prompting mode." if force else
+          " CAVEAT: its app is RUNNING, so the in-memory record can re-save over these until "
+          "the app next re-reads its store - disk is stamped, the live chat may lag. Pass "
+          "--force to drive the app's own picker, the only thing that sets a live chat."))
         if app_running
         else ""
     )
@@ -546,6 +578,7 @@ def _stamp_single_target(match: dict, fleet: dict, as_json: bool) -> int:
             "bypassStamped": bypass_ok,
             "ultracodeStamped": uc_ok,
             "appRunning": app_running,
+            "appConfirmed": app_confirmed,
             "report": f"'{title}'{held_note}: {'; '.join(parts)}.{caveat}",
         },
         as_json,
@@ -574,7 +607,7 @@ def main(argv: list[str]) -> int:
     except hydralib.DaemonError as err:
         return out({"ok": False, "report": f"automation stamp FAILED: {err}"}, as_json, 1)
 
-    return _stamp_single_target(match, fleet, as_json)
+    return _stamp_single_target(match, fleet, as_json, force="--force" in argv)
 
 
 if __name__ == "__main__":

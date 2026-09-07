@@ -108,6 +108,9 @@ Add-Type -TypeDefinition $src
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $TREE = [System.Windows.Automation.TreeScope]::Descendants
 $BTN = [System.Windows.Automation.ControlType]::Button
+# 2026-09-06: push ControlType filtering into a PropertyCondition (see MenuItemFor) instead of
+# walking TrueCondition and filtering client-side - same pattern KebabFor already uses for $BTN.
+$MENUITEM = [System.Windows.Automation.ControlType]::MenuItem
 
 function Wake([IntPtr]$hwnd) { [Ax]::Wake($hwnd); Start-Sleep -Milliseconds 800; return [System.Windows.Automation.AutomationElement]::FromHandle($hwnd) }
 function ByName($scope, $name) { $c = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $name); return $scope.FindFirst($TREE, $c) }
@@ -135,9 +138,12 @@ $ACTION_LABELS = @{
 function MenuItemFor($cond, $action) {
   $wanted = $ACTION_LABELS[$action]
   $seen = @()
+  # 2026-09-06: ControlType filtering pushed into the FindAll condition itself (matches KebabFor's
+  # $BTN PropertyCondition above) instead of walking TrueCondition and discarding non-MenuItems
+  # client-side.
+  $mic = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $MENUITEM)
   foreach ($t in $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)) {
-    foreach ($e in $t.FindAll($TREE, [System.Windows.Automation.Condition]::TrueCondition)) {
-      if ($e.Current.ControlType.ProgrammaticName -ne 'ControlType.MenuItem') { continue }
+    foreach ($e in $t.FindAll($TREE, $mic)) {
       $n = $e.Current.Name
       if (-not $n) { continue }
       $seen += $n
@@ -255,14 +261,31 @@ $mains = Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
     $dir = if ($m.Success) { $m.Groups[1].Value.Trim() } else { Join-Path $env:APPDATA 'Claude' }
     [pscustomobject]@{ ProcId = $_.ProcessId; Dir = $dir }
   }
+# AIM BY IDENTITY, NEVER POSITION (owner rule, 2026-09-06, after an actuator clicked the project
+# selector in the wrong account's window): twenty profiles exist with near-duplicate leaf names
+# ('pap3r rotate' / 'pap3r rotate2'), so a substring match can select either one. A bare -Instance
+# now matches the profile dir's LEAF folder name EXACTLY (case-insensitive), never '-like *name*'.
+# A path-shaped hint (contains a slash) still matches the dir EXACTLY, as before.
+$allMains = $mains
+# Any action that clicks/types/invokes a chat (everything except a pure -List scan) REQUIRES
+# -Instance - a blank -Instance used to silently fan out across every running account, which is
+# exactly how the wrong window gets clicked. Listing may still omit it (it only reads).
+if (-not $List -and -not $Instance) {
+  Write-Output "FAIL: -Instance is required for -Action $Action (blank -Instance is only allowed with -List)"
+  exit 1
+}
 if ($Instance) {
-  # A path-shaped hint (contains a slash) must match the dir EXACTLY - an unanchored substring
-  # let '...\i1' also match '...\i10' (piece-10 review), and a wrong instance means a wrong
-  # chat archived. Short names keep the convenient substring match for manual use.
   $mains = @($mains | Where-Object {
     if ($Instance -match '[\\/]') { $_.Dir.TrimEnd('\') -eq $Instance.TrimEnd('\') }
-    else { $_.Dir -like "*$Instance*" }
+    else { (Split-Path -Leaf $_.Dir.TrimEnd('\')) -eq $Instance }
   })
+  # ZERO or MORE THAN ONE match is a refusal, never "take the first" - print every candidate dir
+  # so the caller can see exactly what -Instance would need to be.
+  if ($mains.Count -ne 1) {
+    Write-Output "FAIL: -Instance '$Instance' matched $($mains.Count) running instance(s), need exactly 1. Candidates:"
+    foreach ($cand in $allMains) { Write-Output ("  " + $cand.Dir) }
+    exit 1
+  }
 }
 if (-not $mains) { Write-Output "FAIL: no running Claude desktop instance matches '$Instance'"; exit 1 }
 
@@ -291,6 +314,16 @@ function RestoreGroups {
   if ($n -gt 0) { Write-Output "collapsed $n sidebar group(s) back the way they were" }
 }
 try {
+# EXACTLY ONE CANDIDATE WINDOW before any action loop runs (2026-09-06 audit): the -Instance
+# gate above already forces this for every non-List action, but the check is repeated here,
+# at the point of entry to the loop that actually clicks/types, as a second, structural
+# guarantee - if more than one running window is in scope, STOP and report every (Dir, Title)
+# rather than acting on the first one found.
+if (-not $List -and $mains.Count -ne 1) {
+  Write-Output "FAIL: $($mains.Count) candidate window(s) in scope for -Action $Action, need exactly 1. Candidates:"
+  foreach ($cand in $mains) { Write-Output ("  " + $cand.Dir) }
+  exit 1
+}
 foreach ($m in $mains) {
   $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty, [int]$m.ProcId)
   $win = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
@@ -355,6 +388,11 @@ foreach ($m in $mains) {
   $ec = TryPattern $kebab ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
   if (-not $ec) { Write-Output 'FAIL: kebab does not expose ExpandCollapse (app UI changed?)'; exit 1 }
   $ec.Expand()
+  # ⛔ A FLAT WAIT, ON PURPOSE (measured 2026-09-06). This was briefly a 150ms poll that invoked
+  # the menu item the moment it appeared in the tree - and the rename drill FAILED every time
+  # ("rename editor did not open") while the same chat renamed fine with this flat wait. The
+  # item is observable in the accessibility tree BEFORE the menu is interactive, so "found" is
+  # not "ready"; the adversarial review said exactly this and was right. Do not poll here.
   Start-Sleep -Milliseconds 800
 
   $found = MenuItemFor $cond $Action

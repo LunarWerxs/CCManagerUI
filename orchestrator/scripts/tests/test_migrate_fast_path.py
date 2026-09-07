@@ -90,7 +90,19 @@ class ActTestBase(unittest.TestCase):
         os.environ["ORCHESTRATOR_STATE_DIR"] = self._state.name
         hydralib.BASE = self.stub.url
         self.stub.routes["/api/fleet"] = fleet()
+        # ⛔ NO TEST MAY REACH THE REAL PICKER. confirm_bypass_in_app drives a PowerShell
+        # actuator against a live Electron window; a unit test that calls it would take the
+        # window lock, steal focus and set a mode on somebody's real chat. Patched here rather
+        # than per-test so a test ADDED later cannot forget - the default answer is the
+        # honest one for a fake instance dir, "the picker could not confirm".
+        self.picker_calls = []
+
+        def _no_picker(row, _fleet):
+            self.picker_calls.append(row)
+            return "REFUSED: no window (test)"
+
         self._patches = [mock.patch.object(migrate_chat, "BYPASS_WATCH_SECS", 0),
+                         mock.patch.object(migrate_chat, "confirm_bypass_in_app", _no_picker),
                          mock.patch.object(migrate_chat, "_pretrust_workspace", lambda *_a, **_k: None)]
         for p in self._patches:
             p.start()
@@ -475,17 +487,82 @@ class BypassWatchTest(unittest.TestCase):
                 self.meta.write_text(json.dumps(m), encoding="utf-8")
 
         got = migrate_chat.watch_bypass(str(self.meta), watch_secs=3, sleep=sleep, clock=lambda: clock["t"])
-        self.assertEqual(got, {"mode": stamplib.BYPASS, "flips": 1, "stable": True})
+        self.assertEqual(got, {"mode": stamplib.BYPASS, "flips": 1, "stable": True,
+                               "ultracode": True})
         self.assertEqual(json.loads(self.meta.read_text(encoding="utf-8"))["permissionMode"], stamplib.BYPASS)
 
     def test_a_record_that_stays_bypass_is_reported_without_flips(self):
         got = migrate_chat.watch_bypass(str(self.meta), watch_secs=0)
-        self.assertEqual(got, {"mode": stamplib.BYPASS, "flips": 0, "stable": True})
+        self.assertEqual(got, {"mode": stamplib.BYPASS, "flips": 0, "stable": True,
+                               "ultracode": True})
+
+    def test_an_app_resave_that_drops_ULTRACODE_is_re_stamped_too(self):
+        """THE FALSE GREEN THIS CLOSES (measured 2026-09-06 on five just-moved chats): the
+        watch only ever guarded permissionMode, so a re-save that kept bypass and dropped
+        ultracode went unnoticed and the move still reported "bypassPermissions + ultracode
+        stamped". Four of five chats were sitting with ultracode gone minutes later."""
+        clock = {"t": 0.0}
+        reads = {"n": 0}
+
+        def sleep(_s):
+            clock["t"] += 1.0
+            reads["n"] += 1
+            if reads["n"] == 1:  # the app re-saves ITS view: bypass kept, ultracode absent
+                m = json.loads(self.meta.read_text(encoding="utf-8"))
+                m["sessionSettings"] = {}
+                m["effort"] = None
+                self.meta.write_text(json.dumps(m), encoding="utf-8")
+
+        got = migrate_chat.watch_bypass(str(self.meta), watch_secs=3, sleep=sleep,
+                                        clock=lambda: clock["t"])
+        self.assertTrue(got["ultracode"], "the ultracode half must be defended, not just bypass")
+        self.assertEqual(got["flips"], 1)
+        back = json.loads(self.meta.read_text(encoding="utf-8"))
+        self.assertTrue(back["sessionSettings"]["ultracode"])
+        self.assertEqual(back["effort"], "xhigh")
 
     def test_an_unreadable_record_is_not_claimed_as_bypass(self):
         got = migrate_chat.watch_bypass(str(self.meta.with_name("gone.json")), watch_secs=0)
         self.assertIsNone(got["mode"])
         self.assertFalse(got["stable"])
+
+    def test_many_records_share_ONE_window_and_each_keeps_its_own_verdict(self):
+        """The shared watch a batch uses. N of these windows overlap perfectly, so running
+        them serially spent 8s x N waiting for the same 8 seconds. What must NOT change is
+        the answer: every path gets the verdict its own record earned."""
+        other = self.meta.with_name("other.json")
+        other.write_text(json.dumps({"cliSessionId": "other", "permissionMode": "acceptEdits"}),
+                         encoding="utf-8")
+        clock = {"t": 0.0}
+        naps = {"n": 0}
+
+        def sleep(_s):
+            clock["t"] += 1.0
+            naps["n"] += 1
+
+        got = migrate_chat.watch_bypass_many([str(self.meta), str(other)], watch_secs=2,
+                                             sleep=sleep, clock=lambda: clock["t"])
+        # ONE window, not one per record: two seconds of watching, not four.
+        self.assertEqual(naps["n"], 2)
+        self.assertEqual(got[str(self.meta)], {"mode": stamplib.BYPASS, "flips": 0,
+                                               "stable": True, "ultracode": True})
+        # The off-doctrine record was re-stamped, exactly as a lone watch would have.
+        self.assertEqual(got[str(other)]["flips"], 1)
+        self.assertTrue(got[str(other)]["stable"])
+        self.assertEqual(json.loads(other.read_text(encoding="utf-8"))["permissionMode"],
+                         stamplib.BYPASS)
+
+    def test_an_unreadable_record_in_a_shared_watch_is_reported_not_dropped(self):
+        """A missing key would read to the caller as "nobody watched for me" and quietly earn
+        a fresh 8s watch; it must come back as an unclaimed verdict instead."""
+        gone = str(self.meta.with_name("gone.json"))
+        got = migrate_chat.watch_bypass_many([str(self.meta), gone], watch_secs=0)
+        self.assertIn(gone, got)
+        self.assertIsNone(got[gone]["mode"])
+        self.assertFalse(got[gone]["stable"])
+
+    def test_an_empty_shared_watch_is_not_an_error(self):
+        self.assertEqual(migrate_chat.watch_bypass_many([], watch_secs=0), {})
 
 
 class LandingPayloadTest(ActTestBase):
@@ -512,12 +589,73 @@ class LandingPayloadTest(ActTestBase):
             self.assertEqual(code, 0, out)
             payload = json.loads(out)
             self.assertEqual(payload["permissionMode"], stamplib.BYPASS)
-            self.assertTrue(payload["bypassStamped"])
+            # ⛔ A RUNNING TARGET THAT THE APP NEVER CONFIRMED IS NOT A GREEN (owner,
+            # 2026-09-05, the third hand-fix). The disk agreeing with itself for the whole
+            # watch is exactly what this payload used to call bypassStamped=True, and the
+            # chat still opened on a prompting mode because the app holds the mode in memory.
+            self.assertEqual(payload["bypassVerdict"], "disk-only")
+            self.assertFalse(payload["bypassStamped"])
+            self.assertIn(SID, payload["bypassRemedy"])
+            self.assertIn("BYPASS NOT VERIFIED", payload["report"])
+            self.assertEqual(len(self.picker_calls), 1)  # it TRIED the app first
             # no live engine: nothing was stopped, so no quiet window was ever decided or scanned
             self.assertNotIn("quietWindowSecs", payload)
             self.assertNotIn("backgroundTasks", payload)
             self.assertEqual((payload["from"], payload["to"], payload["toNum"]), ("another_meh", "2claude", 2))
             self.assertEqual(json.loads(meta.read_text(encoding="utf-8"))["permissionMode"], stamplib.BYPASS)
+
+    def _land_into(self, landed_instance: str, to_arg: str, meta_mode: str = "acceptEdits"):
+        """Land SID into one instance and return (payload, metaPath). Shared by the verdict
+        tests below, which differ only in whether that instance's app is running."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        meta = Path(td.name) / "local_y.json"
+        meta.write_text(json.dumps({"cliSessionId": SID, "title": "T", "permissionMode": meta_mode}),
+                        encoding="utf-8")
+        stub = self.stub
+
+        def route(method, path, query, body):
+            acted = any("/import-desktop" in p for p, _ in stub.posts)
+            q = dossier_query(query)
+            if q != SID and q not in "T":
+                return {"matches": []}
+            return {"matches": [{"instance": landed_instance if acted else "another_meh",
+                                 "chatId": "local_y", "cliSessionId": SID, "lineageIds": [SID],
+                                 "title": "T", "archived": False, "lastActivityAt": "T1",
+                                 "live": None, "metaPath": str(meta)}]}
+
+        stub.routes["/api/chats/dossier"] = route
+        stub.routes[f"/api/sessions/{SID}/import-desktop"] = {"ok": True}
+        stub.routes[f"/api/sessions/{SID}/automation"] = {"ok": True}
+        code, out, _ = run_cli(migrate_chat.main, [SID, "--to", to_arg, "--now", "--json"])
+        self.assertEqual(code, 0, out)
+        return json.loads(out), meta
+
+    def test_the_apps_own_picker_confirming_IS_the_green(self):
+        """The one green available while the target app runs. A confirmation is the app's own
+        verdict (set_mode_via_app writes it on actuator exit 0), never a disk read."""
+        import automation_chat
+
+        def _confirms(row, _fleet):
+            automation_chat.mark_confirmed(row["sessionId"], "MODE SET 'Accept edits' -> 'Bypass permissions'")
+            return "MODE SET 'Accept edits' -> 'Bypass permissions'"
+
+        with mock.patch.object(migrate_chat, "confirm_bypass_in_app", _confirms):
+            payload, _ = self._land_into("2claude", "2")
+        self.assertEqual(payload["bypassVerdict"], "app-confirmed")
+        self.assertTrue(payload["bypassStamped"])
+        self.assertEqual(payload["bypassRemedy"], "")
+        self.assertNotIn("BYPASS NOT VERIFIED", payload["report"])
+
+    def test_a_CLOSED_target_is_adopted_at_boot_and_never_touches_the_picker(self):
+        """A closed app reads its store at its own boot - the one write that provably enters
+        app memory - so the disk stamp IS the mode it will open with. Driving a picker at a
+        window that does not exist would be nonsense, so it must not even be attempted."""
+        payload, meta = self._land_into("pap3r rotate2", "12")
+        self.assertEqual(payload["bypassVerdict"], "adopted-at-boot")
+        self.assertTrue(payload["bypassStamped"])
+        self.assertEqual(self.picker_calls, [])
+        self.assertEqual(json.loads(meta.read_text(encoding="utf-8"))["permissionMode"], stamplib.BYPASS)
 
 
 if __name__ == "__main__":

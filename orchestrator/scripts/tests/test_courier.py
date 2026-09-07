@@ -352,6 +352,63 @@ class CourierRailTest(unittest.TestCase):
             report = courier.run(5, None, act=True)
         self.assertTrue(report["results"][0]["ok"])
 
+    def test_the_cap_counts_WAKES_not_messages(self):
+        """THE CAP DECLINED TO DELIVER ON ITS OWN ARITHMETIC (found live 2026-09-06).
+
+        The machine-wide cap exists because "every delivery can wake a chat", so N deliveries
+        could add N runners. But a delivery to a chat that is ALREADY RUNNING adds nobody - it
+        is a message into an engine the snapshot has already counted. Two chats sitting inside
+        the very 18 the cap was measuring were refused a message for reaching it.
+
+        The notion was already here: deliverable() returns `wakes`, and the PER-ACCOUNT share
+        honoured it while this machine-wide gate did not. Both count the same thing now.
+        """
+        self._stage()
+        # already running, and idle - the normal live target
+        self.live = {"pid": 4242}
+        self.stub.routes["/api/sessions/live"] = {
+            "count": hydralib.MAX_RUNNING_CHATS, "sessions": [{"sessionId": SID}]}
+        with mock.patch.object(hydralib, "running_count",
+                               return_value=hydralib.MAX_RUNNING_CHATS), \
+             mock.patch.object(courier, "_run_actuator",
+                               side_effect=self._moving_actuator()):
+            report = courier.run(5, None, act=True)
+        self.assertTrue(report["results"], "a message to an ALREADY-RUNNING chat adds no "
+                                           "concurrency and must not be held by the cap")
+        self.assertTrue(report["results"][0]["ok"])
+
+    def test_the_cap_still_defers_a_delivery_that_would_WAKE_a_chat(self):
+        """The other half, and the one that must never regress: at the cap, a chat with no live
+        engine can only be a wake, so it still defers and stays staged."""
+        e = self._stage()
+        self.live = None
+        self.stub.routes["/api/sessions/live"] = {"count": hydralib.MAX_RUNNING_CHATS,
+                                                  "sessions": []}
+        with mock.patch.object(hydralib, "running_count",
+                               return_value=hydralib.MAX_RUNNING_CHATS), \
+             mock.patch.object(courier, "_run_actuator") as m:
+            report = courier.run(5, None, act=True)
+        m.assert_not_called()
+        self.assertTrue(report["skipped"][0]["why"].startswith("concurrency cap"))
+        self.assertIn("wake", report["skipped"][0]["why"])
+        self.assertEqual(deliverylib.get(e["id"])["state"], "staged")
+
+    def test_an_unknown_liveness_read_fails_CLOSED_at_the_cap(self):
+        """⛔ Unknown liveness must be treated as a wake. A daemon read that fails must never
+        become a reason to deliver past the cap - that would turn an outage into an override."""
+        e = self._stage()
+        self.live = {"pid": 4242}
+        with mock.patch.object(hydralib, "running_count",
+                               return_value=hydralib.MAX_RUNNING_CHATS), \
+             mock.patch.object(hydralib, "running_by_instance",
+                               side_effect=hydralib.DaemonError(
+                                   "/api/sessions/live", None, "live registry unreachable")), \
+             mock.patch.object(courier, "_run_actuator") as m:
+            report = courier.run(5, None, act=True)
+        m.assert_not_called()
+        self.assertTrue(report["skipped"][0]["why"].startswith("concurrency cap"))
+        self.assertEqual(deliverylib.get(e["id"])["state"], "staged")
+
     def test_a_claimed_delivery_is_never_double_sent(self):
         # Adversarial review, 2026-08-31: two overlapping courier runs could both pick up
         # the same staged row. The claim (an atomic mkdir) makes delivery at-most-once.
@@ -560,3 +617,76 @@ class CourierRailTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WalledChatIsWakeableTest(unittest.TestCase):
+    """A chat killed by a USAGE WALL could never be woken, which is the one class of chat that
+    most needs waking (found live 2026-09-06, on two chats moved off an account at its cap).
+
+    The mechanism, and why each half is right on its own:
+      - deliverylib refuses the app's rate-limit banner as a verify snippet, correctly: every
+        walled chat on one account renders the identical line, so it identifies an ACCOUNT and
+        never a conversation, and the snippet's whole job is proving which pane is on screen.
+      - a walled chat's LAST assistant record is nothing but that banner.
+    Together they produced no evidence at all, the courier refused to type, and the actuator
+    died on an empty -VerifyText. The fix keeps the refusal and walks BACK to what the chat
+    actually said - which is still on screen, directly above the banner.
+    """
+
+    BANNER = "You've hit your session limit · resets 10pm (America/Chicago)"
+    REAL = "Run A finished: 424 of 492 readers succeeded and 68 failed on 529 server overload."
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tp = Path(self._td.name) / "walled.jsonl"
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _write(self, *texts):
+        with open(self.tp, "w", encoding="utf-8") as f:
+            for t in texts:
+                f.write(json.dumps({"type": "assistant",
+                                    "message": {"content": [{"type": "text", "text": t}]}}) + "\n")
+
+    def test_the_banner_is_still_refused_as_proof_of_identity(self):
+        """The guard this fix must NOT weaken: the banner names an account, not a chat."""
+        self.assertTrue(deliverylib.is_limit_banner(self.BANNER))
+        self.assertEqual(deliverylib._verify_snippet(self.BANNER), "")
+
+    def test_a_real_reply_that_merely_mentions_a_limit_is_still_usable(self):
+        """The migration chats discuss session limits constantly. Length is what separates the
+        app's one-line banner from a chat's own words about one; matching alone is not enough."""
+        wordy = ("I stopped the fan-out because the account was near its session limit, and the "
+                 "remaining 44 reads are queued against the parts directory rather than lost, "
+                 "so nothing has to be recomputed when the window resets at the top of the hour.")
+        self.assertFalse(deliverylib.is_limit_banner(wordy),
+                         "matching the phrase is not enough - the banner is SHORT, and length "
+                         "is what separates the app's line from a chat writing about one")
+        self.assertNotEqual(deliverylib._verify_snippet(wordy), "",
+                            "a chat's own paragraph about a limit is still its own words")
+
+    def test_the_transcript_walk_skips_a_banner_only_turn(self):
+        self._write(self.REAL, self.BANNER)
+        import stage_reply
+        with mock.patch.object(stage_reply.hydralib, "session_row",
+                               return_value={"transcript_path": str(self.tp)}):
+            got = stage_reply.last_rendered_text("any-sid")
+        self.assertEqual(got, self.REAL, "stopping on the banner is what made walled chats stuck")
+        self.assertNotEqual(deliverylib._verify_snippet(got), "")
+
+    def test_the_gates_banner_answer_does_not_beat_the_transcript(self):
+        """The half that actually bit: the gate honestly reports the banner as
+        `last_assistant_text`, and non-empty-but-unusable evidence short-circuited the
+        transcript fallback before it ever ran."""
+        self._write(self.REAL, self.BANNER)
+        import stage_reply
+        with mock.patch.object(stage_reply.gatelib, "gate_match",
+                               return_value={"state": "idle",
+                                             "idle": {"last_assistant_text": self.BANNER}}), \
+             mock.patch.object(stage_reply.hydralib, "session_row",
+                               return_value={"transcript_path": str(self.tp)}):
+            ev = stage_reply._gather_evidence({"cliSessionId": "any-sid"}, "any-sid")
+        self.assertEqual(ev, self.REAL)
+        self.assertNotEqual(deliverylib._verify_snippet(ev), "",
+                            "with no usable snippet the courier refuses and the chat stays stuck")

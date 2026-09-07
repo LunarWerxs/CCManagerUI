@@ -91,8 +91,23 @@ def last_rendered_text(sid: str) -> str:
             continue
         texts = [b.get("text") for b in content
                  if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
-        if texts:
-            return "\n".join(texts)
+        if not texts:
+            continue
+        joined = "\n".join(texts)
+        # ⛔ A TURN THAT IS ONLY THE APP'S LIMIT BANNER IS NOT WORDS TO IDENTIFY A CHAT BY, AND
+        # STOPPING ON ONE MADE WALLED CHATS UNWAKEABLE (found live 2026-09-06, on two chats
+        # moved off an account that had hit its 5-hour cap). A chat killed by a usage wall ends
+        # with exactly one assistant record - "You've hit your session limit - resets 10pm" -
+        # which every walled chat on that account renders identically. deliverylib rightly
+        # refuses it as a verify snippet, so the evidence collapsed to nothing, the courier
+        # refused to type, and the actuator died on an empty -VerifyText. The class of chat
+        # that most needs waking was, again, the one class that could not be woken.
+        #
+        # The guard is not weakened: the banner is still never used as proof. We simply keep
+        # walking BACK to the last thing the chat actually said, which is on screen above it.
+        if deliverylib.is_limit_banner(joined):
+            continue
+        return joined
     return ""
 
 
@@ -173,8 +188,14 @@ def _gather_evidence(match: dict, sid: str) -> str:
     if verdict:
         src = verdict.get("finished") or verdict.get("idle") or {}
         evidence = src.get("last_assistant_text") or ""
-    if not evidence:
-        evidence = last_rendered_text(sid)
+    # ⛔ THE GATE'S ANSWER IS NOT AUTOMATICALLY USABLE EVIDENCE. For a chat stopped by a usage
+    # wall the gate reports the app's own limit banner as `last_assistant_text` - it IS the
+    # last assistant text, honestly - but deliverylib refuses it as proof of identity, because
+    # every walled chat on that account shows the same line. Non-empty-but-unusable then beat
+    # the transcript fallback to the punch and the chat could not be woken at all. Treat a
+    # banner-only answer as no answer and walk the transcript for what the chat really said.
+    if not evidence or deliverylib.is_limit_banner(evidence):
+        evidence = last_rendered_text(sid) or evidence
     return evidence
 
 

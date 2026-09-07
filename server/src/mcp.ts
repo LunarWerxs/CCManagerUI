@@ -412,6 +412,40 @@ const FAN_OUT_VERDICTS: Readonly<Record<number, string>> = Object.freeze({
 /** Run one fan_out.py invocation through the daemon and hand back its JSON report with the exit
  *  code translated. No JSON on stdout means the script never reached its own report (python
  *  missing, usage error), so the raw run comes back with ok:false rather than a bare failure. */
+/** Resolve a move's `to` into the argv migrate_chat wants, plus the note a caller reports.
+ *  Shared by move_chat and move_chats so a batch can never resolve a DIFFERENT target than a
+ *  single move would for the same input - the two disagreeing about what "here" means is how a
+ *  batch would quietly land 13 chats on the wrong account. */
+async function resolveMoveTarget(
+  to: unknown,
+): Promise<{ toRef: string; targetNote: string | undefined }> {
+  const toArg = to == null || str(to).trim() === '' ? 'here' : str(to).trim()
+  if (toArg.toLowerCase() === 'here') {
+    // "here" bills THIS process's account, so it is accepted only on a proven identity: an
+    // assumed or disambiguated answer would make the wrong account the destination.
+    const self = await selfIdentity()
+    if (!self.instance || self.confidence !== 'exact' || self.warning)
+      throw new Error(
+        `cannot resolve "here" with certainty (${self.summary}${self.warning ? ` — ${self.warning}` : ''}). Pass \`to\` as the target's instance number (list_instance_numbers).`,
+      )
+    if (self.instance.kind !== 'desktop')
+      throw new Error(
+        `"here" is ${instanceLabel(self.instance)}, a ${self.instance.kind} instance; a chat can only land in a Claude DESKTOP instance — pass \`to\` explicitly.`,
+      )
+    return {
+      toRef: String(self.instance.num),
+      targetNote: `here = ${instanceLabel(self.instance)}`,
+    }
+  }
+  if (toArg.toLowerCase() === 'best') return { toRef: 'best', targetNote: undefined } // the orchestrator ranks the fleet itself
+  const row = await resolveRef(toArg)
+  if (row.kind !== 'desktop')
+    throw new Error(
+      `${instanceLabel(row)} is a ${row.kind} instance; a chat can only land in a Claude DESKTOP instance.`,
+    )
+  return { toRef: String(row.num), targetNote: `to = ${instanceLabel(row)}` }
+}
+
 async function runFanOut(args: string[], timeoutMs: number): Promise<Record<string, unknown>> {
   const run = (await api('/api/orchestrator/run', {
     method: 'POST',
@@ -1516,7 +1550,7 @@ export const TOOLS: McpEngineTool[] = [
   {
     name: 'move_chat',
     description:
-      'MUTATES: MOVE ONE CHAT BETWEEN ACCOUNTS IN ONE CALL — the path for "move the X chat from Martin to here" (owner, 2026-09-04: by hand this took a dozen round trips and minutes; now it is this call). `chat` is a title fragment — matched FUZZILY, so case, punctuation and a misspelling still find it ("arkitecht cleanup" finds "Arkitekt cleanup") — or a session id. `from` (optional) is the account it lives on — instance number, name, label or email — and scopes the search, so a title two accounts share is not ambiguous. `to` defaults to "here" (the instance THIS process runs as, resolved like whoami; refused unless that identity is exact); "best" picks the running desktop instance with the most real headroom (tier × remaining weekly %, from the usage survey, never the source); or name any instance by number/name/label/email. It runs the orchestrator\'s migrate_chat with EVERY rail it has — hold, breaker, live-writer refusal, verified landing, source row settled so the old account no longer shows it — plus --now: a chat whose turn is finished and whose transcript shows NO background job outstanding moves after 15s of quiet instead of the standing 300s (an outstanding job, a working or stuck engine still wait or refuse). `wait_secs` (default 330, max 360) is how long the call itself waits for a chat that is idle but not yet quiet enough. EVERY LANDING IS STAMPED bypassPermissions + ultracode and the mode is re-read from disk after the app boots the chat: `permissionMode` in the result is what the disk said LAST. `force` is a PERSON\'S word — pass it only when the human asked for this move (it overrides a hold or a superseded lineage; a live writer is never overridden). `dry_run` resolves the chat, the target, the hold and the engine\'s idleness and reports the plan without moving anything. Read `report`; `landed` is the verdict. A just-landed chat does not process peer messages until the user first interacts with it.',
+      'MUTATES: MOVE ONE CHAT BETWEEN ACCOUNTS IN ONE CALL — the path for "move the X chat from Martin to here" (owner, 2026-09-04: by hand this took a dozen round trips and minutes; now it is this call). `chat` is a title fragment — matched FUZZILY, so case, punctuation and a misspelling still find it ("arkitecht cleanup" finds "Arkitekt cleanup") — or a session id. `from` (optional) is the account it lives on — instance number, name, label or email — and scopes the search, so a title two accounts share is not ambiguous. `to` defaults to "here" (the instance THIS process runs as, resolved like whoami; refused unless that identity is exact); "best" picks the running desktop instance with the most real headroom (tier × remaining weekly %, from the usage survey, never the source); or name any instance by number/name/label/email. It runs the orchestrator\'s migrate_chat with EVERY rail it has — hold, breaker, live-writer refusal, verified landing, source row settled so the old account no longer shows it — plus --now: a chat whose turn is finished and whose transcript shows NO background job outstanding moves after 15s of quiet instead of the standing 300s (an outstanding job, a working or stuck engine still wait or refuse). `wait_secs` (default 330, max 360) is how long the call itself waits for a chat that is idle but not yet quiet enough. EVERY LANDING IS STAMPED bypassPermissions + ultracode, and then ADJUDICATED, because a disk read is not the mode the chat opens with: the app holds each chat\'s mode in MEMORY and only re-reads its store at its own process boot. Read `bypassVerdict`, never `permissionMode` (which is only what the disk said last). `app-confirmed` = the target app\'s own permission picker was driven and agreed; `adopted-at-boot` = the target app is closed, so it will read this stamp at its next boot; both are real. `disk-only` = NOT a guarantee, the chat may open on a prompting mode, and `bypassRemedy` is the exact command that fixes it. `bypassStamped` is true only for the two earned verdicts. `force` is a PERSON\'S word — pass it only when the human asked for this move (it overrides a hold or a superseded lineage; a live writer is never overridden). `dry_run` resolves the chat, the target, the hold and the engine\'s idleness and reports the plan without moving anything. Read `report`; `landed` is the verdict. A just-landed chat does not process peer messages until the user first interacts with it.',
     inputSchema: S(
       {
         chat: { type: 'string', description: 'Title fragment (fuzzy) or session id.' },
@@ -1546,6 +1580,11 @@ export const TOOLS: McpEngineTool[] = [
             'Seconds to wait inside the call for an idle-but-young engine (default 330, max 360).',
         },
         dry_run: { type: 'boolean', description: 'Plan only: resolve everything, move nothing.' },
+        archived: {
+          type: 'boolean',
+          description:
+            'Move the chat even though it is ARCHIVED. Default FALSE, and leave it that way unless the human asked for that specific chat. Note that `archived` does NOT mean the chat is finished: it is Claude Desktop\'s resting "not on screen" state, carried by 2,598 of 2,611 chats when measured, so it is the MAJORITY of any account rather than a tail. That is why the default is off. Separate from `force`, both ways: neither implies the other.',
+        },
       },
       ['chat'],
     ),
@@ -1553,36 +1592,9 @@ export const TOOLS: McpEngineTool[] = [
       const chat = str(a.chat).trim()
       if (!chat) throw new Error('chat is required: a title fragment or a session id')
       const wait = Math.max(0, Math.min(360, Number(a.wait_secs ?? 330) || 0))
-      const toArg = a.to == null || str(a.to).trim() === '' ? 'here' : str(a.to).trim()
-      let toRef: string
-      let targetNote: string | undefined
-      if (toArg.toLowerCase() === 'here') {
-        // "here" bills THIS process's account, so it is accepted only on a proven identity: an
-        // assumed or disambiguated answer would make the wrong account the destination.
-        const self = await selfIdentity()
-        if (!self.instance || self.confidence !== 'exact' || self.warning) {
-          throw new Error(
-            `cannot resolve "here" with certainty (${self.summary}${self.warning ? ` — ${self.warning}` : ''}). Pass \`to\` as the target's instance number (list_instance_numbers).`,
-          )
-        }
-        if (self.instance.kind !== 'desktop') {
-          throw new Error(
-            `"here" is ${instanceLabel(self.instance)}, a ${self.instance.kind} instance; a chat can only land in a Claude DESKTOP instance — pass \`to\` explicitly.`,
-          )
-        }
-        toRef = String(self.instance.num)
-        targetNote = `here = ${instanceLabel(self.instance)}`
-      } else if (toArg.toLowerCase() === 'best') {
-        toRef = 'best' // the orchestrator ranks the fleet itself, excluding the chat's own account
-      } else {
-        const row = await resolveRef(toArg)
-        if (row.kind !== 'desktop')
-          throw new Error(
-            `${instanceLabel(row)} is a ${row.kind} instance; a chat can only land in a Claude DESKTOP instance.`,
-          )
-        toRef = String(row.num)
-        targetNote = `to = ${instanceLabel(row)}`
-      }
+      // One resolver, shared with move_chats (resolveMoveTarget), so a batch and a single
+      // move can never disagree about which account "here" or "best" names.
+      const { toRef, targetNote } = await resolveMoveTarget(a.to)
       const args = [
         chat,
         '--to',
@@ -1600,6 +1612,10 @@ export const TOOLS: McpEngineTool[] = [
       if (a.force === true) args.push('--force')
       if (a.title != null && str(a.title).trim() !== '') args.push('--title', str(a.title).trim())
       if (a.dry_run === true) args.push('--dry-run')
+      // Off by default, and migrate_chat enforces the same default independently (exit 7),
+      // so omitting this can only ever be safe. Owner, Michael, 2026-09-05: a move touches
+      // unarchived chats only, unless the human asked for that specific chat.
+      if (a.archived === true) args.push('--archived')
       const run = (await api('/api/orchestrator/run', {
         method: 'POST',
         headers: JSON_HEADERS,
@@ -1624,6 +1640,112 @@ export const TOOLS: McpEngineTool[] = [
       }
       return {
         ok: payload.landed === true || payload.dryRun === true,
+        ...payload,
+        targetNote,
+        exitCode: run.exitCode,
+        exitMeaning: run.exitMeaning,
+        ...(str(run.stderr).trim() ? { stderr: run.stderr } : {}),
+      }
+    },
+  },
+  {
+    name: 'move_chats',
+    description:
+      "MUTATES: MOVE MANY CHATS BETWEEN ACCOUNTS IN ONE CALL — move_chat's plural, and the one you should reach for whenever more than a single chat is being moved (owner, 2026-09-05, angry: 13 chats took ~15 minutes as 13 separate calls). Do NOT loop move_chat and do NOT fire it in parallel: the daemon keys its in-flight map by SCRIPT NAME, so concurrent move_chat calls do not overlap — all but one return `409 busy` and the rest time their sockets out. This runs the orchestrator's migrate_batch, which executes migrate_chat's OWN pipeline inside ONE interpreter and ONE route-lock acquisition, BY PHASE rather than by chat (owner, 2026-09-06: \"move them all, archive them all, then set all the permissions\"): every chat is moved and verified, THEN every source row is settled, THEN one shared bypass watch is followed by every chat's permission stamp. So the fleet, session and usage-survey reads are paid once for the whole batch, the 8s bypass watch is paid once instead of once per chat, and the chats are usable as soon as the first phase ends. EVERY RAIL IS UNCHANGED AND PER CHAT: each chat is re-resolved immediately before its own gates (a liveness read from batch start is not liveness), a live writer is still refused, the landing is still verified by read-back, the source row is still settled, and the bypass verdict is still ADJUDICATED — read each result's `bypassVerdict`, never `permissionMode`. Imports are deliberately NOT parallelised: /import-desktop takes no act lock and two at once into one store can create a duplicate row that makes a chat permanently unreachable. Pass `chats` (title fragments or session ids), or `all_unarchived: true` to take every unarchived desktop chat — with `from` to scope that to one account and `limit` to cap it. A REFUSED CHAT DOES NOT STOP THE BATCH: it is reported by name with its reason and the rest continue, so read `refused` and the per-chat `results`, never just `moved`. `dry_run: true` plans every chat and moves nothing. Expect roughly 15-25s per chat that actually lands (the import, the source settle and the app's own permission picker each drive one window under its own lock, so they are irreducibly serial); the saving is in what is no longer repeated and no longer waited for twice, not in doing several at once.",
+    inputSchema: S(
+      {
+        chats: {
+          type: 'array',
+          minItems: 1,
+          items: { type: 'string' },
+          description:
+            'The chats to move: each a title fragment (fuzzy) or a session id. Omit only when using all_unarchived.',
+        },
+        all_unarchived: {
+          type: 'boolean',
+          description:
+            "Instead of naming chats, take EVERY unarchived desktop chat (scope it with `from`, cap it with `limit`). Archived chats are excluded — that is Claude Desktop's resting state and the majority of any account.",
+        },
+        from: {
+          type: ['string', 'number'],
+          description:
+            'The account the chats live on: number, name, label or email. Scopes both the search and all_unarchived.',
+        },
+        to: {
+          type: ['string', 'number'],
+          description:
+            '"here" (default: the instance this process runs as), "best" (most headroom), or an instance number/name/label/email. Resolved exactly as move_chat resolves it.',
+        },
+        force: {
+          type: 'boolean',
+          description:
+            "A person's word, applied to EVERY chat in the batch: override a hold / superseded lineage. A live writer is never overridden. Only when the human asked.",
+        },
+        archived: {
+          type: 'boolean',
+          description:
+            'Allow ARCHIVED chats to move too. Default false. Ignored by all_unarchived, which is unarchived by definition.',
+        },
+        limit: {
+          type: 'number',
+          description:
+            'With all_unarchived, cap the batch at the N most recently active chats. 0 or omitted means no cap.',
+        },
+        wait_secs: {
+          type: 'number',
+          description:
+            'Seconds each chat may wait for an idle-but-young engine (default 60 for a batch, max 360). Lower than move_chat on purpose: waiting 330s per chat is what makes a batch take a quarter of an hour.',
+        },
+        dry_run: { type: 'boolean', description: 'Plan every chat, move nothing.' },
+      },
+      [],
+    ),
+    run: async (a) => {
+      const chats = Array.isArray(a.chats)
+        ? a.chats.map((c) => str(c).trim()).filter((c) => c !== '')
+        : []
+      const all = a.all_unarchived === true
+      if (!all && chats.length === 0)
+        throw new Error(
+          'name the chats in `chats`, or pass all_unarchived: true (optionally with `from` and `limit`)',
+        )
+      // A batch's per-chat wait defaults LOW. move_chat's 330s is right when a human asked for
+      // one specific chat and will wait for it; multiplied across a batch it is the entire
+      // complaint this tool exists to answer.
+      const wait = Math.max(0, Math.min(360, Number(a.wait_secs ?? 60) || 0))
+      const { toRef, targetNote } = await resolveMoveTarget(a.to)
+      const args = ['--to', toRef, '--stop-idle', '--now', '--idle-wait', String(wait), '--json']
+      for (const c of chats) args.push('--chat', c)
+      if (all) args.push('--all-unarchived')
+      if (a.from != null && str(a.from).trim() !== '') {
+        const src = await resolveRef(str(a.from).trim())
+        args.push('--from', String(src.num))
+      }
+      if (a.force === true) args.push('--force')
+      if (a.archived === true) args.push('--archived')
+      if (a.dry_run === true) args.push('--dry-run')
+      const limit = Math.max(0, Math.floor(Number(a.limit ?? 0) || 0))
+      if (limit > 0) args.push('--limit', String(limit))
+      // The batch's own deadline must outlast every chat's wait plus its work, or the daemon
+      // kills a run mid-move and the report never comes back.
+      const planned = all ? Math.max(limit || 40, 40) : chats.length
+      const timeoutMs = Math.min(3_600_000, (planned * (wait + 90) + 180) * 1000)
+      const run = (await api('/api/orchestrator/run', {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ script: 'migrate_batch', args, timeoutMs }),
+      })) as Record<string, unknown>
+      let payload: Record<string, unknown> | null = null
+      try {
+        const parsed: unknown = JSON.parse(str(run.stdout))
+        if (parsed && typeof parsed === 'object') payload = parsed as Record<string, unknown>
+      } catch {
+        payload = null
+      }
+      // No JSON means the script never reached its own report (usage error, python missing,
+      // the route already busy) - hand back the raw run so the reason is visible.
+      if (!payload) return { ...run, ok: false, args, targetNote }
+      return {
         ...payload,
         targetNote,
         exitCode: run.exitCode,

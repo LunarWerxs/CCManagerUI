@@ -47,8 +47,10 @@ public struct WINDOWPLACEMENT {
 [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
 '@
 
-# The instance's MAIN window, matched the same way every sibling actuator matches: exact
-# --user-data-dir for a path-shaped -Instance, substring for a bare name.
+# The instance's MAIN window, matched the same way every sibling actuator matches (2026-09-06):
+# exact --user-data-dir for a path-shaped -Instance, exact LEAF folder name for a bare one - never
+# a substring ("pap3r rotate" is inside "pap3r rotate2") - and anything but exactly one match is
+# a refusal.
 $procs = Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
   Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' } |
   ForEach-Object {
@@ -60,7 +62,16 @@ $procs = Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
 if ($Instance -match '[\\/]') {
   $procs = @($procs | Where-Object { $_.Dir.TrimEnd('\') -eq $Instance.TrimEnd('\') })
 } else {
-  $procs = @($procs | Where-Object { $_.Dir -like "*$Instance*" })
+  # EXACT leaf-name match, never a substring: '-Instance main' must not also match 'main2'
+  # (mirrors rename_first.ps1's aim rail; review, 2026-09-06 - a substring hit could place a
+  # WRONG window's window).
+  $procs = @($procs | Where-Object { (Split-Path $_.Dir -Leaf) -ieq $Instance })
+}
+# ZERO or MORE THAN ONE match is a refusal, never "take the first" (2026-09-06).
+if ($procs.Count -ne 1) {
+  $candidates = ($procs | ForEach-Object { $_.Dir }) -join ', '
+  Write-Output "FAIL: $($procs.Count) running window(s) match instance '$Instance'$(if ($candidates) { " - candidates: $candidates" })"
+  exit 1
 }
 
 $hwnd = [IntPtr]::Zero

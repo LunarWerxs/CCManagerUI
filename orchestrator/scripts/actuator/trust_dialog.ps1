@@ -19,8 +19,14 @@
 #
 # Exit: 0 trusted - 3 no trust dialog on screen (nothing to do) - 4 a dialog is up but for a
 #       DIFFERENT folder (refused) - 1 error.
+#
+# -Instance IS MANDATORY (2026-09-06, review: an unscoped scan could answer a DIFFERENT
+# spawned instance's dialog). Matched exactly the same way every sibling actuator matches: an
+# exact --user-data-dir for a path-shaped -Instance, an exact leaf-folder-name match
+# (case-insensitive) for a bare one - never a substring, never "take the first" on ambiguity.
 param(
   [Parameter(Mandatory = $true)][string]$Folder,
+  [Parameter(Mandatory = $true)][string]$Instance,
   [switch]$WhatIf
 )
 $ErrorActionPreference = 'Stop'
@@ -29,12 +35,38 @@ Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 function Norm([string]$p) { return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant() }
 $want = Norm $Folder
 
+# Resolve THIS instance's process first, so the dialog scan below is scoped to windows ONLY
+# this process owns - never a different spawned instance's dialog.
+$mains = Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
+  Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' } |
+  ForEach-Object {
+    $m = [regex]::Match($_.CommandLine, '"--user-data-dir=([^"]+)"')
+    if (-not $m.Success) { $m = [regex]::Match($_.CommandLine, '--user-data-dir=(\S+)') }
+    $dir = if ($m.Success) { $m.Groups[1].Value.Trim() } else { Join-Path $env:APPDATA 'Claude' }
+    [pscustomobject]@{ ProcId = $_.ProcessId; Dir = $dir }
+  }
+if ($Instance -match '[\\/]') {
+  $mains = @($mains | Where-Object { $_.Dir.TrimEnd('\') -eq $Instance.TrimEnd('\') })
+} else {
+  $mains = @($mains | Where-Object { (Split-Path $_.Dir -Leaf) -ieq $Instance })
+}
+if ($mains.Count -ne 1) {
+  $candidates = ($mains | ForEach-Object { $_.Dir }) -join ', '
+  Write-Output "FAIL: $($mains.Count) running process(es) match instance '$Instance'$(if ($candidates) { " - candidates: $candidates" })"
+  exit 1
+}
+$procId = [int]$mains[0].ProcId
+
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $children = [System.Windows.Automation.TreeScope]::Children
 $desc = [System.Windows.Automation.TreeScope]::Descendants
+# Scope every top-level window this scan looks at to THIS instance's process id - the aim rail
+# that makes the folder-name check below a second, belt-and-braces confirmation rather than the
+# only thing standing between this actuator and someone else's dialog.
+$pidCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $procId)
 
 $sawAnyDialog = $false
-foreach ($w in $root.FindAll($children, [System.Windows.Automation.Condition]::TrueCondition)) {
+foreach ($w in $root.FindAll($children, $pidCond)) {
   $wn = $w.Current.Name
   if (-not $wn -or ($wn -notmatch 'Claude' -and $wn -notmatch 'Trust this workspace')) { continue }
   $all = $w.FindAll($desc, [System.Windows.Automation.Condition]::TrueCondition)
@@ -51,8 +83,10 @@ foreach ($w in $root.FindAll($children, [System.Windows.Automation.Condition]::T
   if (-not $sawDialog) { continue }
   $sawAnyDialog = $true
   if (-not $folderMatches) {
-    # another top-level window (a different spawned instance) may still carry OUR
-    # dialog - keep scanning instead of refusing off the first mismatch (race fix)
+    # this instance can own more than one top-level window (main + dialog); another one of
+    # THIS SAME process's windows may still carry our dialog - keep scanning instead of
+    # refusing off the first mismatch (race fix). The pid scope above already rules out a
+    # DIFFERENT instance's window reaching this point at all.
     continue
   }
   foreach ($e in $all) {

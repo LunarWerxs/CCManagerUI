@@ -7,8 +7,67 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ## [Unreleased]
 
+### Added
+
+- **The Instances toolbar's "Usage filter" is now just "Filter", and it asks three questions
+  instead of one** (`web/src/lib/instance-filter.ts`, `web/src/composables/useInstanceFilter.ts`,
+  `web/src/components/InstanceFilterMenu.vue`). Alongside the two quota windows it now filters by
+  STATUS (open / closed) and by PLAN (Max 20×, Pro, Free, … - the list is built from the accounts
+  actually on screen, so it names your plans rather than a guessed catalogue). The three facets are
+  OR-ed: picking two narrows the tables rather than cancelling out. Both new facets are true
+  whichever columns are showing, so the button no longer appears only in usage mode - only the
+  QUOTA half stands down with the percentages it measures, and the flyout says so in place rather
+  than silently ceasing to apply. Existing settings are untouched: the storage keys keep their
+  `usageFilter` spelling (a preference key is a wire format, not a label), status defaults to
+  "any" and no plan is picked, so an upgraded install filters exactly as it did.
+- **A row whose fact is not KNOWN is never filtered out.** An unlinked CLI login has no window to
+  be open or closed and no account record of its own, and a desktop instance's plan arrives a beat
+  after its row does. Both were already the rule for an unread quota reading; extending it is what
+  stops rows blinking out of the table and back on every refresh, and what stops "show me the open
+  ones" emptying the CLI table. The Codex table joins the filter on the same terms.
+
+### Changed
+
+- **The two 5-hour quota cells are grey now; colour is spent on the weekly ones**
+  (`web/src/components/UsageBar.vue`, `UsageBadge.vue`). A usage-mode row carried four coloured
+  cells, and four hues side by side average out to "busy" - the eye had to read each one to find
+  the alarming one. The 5-hour window is the one that gives its colour up, because it refills the
+  same afternoon: a spent session means "not right now", a spent week means "not at all", and only
+  the second is worth an alarm. Both 5-hour cells keep their number, their length and their
+  popover; the Session bar simply reads in the same neutral grey the Plan chip does.
+
 ### Fixed
 
+- **The window actuators aim by identity, never by substring or position** (every
+  `orchestrator/scripts/actuator/*.ps1`, plus `spawn_chat.py` and `migrate_chat.py`), after the
+  owner watched one click the project selector in the wrong account's window. A bare `-Instance`
+  now matches the profile dir's leaf name EXACTLY (`pap3r rotate` no longer also matches
+  `pap3r rotate2`), a blank `-Instance` is refused for anything that clicks or types (it used to
+  scan every running account), zero or several matching windows is a refusal that names every
+  candidate, a sidebar row must equal the title exactly rather than end with it, a key is never
+  posted until the focused element is proven to be the target, and a dialog's confirm button must
+  be NEW since the action that opened it rather than any enabled button named OK/Continue/Yes
+  anywhere on screen. `trust_dialog.ps1` finally takes an `-Instance`. Python callers hand the
+  actuators the unique profile DIR rather than the fleet name. Proven live: the rename drill on
+  the hardened scripts round-trips a real chat by bare instance name in 9.4s.
+- **A batch move no longer reports a chat that landed and then crashed in a later phase as "NOT
+  moved"** (`orchestrator/scripts/migrate_batch.py`). Phases two and three only run on a verified
+  landing, so a settle or stamp that raises keeps `landed: true`, marks the chat `ok: false` with
+  what did not finish, keeps its OTHER tidy-up running, and the report gets a distinct
+  "LANDED but not finished" bucket instead of the re-run advice. Per-chat `secs` also stops
+  charging the first chat with every later chat's stamping.
+- **The naming door restates the daemon's own title** (`migrate_chat.py`). A chat renamed in the
+  app whose index row still carried its first message was refused twice with "confirm_title does
+  not match" - the second time through the breaker. The door compares against the ROW, so the row
+  is what is restated now, via the per-id route.
+- **A compiled `dist/AgentHydra.exe` run from the repo finds the orchestrator one level up**
+  (`server/src/orchestrator.ts`). Launched as the daemon it looked for `dist/orchestrator`, and
+  every orchestrator-backed tool (`move_chats`, `orchestrator_menu`) died with "no orch.py" while
+  the tree sat beside it. A release zip with no toolbox still reports honestly.
+- **The migrate stopwatch now splits the two slow phases** into `settle-drive` / `settle-confirm`
+  and `stamp-doctrine` / `stamp-picker`, so a slow move says which half is slow. First measurement:
+  7.8s driving the source app's archive control, 8.0s for the single-move bypass watch, 5.2s
+  driving the target app's picker.
 - **The per-window UI lock is reclaimed on proof of death, not on age** (`orchestrator/scripts/
   lib/windowlib.py`). `instance_lock` deleted any lock directory older than 15 minutes without
   checking who held it, so a lane that legitimately ran long had its lock taken mid-gesture and

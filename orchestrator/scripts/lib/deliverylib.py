@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re as _re
 import time
 import uuid
 from pathlib import Path
@@ -140,6 +141,34 @@ def stage(session_id: str, text: str, *, title: str = "", instance: str = "",
 # conversation, and the whole point of the verify text is that it identifies THIS chat.
 MIN_VERIFY_LEN = 10
 
+#: The app's own rate-limit banner, which is NOT the chat's words: every walled chat on one
+#: account renders the identical line, so it identifies an account and never a conversation.
+#: Lives here, once, because two things need the same answer - _verify_snippet skips such a
+#: line when choosing a snippet, and stage_reply.last_rendered_text must keep walking BACK
+#: past a turn that is nothing else. Two copies of this regex would drift and the drift would
+#: show up as a chat that cannot be woken.
+_LIMIT_BANNER_RE = _re.compile(r"(?i)\b(session|usage|weekly|rate) limit\b|too many requests")
+
+#: LENGTH IS THE DISCRIMINATOR, and it belongs here rather than in each caller. The banner is
+#: one short line the APP renders; a chat's own paragraph that happens to discuss a session
+#: limit is the chat's words and identifies it perfectly well. The migration chats discuss
+#: limits constantly, so matching on the phrase alone would throw away real evidence - and
+#: when one caller applied a length rule and this one did not, they disagreed about the same
+#: text and the chat became unwakeable again by a different route.
+BANNER_MAX_LEN = 200
+
+
+def is_limit_banner(text: str) -> bool:
+    """Is this ONLY the app's rate-limit banner, rather than something the chat itself said?
+
+    Every walled chat on one account renders the identical line, so it identifies an ACCOUNT
+    and never a conversation - which is exactly what a verify snippet must do. Both the
+    snippet chooser below and stage_reply's transcript walk ask this one question, so they
+    cannot disagree about a given piece of text.
+    """
+    t = (text or "").strip()
+    return bool(t) and len(t) <= BANNER_MAX_LEN and bool(_LIMIT_BANNER_RE.search(t))
+
 
 def _verify_snippet(evidence: str, prefer_len: int = 24, max_len: int = 80) -> str:
     """A distinctive line from the chat's own last words, for the actuator to match on.
@@ -186,7 +215,7 @@ def _verify_snippet(evidence: str, prefer_len: int = 24, max_len: int = 80) -> s
         # resets 5:50pm"). Every rate-limited chat on that account shows the same line, so
         # it proves nothing about WHICH chat is on screen - and it is exactly the moment the
         # wrong-chat guard matters most. Keep walking back to real content.
-        if re.search(r"(?i)\b(session|usage|weekly|rate) limit\b|too many requests", cand):
+        if is_limit_banner(cand):
             continue
         if len(cand) >= MIN_VERIFY_LEN:
             return cand[:max_len]

@@ -39,8 +39,15 @@ class ActTestBase(unittest.TestCase):
         # is what it waits for); a stub daemon boots nothing, so one pass is the whole watch.
         self._watch = mock.patch.object(migrate_chat, "BYPASS_WATCH_SECS", 0)
         self._watch.start()
+        # ⛔ NO TEST MAY REACH THE REAL PICKER - same rail as test_migrate_fast_path's base:
+        # confirm_bypass_in_app drives a PowerShell actuator at a live Electron window, and
+        # every target in this suite's fleet is isRunning=True.
+        self._picker = mock.patch.object(migrate_chat, "confirm_bypass_in_app",
+                                         lambda _row, _fleet: "REFUSED: no window (test)")
+        self._picker.start()
 
     def tearDown(self):
+        self._picker.stop()
         self._watch.stop()
         self.stub.close()
         os.environ.pop("ORCHESTRATOR_STATE_DIR", None)
@@ -296,7 +303,10 @@ class MigrateTest(ActTestBase):
         with mock.patch.object(migrate_chat, "_settle_source", return_value=(0, "Archive done")) as m:
             code = migrate_chat.main([SID, "--to", "2claude"])
         self.assertEqual(code, 0)
-        m.assert_called_once_with("src", "T")
+        # Dir-first (2026-09-06): the fixture's fleet row carries a dir for "src", so the
+        # actuator (and the window lock it keys inside _settle_source) must be aimed at
+        # that unique profile dir, never the bare leaf name a sibling profile could share.
+        m.assert_called_once_with("c:\\i\\src", "T")
 
     def test_closed_source_needs_no_settle(self):
         import unittest.mock as mock

@@ -14,7 +14,7 @@ migration notice so the chat introduces itself in its new home); this script own
 
 Usage: python migrate_chat.py <title fragment | session id> --to <instance num|name|dir|best>
        [--from <instance>] [--now] [--title "New title"] [--force] [--stop-idle]
-       [--idle-wait N] [--dry-run] [--json]
+       [--idle-wait N] [--dry-run] [--archived] [--json]
   <title>       matched exactly first, then FUZZILY: case, punctuation and a misspelling
                 ("arkitecht cleanup" finds "Arkitekt cleanup") - every word of the query must
                 closely match a word of the title. Two different chats that both fit stay a
@@ -31,8 +31,16 @@ Usage: python migrate_chat.py <title fragment | session id> --to <instance num|n
                 tell "waiting" from "background work" by time alone; this reads the work
                 itself (enginelib.background_work). An outstanding job, a working engine, a
                 stuck engine and a live writer all keep every rail they have.
+  --archived    move the chat even though it is ARCHIVED. Off by default (owner, Michael,
+                2026-09-05: "only move UN archived chats. Not archived ones. Make sure
+                that's the default. Unless asked"), because an archived chat is finished
+                history or a retired twin, and landing one spends a live account's headroom
+                on something nobody will open. A separate word from --force, both ways:
+                --force overrides a hold on ONE chat and never implies this.
   --dry-run     resolve the chat, the target, the hold and the engine's idleness, print the
                 plan, and STOP - nothing is posted, nothing is stopped, nothing is counted.
+                The archived refusal above IS enforced here: a plan that says "would move"
+                for a chat the real run refuses is worse than no plan at all.
   --stop-idle   a chat whose engine is alive but IDLE (finished its turn, quiet 5+ min) is
                 stopped deliberately first, and confirmed gone, then moved - the desktop
                 never stops an engine on its own, so without this no desktop chat could ever
@@ -57,7 +65,7 @@ Usage: python migrate_chat.py <title fragment | session id> --to <instance num|n
 Exit:  0 landed and verified - 3 deterministic refusal (chat/instance not resolvable,
        superseded, or a 400 the daemon will repeat) - 4 live writer (import rewrites the
        transcript; never overridden) - 5 breaker - 6 the chat is HELD (--force overrides) -
-       1 daemon failure or verify failed.
+       7 the chat is ARCHIVED (--archived includes it) - 1 daemon failure or verify failed.
 
 Without --title, the chat's CURRENT title (just read from the dossier) is restated as
 confirm_title - the daemon's naming door demands a real title or exactly that proof of a
@@ -89,6 +97,7 @@ from pathlib import Path as _Path
 
 from lib import clilib, holdlib
 from lib import hydralib
+from lib import windowlib
 from lib import ledgerlib
 from lib import mutationlib
 from lib import stamplib
@@ -111,6 +120,13 @@ SETTLE_CONFIRM_SECS = 3.0
 # boots a landed chat within ~2s; its re-save follows. Polled every second, re-stamped on a
 # flip, and only a mode that STAYS bypass is reported as bypass.
 BYPASS_WATCH_SECS = 8.0
+# The doctrine re-stamp's ceiling and its poll interval. The ceiling is the old flat sleep(4)
+# unchanged - only the WAITING got smarter, never the deadline.
+DOCTRINE_RESTAMP_SECS = 4.0
+DOCTRINE_RESTAMP_POLL_SECS = 0.4
+# Match hydralib's own SURVEY_CACHE_SECS: at 120 a batch running past two minutes re-paid an
+# ~80s fleet usage survey it already had a fresh answer for. 240 is the cache's own contract.
+SURVEY_MAX_AGE_SECS = 240
 # Fuzzy title matching: every query word must match some title word at least this closely
 # (difflib ratio), OR the whole normalized query must match the whole title this closely.
 # 0.8 lets one letter-pair slip in a nine-letter word ("arkitecht"/"arkitekt" = 0.82) and
@@ -139,6 +155,7 @@ class _Stopwatch:
     def __init__(self) -> None:
         self.t0 = time.time()
         self.mark = self.t0
+        self.idle = 0.0
         self.phases: dict[str, float] = {}
 
     def lap(self, name: str) -> None:
@@ -146,8 +163,21 @@ class _Stopwatch:
         self.phases[name] = round(self.phases.get(name, 0.0) + (now - self.mark), 2)
         self.mark = now
 
+    def resume(self) -> None:
+        """Begin a phase after time this chat did NOT spend, and discount it.
+
+        A batch runs one phase across every chat before starting the next, so the wall clock
+        between two of ONE chat's phases is other chats' work. Counting it would put a
+        four-minute 'settle-source' on a chat whose settle took eight seconds - a number that
+        is not merely useless but actively misleading, since the phase timings are what get
+        read when a migration is called slow.
+        """
+        now = time.time()
+        self.idle += now - self.mark
+        self.mark = now
+
     def total(self) -> float:
-        return round(time.time() - self.t0, 2)
+        return round(time.time() - self.t0 - self.idle, 2)
 
     def text(self) -> str:
         parts = " · ".join(f"{k} {v:.1f}" for k, v in self.phases.items() if v >= 0.05)
@@ -155,23 +185,26 @@ class _Stopwatch:
 
 
 def _untruncated_title(session_id: str, shown: str | None) -> str | None:
-    """The title the NAMING DOOR wants: the session's own, whenever the desktop record's is
-    elided. The app stores a long chat title cut short with an ellipsis, and the daemon
-    compares confirm_title against the full one, so restating what the record shows is a
-    guaranteed rejection. Only an actually-elided title is looked up - a normal title is
-    never second-guessed, and a failed lookup degrades to what we already had."""
-    text = str(shown or "")
-    if not text.endswith(ELIDED):
-        return shown
+    """The title the NAMING DOOR compares against: the daemon's OWN row for this session,
+    whenever it has one - restating anything else is a guaranteed 400.
+
+    Two ways the desktop record's title is not what the door wants, both hit live:
+      1. an ELIDED long title (2026-09-03, the Agos chats): the app stores it cut short with an
+         ellipsis and the daemon compares against the full one;
+      2. a title the desktop holds and the daemon's index does NOT (2026-09-06, 'D drive
+         cleanup'): the chat was renamed in the app, the index row still carried its first
+         message, and the move was refused twice - the second time through the breaker - with
+         'confirm_title does not match the current title'.
+    The door compares against the ROW, so the row is what is restated, and the per-id route
+    (hydralib.session_row) is asked rather than a windowed list scan. A failed lookup, or a
+    row with no usable title, degrades to what the record showed."""
     try:
-        for row in hydralib.sessions():
-            if row.get("session_id") == session_id:
-                full = str(row.get("title") or "")
-                if full and not full.endswith(ELIDED):
-                    return full
-                break
+        row = hydralib.session_row(session_id) or {}
     except hydralib.DaemonError:
-        pass
+        row = {}
+    full = str(row.get("title") or "")
+    if full and not full.endswith(ELIDED):
+        return full
     return shown
 
 
@@ -275,7 +308,14 @@ def resolve_for_migrate(query: str, source_name: str | None = None) -> dict:
     try:
         return hydralib.choose_match(query, matches)
     except hydralib.ChatNotFound:
-        rows = [r for r in hydralib.sessions() if _in_source(r.get("instance"), source_name)]
+        # RESOLUTION ASKS THE COMPLETE QUESTION (2026-09-05). The default 7d window measured
+        # 21 rows against 500 for all+archived and hid six unarchived chats, one of them live
+        # that morning - so a windowed scan here answers "no such chat" for a chat that
+        # plainly exists, which is the most misleading refusal this script can produce. Find
+        # everything; let _check_archived_or_raise decide whether it may MOVE. A guard that
+        # names the real reason always beats a lookup that pretends the chat is not there.
+        rows = [r for r in hydralib.sessions(period="all", archived="include")
+                if _in_source(r.get("instance"), source_name)]
         hits = [r for r in rows if r.get("session_id") == query]
         if not hits:
             q = query.lower()
@@ -314,18 +354,38 @@ _ACTUATOR = _Path(__file__).resolve().parent / "actuator" / "manage_desktop_chat
 def _settle_source(instance: str, title: str) -> tuple[int, str]:
     """Archive the SUPERSEDED source row through its RUNNING app's own control.
 
+    `instance` should be the SOURCE fleet row's unique profile DIR, not its bare name
+    (2026-09-06): 20 desktop profiles share near-duplicate leaf names ("pap3r rotate" vs
+    "pap3r rotate2"), and both the actuator's -Instance and the instance_lock below key on
+    whatever string this parameter holds - a bare name is the one thing that can resolve to
+    the wrong window. The caller falls back to the name only when its fleet row has no dir.
+
     THE ZOMBIE-ROW LEAK (found live 2026-08-31, five fresh cases in minutes): the daemon's
     import flags the source copy archived on disk, but a RUNNING source app re-saves the
     flag away - so every migration off an open account left a visible stale twin, and the
     twins made every later resolve of that chat ambiguous. Settling through the app's own
     archive control is immediate and durable (the app makes the write itself). Exit 3 (row
-    not rendered) means the screen already agrees - settled."""
-    r = clilib.run_text(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_ACTUATOR),
-         "-Instance", instance, "-Action", "Archive", "-Title", title],
-        timeout=240,
-    )
-    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+    not rendered) means the screen already agrees - settled.
+
+    ⛔ THIS DRIVES AN ELECTRON WINDOW, SO IT TAKES THAT WINDOW'S LOCK (added 2026-09-05, the
+    gap a batch made load-bearing). Every other window driver goes through
+    windowlib.instance_lock ('ONE DRIVER PER WINDOW AT A TIME'); this one never did, and the
+    daemon's global per-script route lock was the only thing keeping two moves off the SAME
+    account from fighting over one sidebar. A batch runs N moves inside ONE route-lock
+    acquisition, so that accidental protection is gone and the real lock has to be here.
+    The yielded False is HONOURED, never ignored: another lane held the window past the
+    wait, so the actuator is not driven at all and exit 75 tells the caller to fall back to
+    the disk flag rather than claim a settle that never happened."""
+    with windowlib.instance_lock(instance, wait_secs=60) as mine:
+        if not mine:
+            return 75, (f"another lane held {instance}'s window past the wait - the source "
+                        "row was not driven through the app's own control")
+        r = clilib.run_text(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_ACTUATOR),
+             "-Instance", instance, "-Action", "Archive", "-Title", title],
+            timeout=240,
+        )
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
 
 
 def _source_still_visible(session_id: str, src_instance: str, fleet_data: dict | None = None) -> bool:
@@ -396,6 +456,7 @@ class MigrateArgs:
     source: str | None = None   # --from: the instance the chat lives on
     now: bool = False           # --now: a person's move, the fast quiet window
     dry_run: bool = False       # --dry-run: plan, post nothing
+    archived: bool = False      # --archived: move it even though it is archived
 
 
 class _MigrateRefusal(Exception):
@@ -419,6 +480,7 @@ def _parse_migrate_argv(argv: list[str]) -> MigrateArgs | int:
     stop_idle = "--stop-idle" in argv
     now = "--now" in argv
     dry_run = "--dry-run" in argv
+    archived = "--archived" in argv
     to = title = source = None
     idle_wait = 0
     args: list[str] = []
@@ -462,7 +524,7 @@ def _parse_migrate_argv(argv: list[str]) -> MigrateArgs | int:
     if now and not stop_idle:
         stop_idle = True  # --now IS a stop-idle move; saying so twice is not required
     return MigrateArgs(as_json, force, stop_idle, to, title, idle_wait, args[0],
-                       source=source, now=now, dry_run=dry_run)
+                       source=source, now=now, dry_run=dry_run, archived=archived)
 
 
 def _resolve_chat_or_raise(query: str, source: str | None = None) -> tuple[dict, dict]:
@@ -514,7 +576,7 @@ def best_target(fleet: dict, exclude_name: str | None, survey: dict | None = Non
     (severity 'unknown' is not headroom - AgentHydra's own rule), and a 5-hour window at or
     past 95% (that account is walled NOW, whatever its weekly says)."""
     if survey is None:
-        survey = hydralib.usage_survey(max_age_secs=120)
+        survey = hydralib.usage_survey(max_age_secs=SURVEY_MAX_AGE_SECS)
     by_num = {int(i.get("num")): i for i in fleet.get("instances", []) if i.get("num") is not None}
     ranked: list[dict] = []
     for row in survey.get("rows", []):
@@ -578,6 +640,42 @@ def _resolve_target_or_raise(fleet: dict, to: str, match: dict, session_id: str,
             0,
         )
     return target
+
+
+def _check_archived_or_raise(match: dict, include_archived: bool) -> None:
+    """⛔ A MOVE TOUCHES UNARCHIVED CHATS ONLY (owner, Michael, 2026-09-05: "when I tell you
+    to move, only move UN archived chats. Not archived ones. Make sure that's the default.
+    Unless asked").
+
+    ⛔ AND `archived` IS NOT EVIDENCE THE CHAT IS FINISHED - which is exactly WHY the default
+    is off, not a reason to doubt it. Claude Desktop's isArchived is a RESTING state meaning
+    "not currently on screen", and it was measured across this machine's whole store on
+    2026-08-29 at 2,598 of 2,611 chats; the thirteen without it were precisely the ones open
+    in a window at that moment. So archived is the overwhelming MAJORITY of every account,
+    and a move that swept it in by default would quietly turn "move this account's chats"
+    into "move everything that ever existed here". Measured on the real fleet the day this
+    landed: one account offered 26 archived rows against 0 live ones.
+
+    Human intent lives in the done-mark (session_marks.done), never in this flag. If you ever
+    want a heuristic for "is this chat finished", the archive flag is not it.
+
+    --archived is a SEPARATE word from --force, deliberately, and neither implies the other.
+    --force is a person's judgment about ONE chat (override this hold, re-land this retired
+    lineage); this is a standing default about a whole CLASS. So a --force move can never
+    drag an archived chat along as a side effect of overriding something else.
+
+    Enforced BEFORE the --dry-run return, unlike the hold, which a dry run reads without
+    enforcing. A dry run answering "would move" for a chat the real run would refuse is the
+    exact trap this guard exists to close: the plan is what an operator (or an agent) acts on.
+    """
+    if not match.get("archived") or include_archived:
+        return
+    raise _MigrateRefusal({
+        "landed": False,
+        "archivedSkipped": True,
+        "report": (f"REFUSED: '{match.get('title')}' is ARCHIVED, and a move touches "
+                   f"unarchived chats only by default. Pass --archived if you meant this one."),
+    }, 7)
 
 
 def _check_hold_or_raise(session_id: str, force: bool) -> None:
@@ -906,7 +1004,7 @@ def _verify_landing_or_raise(session_id: str, target: dict, chat_title, result: 
 
 
 def _settle_source_row(match: dict, target: dict, fleet: dict, session_id: str,
-                       chat_title) -> tuple[str, str]:
+                       chat_title, sw=None) -> tuple[str, str]:
     """Settle the superseded SOURCE row (_settle_source docstring).
 
     Returns (report suffix, STATE) where state is the machine half - 'none' nothing to
@@ -931,7 +1029,18 @@ def _settle_source_row(match: dict, target: dict, fleet: dict, session_id: str,
             if _archive_source_on_disk(session_id, src_name, fleet) else \
             (f" ⚠ Source row is STILL VISIBLE in {src_name} and its flag could not be "
              "written. Not claiming a clean move.", "visible")
-    code_s, out_s = _settle_source(src_name, str(chat_title))
+    # AIM BY IDENTITY, NOT BY NAME (2026-09-06): src_inst is already the SOURCE's unique
+    # fleet row, so hand the actuator its profile DIR - the one thing that cannot collide
+    # with a same-named-leaf sibling ("pap3r rotate" vs "pap3r rotate2"). windowlib
+    # .instance_lock inside _settle_source keys on this same value, so the lock and the
+    # actuator now aim at the identical, unique target. Fall back to the bare name only
+    # when the fleet row itself carries no dir, and say so in the report.
+    src_dir = str(src_inst.get("dir") or "") if src_inst else ""
+    settle_instance = src_dir or src_name
+    dir_note = "" if src_dir else f" (no dir on record for {src_name}; settled by name)"
+    code_s, out_s = _settle_source(settle_instance, str(chat_title))
+    if sw is not None:
+        sw.lap("settle-drive")  # the actuator alone; the read-back below is the next lap
     # DOUBLE-CHECK, NEVER ASSUME (owner, 2026-09-01: "it can't do it blind; it must always
     # double check, confirm"). Exit 3 used to be read as "already settled"; a row the app
     # virtualized off-screen is not rendered AND still visible when scrolled. So the source
@@ -944,10 +1053,11 @@ def _settle_source_row(match: dict, target: dict, fleet: dict, session_id: str,
         # once more after a beat: only a flag that STAYS archived counts (a running app can
         # re-save it away), which is what the old single look after 2s was really testing.
         if _wait_until(lambda: not _source_still_visible(session_id, src_name, fleet),
-                       SETTLE_CONFIRM_SECS):
+                       SETTLE_CONFIRM_SECS, step_secs=DOCTRINE_RESTAMP_POLL_SECS):
             time.sleep(0.5)
             if not _source_still_visible(session_id, src_name, fleet):
-                return " Source row settled through its app's own control (verified on disk).", "settled"
+                return (" Source row settled through its app's own control (verified on "
+                        f"disk).{dir_note}", "settled")
         # ⛔ NEVER LEAVE THE SOURCE VISIBLE (owner, 2026-09-01) - and this branch used to do
         # exactly that: it warned and stopped, so a window that renders no rows (minimized,
         # collapsed, virtualized) returned exit 3 and every move off it left a twin nobody
@@ -958,63 +1068,202 @@ def _settle_source_row(match: dict, target: dict, fleet: dict, session_id: str,
                 not _source_still_visible(session_id, src_name, fleet):
             return ((f" Source row in {src_name} did not answer its app's own control "
                      f"(exit {code_s}); its archive flag was written on disk instead - the "
-                     "ghost sweep clears the row the moment that app renders it."), "flagged")
+                     f"ghost sweep clears the row the moment that app renders it.{dir_note}"),
+                    "flagged")
         ledgerlib.annotate("migrate", session_id,
                            f"landed in {target.get('name')} but the source row in "
                            f"{src_name} is still visible (settle exit {code_s})",
                            failure=True)
         return (f" ⚠ Source row in {src_name} is STILL VISIBLE after the settle "
                 f"(actuator exit {code_s}) - a twin is on screen; the twins lane "
-                "will keep settling it. Not claiming a clean move.", "visible")
+                f"will keep settling it. Not claiming a clean move.{dir_note}", "visible")
     # The app's own control is the immediate and durable route, but it can fail - an
     # ambiguous title, a row not rendered - and every one of those failures left a twin on
     # screen until a later sweep caught it.
     fallback = _archive_source_on_disk(session_id, src_name, fleet)
     return (
         (f" Source row could not be settled through the app ({code_s}); its archive "
-         "flag was written on disk instead - it clears at that app's next restart."), "flagged"
+         f"flag was written on disk instead - it clears at that app's next restart."
+         f"{dir_note}"), "flagged"
     ) if fallback else (
         (f" Source row NOT settled (actuator said: "
          f"{(out_s.splitlines()[-1][:100] if out_s else code_s)}) - a stale twin "
-         f"may linger in {src_name}; archive it there."), "visible"
+         f"may linger in {src_name}; archive it there.{dir_note}"), "visible"
     )
 
 
 def watch_bypass(meta_path: str, watch_secs: float = BYPASS_WATCH_SECS,
                  sleep=time.sleep, clock=time.time) -> dict:
-    """Keep the landed record on bypassPermissions THROUGH the app's boot re-save.
+    """Keep the landed record on BOTH doctrine stamps THROUGH the app's boot re-save.
 
-    Reads the mode back from disk once a second for `watch_secs`; any read that is not
-    bypass is re-stamped (stamplib.stamp_doctrine) and counted. Returns {mode, flips,
-    stable}: `mode` is what the disk said on the LAST read - never what was written - and
-    `stable` is whether the final second of the watch saw bypass hold. A record that cannot
-    be read reports mode None; the caller says so rather than claiming bypass."""
+    Reads the record back from disk once a second for `watch_secs`; any read missing EITHER
+    half is re-stamped (stamplib.stamp_doctrine, which writes both) and counted. Returns
+    {mode, ultracode, flips, stable}: `mode` and `ultracode` are what the disk said on the
+    LAST read - never what was written - and `stable` is whether the final second of the
+    watch saw bypass hold. A record that cannot be read reports mode None and ultracode
+    False; the caller says so rather than claiming either.
+
+    ⛔ IT GUARDS BOTH HALVES BECAUSE GUARDING ONE PRODUCED A FALSE GREEN (measured 2026-09-06,
+    on the five chats a batch had just moved). The watch only ever re-stamped permissionMode,
+    so the bypass half survived the app's re-save and the ultracode half did not: FOUR OF FIVE
+    chats the move reported as "bypassPermissions + ultracode stamped into the landed record"
+    were sitting with ultracode gone and effort null minutes later. The sentence was true when
+    it printed and false before anyone read it, which is the worst shape a report can have.
+    stamp_doctrine writes both halves in one write, so defending both costs nothing extra."""
     flips = 0
     mode = None
+    ultracode = False
     deadline = clock() + watch_secs
     while True:
         try:
             meta = stamplib.read_meta(meta_path)
             mode = meta.get("permissionMode")
+            ultracode = stamplib.is_stamped(meta)
         except (OSError, ValueError):
-            mode = None
-        if mode != stamplib.BYPASS:
+            mode, ultracode = None, False
+        if mode != stamplib.BYPASS or not ultracode:
             got = stamplib.stamp_doctrine(meta_path)
-            if got.get("bypass"):
+            if got.get("bypass") or got.get("ultracode"):
                 flips += 1
-                mode = stamplib.BYPASS
+                mode = stamplib.BYPASS if got.get("bypass") else mode
+                ultracode = bool(got.get("ultracode")) or ultracode
         if clock() >= deadline:
             break
         sleep(1)
-    return {"mode": mode, "flips": flips, "stable": mode == stamplib.BYPASS}
+    return {"mode": mode, "flips": flips, "stable": mode == stamplib.BYPASS,
+            "ultracode": ultracode}
 
 
-def _stamp_automation_doctrine(session_id: str, target: dict, after: list[dict]) -> tuple[bool, str, bool, str, str | None]:
+def watch_bypass_many(meta_paths: list[str], watch_secs: float = BYPASS_WATCH_SECS,
+                      sleep=time.sleep, clock=time.time) -> dict:
+    """watch_bypass over MANY landed records at once, in ONE window.
+
+    Nothing about the watch is per chat except which file is read: it is a once-a-second
+    re-read that re-stamps anything the app flipped back, and N of those windows overlap
+    perfectly. Running them serially spent 8s x N waiting for the same 8 seconds - on the
+    5-chat migration of 2026-09-06 that was 40 of 189 total seconds, doing nothing, and it
+    grows linearly with the batch (owner, same day: "you seem a little slow").
+
+    Returns {meta_path: {mode, flips, stable, ultracode}} - the SAME per-chat verdict watch_bypass
+    returns, so a caller cannot tell a shared watch from its own except by the clock. A path
+    that cannot be read reports mode None, exactly as the single watch does; it is never
+    silently dropped, because a missing key would read to the caller as "nobody watched" and
+    quietly earn a fresh 8s watch it does not need.
+    """
+    paths = list(dict.fromkeys(p for p in meta_paths if p))
+    state = {p: {"mode": None, "flips": 0, "stable": False, "ultracode": False} for p in paths}
+    if not paths:
+        return state
+    deadline = clock() + watch_secs
+    while True:
+        for path in paths:
+            row = state[path]
+            try:
+                meta = stamplib.read_meta(path)
+                mode = meta.get("permissionMode")
+                ultracode = stamplib.is_stamped(meta)
+            except (OSError, ValueError):
+                mode, ultracode = None, False
+            if mode != stamplib.BYPASS or not ultracode:
+                got = stamplib.stamp_doctrine(path)
+                if got.get("bypass") or got.get("ultracode"):
+                    row["flips"] += 1
+                    mode = stamplib.BYPASS if got.get("bypass") else mode
+                    ultracode = bool(got.get("ultracode")) or ultracode
+            row["mode"] = mode
+            row["ultracode"] = ultracode
+        if clock() >= deadline:
+            break
+        sleep(1)
+    for row in state.values():
+        row["stable"] = row["mode"] == stamplib.BYPASS
+    return state
+
+
+BYPASS_REMEDY_CMD = "python automation_chat.py {sid} --force"
+
+
+def confirm_bypass_in_app(row: dict, fleet: dict) -> str:
+    """Drive the TARGET APP'S OWN permission picker for the chat that just landed, and return
+    what the actuator said. Indirection kept at module scope so a test can replace it without
+    a real PowerShell window; never raises."""
+    try:
+        import automation_chat
+    except Exception as err:  # pragma: no cover - an import failure is reported, never fatal
+        return f"picker unavailable ({str(err)[:80]})"
+    try:
+        return automation_chat.set_mode_via_app(row, fleet, force=True)
+    except Exception as err:
+        return f"picker error: {str(err)[:120]}"
+
+
+def _app_confirmed(session_id: str) -> bool:
+    """Did the picker's own verdict land? set_mode_via_app writes mark_confirmed(sid) exactly
+    when the actuator exited 0, so the confirmation ledger - not a parsed message string - is
+    what says the app itself now holds bypass."""
+    try:
+        import automation_chat
+
+        return session_id in automation_chat.load_confirmed()
+    except Exception:
+        return False
+
+
+def _adjudicate_bypass(session_id: str, chat_title, target: dict, meta_path: str,
+                       fleet: dict, watched: dict) -> tuple[str, str, str]:
+    """WHAT A MOVE MAY CLAIM ABOUT THE PERMISSION MODE, AND ON WHAT EVIDENCE.
+
+    ⛔ A DISK READ IS NOT THE MODE THE CHAT WILL OPEN WITH (owner, 2026-09-05, the third time
+    he has had to set it by hand: "moving the chats is required to set the permissions to
+    bypass permissions ... I had to do that manually"). The app's import handler creates the
+    chat's record in MEMORY on `acceptEdits`, memory is authoritative, and the store is
+    re-read only at the app's OWN process boot (session-launch.ts applyDesktopChatAutomation,
+    "HOW IT LOSES", measured twice). So watch_bypass's green - eight seconds of a disk file
+    agreeing with itself, with nothing racing it - was never evidence about the running app,
+    and every move reported it as though it were.
+
+    Three verdicts, each naming its own evidence:
+      app-confirmed   the target app's picker itself reports Bypass permissions. The only
+                      green available while that app is running.
+      adopted-at-boot the target app is NOT running, so it reads this store at its next boot
+                      and opens the chat on what we just wrote. Green, on the one write the
+                      code has always said provably enters app memory.
+      disk-only       disk holds bypass and the app was not confirmed. NOT a guarantee, and
+                      it must never again be printed as one.
+      unknown         the record could not be read; claim nothing.
+    """
+    mode = watched["mode"]
+    remedy = BYPASS_REMEDY_CMD.format(sid=session_id)
+    if mode is None:
+        return "unknown", "the landed record could not be read back", remedy
+    if not watched["stable"]:
+        return "disk-only", f"permissionMode on disk is {mode!r}, NOT bypass", remedy
+    if not target.get("isRunning"):
+        return ("adopted-at-boot",
+                f"{target.get('name')}'s app is not running, so it reads this store at its own "
+                "boot - the stamp on disk IS the mode it will open with", "")
+
+    said = confirm_bypass_in_app(
+        {"sessionId": session_id, "title": chat_title,
+         # dir-first (2026-09-06): target is already the unique fleet row; hand its dir
+         # rather than re-resolving a bare name that a same-named-leaf sibling could match.
+         "instance": target.get("dir") or target.get("name") or "", "metaPath": meta_path},
+        fleet,
+    )
+    if _app_confirmed(session_id):
+        return "app-confirmed", f"the app's own picker: {said}", ""
+    return "disk-only", f"the app's picker did not confirm ({said})", remedy
+
+
+def _stamp_automation_doctrine(session_id: str, target: dict, after: list[dict],
+                               fleet: dict, chat_title=None,
+                               watched: dict | None = None, sw=None) -> dict:
     """The automation doctrine (module docstring): stamp bypassPermissions on every verified
     landing, and ultracode, mechanically, into the landed chat's meta record (stamplib
-    docstring). Returns (stamped, stamp_note, ultracode_ok, ultracode_note, permission_mode)
-    where permission_mode is what the disk said LAST (watch_bypass), or None when no record
-    could be read."""
+    docstring), then ADJUDICATE what may actually be claimed about the mode
+    (_adjudicate_bypass). Returns the payload half as a dict; `mode` is what the disk said
+    LAST (watch_bypass), or None when no record could be read, and `stamped` is true ONLY on
+    a verdict that was earned."""
     try:
         stamp = hydralib.api_post(f"/api/sessions/{session_id}/automation", {})
         stamped = bool(isinstance(stamp, dict) and stamp.get("ok"))
@@ -1043,35 +1292,316 @@ def _stamp_automation_doctrine(session_id: str, target: dict, after: list[dict])
         # what makes it stick.
         got = stamplib.stamp_doctrine(meta_path)
         if not (got["bypass"] and got["ultracode"]):
-            time.sleep(4)
-            got = stamplib.stamp_doctrine(meta_path)
-        if got["bypass"] and got["ultracode"]:
-            uc_note = "bypassPermissions + ultracode stamped into the landed record"
-        else:
-            uc_note = (f"doctrine stamp INCOMPLETE (bypass={got['bypass']}, "
-                       f"ultracode={got['ultracode']}, {got['error']}) - run automation_chat.py")
-        uc_ok = bool(got["bypass"] and got["ultracode"])
+            # POLL, DON'T SLEEP THE CEILING. The flat sleep(4) here burned four seconds on
+            # every move whose first stamp lost the race, including the overwhelming majority
+            # where the app had settled within a few hundred milliseconds. Same 4s ceiling,
+            # same re-stamp, same outcome - it just stops waiting once both halves have taken.
+            deadline = time.time() + DOCTRINE_RESTAMP_SECS
+            while True:
+                time.sleep(DOCTRINE_RESTAMP_POLL_SECS)
+                got = stamplib.stamp_doctrine(meta_path)
+                if (got["bypass"] and got["ultracode"]) or time.time() >= deadline:
+                    break
         stamped = stamped or got["bypass"]
         # ALWAYS BYPASS, VERIFIED, NOT HOPED (owner, 2026-09-04): watch the record through the
         # app's boot re-save and re-stamp any flip; report what the disk said last.
-        watched = watch_bypass(meta_path)
+        # A BATCH SHARES ONE WATCH. Eight seconds is eight seconds N times for a window that
+        # overlaps perfectly - every landed record is watched by the same once-a-second loop,
+        # so migrate_batch watches them all together (watch_bypass_many) and hands each chat
+        # its own result here. `None` means nobody watched on this chat's behalf.
+        if watched is None:
+            watched = watch_bypass(meta_path)
         mode = watched["mode"]
+        # ⛔ WHAT THE WATCH SAW LAST IS THE ANSWER, NOT WHAT THE STAMP WROTE FIRST. This used
+        # to report `got` - the result of the write, taken before the watch had run - so the
+        # move claimed both halves the instant it wrote them and never asked whether they
+        # survived. Four of the five chats moved on 2026-09-06 were reported as "ultracode
+        # stamped" and had ultracode gone minutes later. Read the observation, not the intent.
+        uc_ok = bool(watched.get("ultracode", got["ultracode"]))
+        if mode == stamplib.BYPASS and uc_ok:
+            uc_note = "bypassPermissions + ultracode stamped into the landed record"
+        else:
+            uc_note = (f"doctrine stamp INCOMPLETE (bypass={mode == stamplib.BYPASS}, "
+                       f"ultracode={uc_ok}, {got['error']}) - run automation_chat.py")
         if watched["flips"]:
-            uc_note += (f"; the app re-saved a prompting mode {watched['flips']}x during the "
-                        f"{int(BYPASS_WATCH_SECS)}s watch and was re-stamped each time")
-        if not watched["stable"]:
-            uc_note += f" - ⚠ permissionMode on disk is {mode!r}, NOT bypass; re-stamp before it runs"
-            stamped = False
+            uc_note += (f"; the app re-saved over a doctrine stamp {watched['flips']}x during "
+                        f"the watch and was re-stamped each time")
+        if uc_ok and target.get("isRunning"):
+            # The same honesty the permission half already gets. A running app holds the
+            # record in memory and writes its OWN view of it on its own schedule - and its
+            # view has no ultracode field at all, so a later re-save simply drops ours. The
+            # watch defends the window it can see; it cannot defend the next hour.
+            uc_note += ("; ultracode is on disk but NOT durable while that app runs - its "
+                        "next re-save can drop it, and the doctrine sweep re-applies on a clock")
+        if sw is not None:
+            sw.lap("stamp-doctrine")  # the daemon stamp + disk stamps + re-stamp poll
+        verdict, evidence, remedy = _adjudicate_bypass(
+            session_id, chat_title, target, meta_path, fleet, watched)
+        if sw is not None:
+            sw.lap("stamp-picker")  # the target app's own permission picker, driven and read back
+        # ⛔ THE GREEN IS THE VERDICT'S, NOT THE DISK'S. bypassStamped stays in the payload for
+        # older readers, but it is now true only for a verdict that was earned - a disk-only
+        # result reports FALSE and says the remedy out loud, because a green nobody earned is
+        # what let this ship three times.
+        stamped = verdict in ("app-confirmed", "adopted-at-boot")
+        if verdict == "app-confirmed":
+            uc_note += "; the target app's own picker confirms Bypass permissions"
+        elif verdict == "adopted-at-boot":
+            uc_note += f"; {evidence}"
+        else:
+            uc_note += (f" - ⚠ BYPASS NOT VERIFIED ({verdict}): {evidence}. "
+                        f"The app holds its own mode while it runs, so this chat may open on a "
+                        f"prompting mode. Fix it with: {remedy}")
     else:
         uc_ok = False
         mode = None
+        verdict, evidence = "unknown", "the dossier gave no metaPath"
+        remedy = BYPASS_REMEDY_CMD.format(sid=session_id)
         uc_note = "not stamped - the dossier gave no metaPath; run automation_chat.py on it"
-    return stamped, stamp_note, uc_ok, uc_note, mode
+    return {"stamped": stamped, "stampNote": stamp_note, "ultracode": uc_ok, "note": uc_note,
+            "mode": mode, "verdict": verdict, "evidence": evidence, "remedy": remedy}
 
 
 def out(payload: dict, as_json: bool, code: int) -> int:
     print(json.dumps(payload, indent=2) if as_json else payload["report"])
     return code
+
+
+class _Landing:
+    """A VERIFIED LANDING THAT HAS NOT BEEN FINISHED YET.
+
+    Phase one (move_only) ends the moment the chat provably lives in the target account.
+    Everything after that - settling the source row so the old account stops showing it, and
+    stamping/adjudicating the permission mode - is cleanup on a move that has ALREADY
+    happened, and this carries the state those phases need.
+
+    It exists so a batch can run each phase across every chat instead of running the whole
+    pipeline once per chat (owner, 2026-09-06: "move them all, archive them all, then set all
+    the permissions ... that would make the most sense"). Nothing here is a shortcut: the
+    phases are the same calls in the same order, and every gate already ran in phase one.
+    """
+
+    __slots__ = ("parsed", "sw", "notes", "match", "fleet", "target", "session_id",
+                 "chat_title", "src_instance", "result", "after", "settle_note",
+                 "source_row", "doctrine")
+
+    def __init__(self, **kw) -> None:
+        for slot in _Landing.__slots__:
+            setattr(self, slot, kw.get(slot))
+
+
+class _MoveOutcome:
+    """What phase one produced: EITHER a landing to finish, OR a finished payload to print.
+
+    A dry-run plan and a refusal are both the second kind - a payload whose exit code is
+    already decided and which nothing may be done to - so a caller handles them through one
+    door and never has to ask which of the two it is holding. `landing is None` is the whole
+    test, and it is the same test for both callers.
+    """
+
+    __slots__ = ("landing", "payload", "code", "as_json")
+
+    def __init__(self, landing=None, payload=None, code: int = 0, as_json: bool = False) -> None:
+        self.landing = landing
+        self.payload = payload
+        self.code = code
+        self.as_json = as_json
+
+
+def move_only(argv: list[str]) -> _MoveOutcome:
+    """PHASE ONE: resolve, gate, import, and VERIFY the landing - then stop.
+
+    Every gate is here and every gate is unchanged - archived, hold, live writer, breaker, the
+    quiet window, the target choice - and they all run BEFORE the import, which is what makes
+    the later phases safe to defer: nothing they do can decide whether the move was allowed.
+
+    main() is exactly this plus finish_move(), so the single-chat path and the batch cannot
+    drift apart by construction. There is one pipeline called twice, not two pipelines that
+    happen to agree today.
+    """
+    parsed = _parse_migrate_argv(argv)
+    if isinstance(parsed, int):
+        # A usage error the parser has already explained on stderr. No payload: printing one
+        # would say it twice, in two different voices.
+        return _MoveOutcome(code=parsed, as_json="--json" in argv)
+
+    sw = _Stopwatch()
+    notes: dict = {}  # what the fast path decided (window, background scan, target choice)
+    try:
+        match, fleet = _resolve_chat_or_raise(parsed.query, parsed.source)
+        session_id = match.get("cliSessionId") or ""
+        chat_title = match.get("title")
+        door_title = _untruncated_title(session_id, chat_title)
+        src_name = str(match.get("instance") or "")
+        sw.lap("resolve")
+        _check_archived_or_raise(match, parsed.archived)
+
+        choice: dict = {}
+        target = _resolve_target_or_raise(fleet, parsed.to, match, session_id, chat_title,
+                                          choice_out=choice)
+        if choice:
+            notes["targetChoice"] = choice
+        if parsed.dry_run:
+            # A PLAN IS A FINISHED PAYLOAD, not a landing: nothing moved, so there is nothing
+            # for the later phases to finish and nothing they could be deferred past.
+            return _MoveOutcome(
+                payload=_dry_run_plan(match, target, session_id, chat_title, parsed.now,
+                                      notes, sw),
+                code=0, as_json=parsed.as_json)
+        _check_hold_or_raise(session_id, parsed.force)
+        match = _settle_live_writer_or_raise(match, parsed.query, chat_title, session_id,
+                                             parsed.stop_idle, parsed.idle_wait, parsed.force,
+                                             now=parsed.now, source_name=src_name or None,
+                                             notes=notes)
+        sw.lap("stop-idle")
+        _check_breaker_or_raise(session_id, parsed.force)
+
+        body = _build_import_body(target, parsed.title, door_title, parsed.force)
+        _pretrust_workspace(session_id)
+
+        ledgerlib.note("migrate", session_id, note=f"'{chat_title}' -> {target.get('name')}")
+        result = _post_import_or_raise(session_id, target, body)
+        sw.lap("import")
+        after = _verify_landing_or_raise(session_id, target, chat_title, result,
+                                         src_instance=str(match.get("instance") or ""))
+        sw.lap("verify")
+    except _MigrateRefusal as refusal:
+        refusal.payload["secs"] = sw.total()
+        refusal.payload["timings"] = sw.phases
+        refusal.payload.update(notes)
+        return _MoveOutcome(payload=refusal.payload, code=refusal.code, as_json=parsed.as_json)
+
+    # MUTATION LEDGER: before = where it lived, after = the verified landing target. Recorded
+    # unconditionally on a VERIFIED landing (we only reach here once _verify_landing_or_raise
+    # has confirmed the dossier places the chat in the target) - the source-settle outcome
+    # below does not change WHERE the chat is, only whether a stale twin lingers, so it is not
+    # part of the before/after pair an undo (migrate back) needs.
+    #
+    # ⛔ AND IT IS RECORDED HERE, IN PHASE ONE, NOT WHEN THE MOVE IS "FINISHED". The chat has
+    # already moved by this line. A batch that dies between phases must leave a ledger that
+    # says so, or the undo path has no record of a mutation that really happened.
+    src_instance = str(match.get("instance") or "")
+    mutationlib.record("migrate", session_id, instance=target.get("name") or "", title=str(chat_title),
+                       before={"instance": src_instance}, after={"instance": target.get("name")},
+                       undoable=True)
+
+    return _MoveOutcome(
+        landing=_Landing(parsed=parsed, sw=sw, notes=notes, match=match, fleet=fleet,
+                         target=target, session_id=session_id, chat_title=chat_title,
+                         src_instance=src_instance, result=result, after=after),
+        as_json=parsed.as_json)
+
+
+def landed_meta_path(land: _Landing) -> str:
+    """Where the landed chat's record lives on disk, read off the verify dossier.
+
+    Exposed because a batch needs every path BEFORE it starts the shared bypass watch, and
+    the alternative - letting each chat's stamp find its own path and watch it alone - is the
+    8s-times-N wait that made a batch feel slow.
+    """
+    landed = next(
+        (m for m in (land.after or [])
+         if str(m.get("instance", "")).lower() == str((land.target or {}).get("name", "")).lower()),
+        {},
+    )
+    return str(landed.get("metaPath") or "")
+
+
+def phase_settle(land: _Landing) -> None:
+    """PHASE TWO: settle the SOURCE row, so the account it left stops showing it."""
+    land.sw.resume()
+    land.settle_note, land.source_row = _settle_source_row(
+        land.match, land.target, land.fleet, land.session_id, land.chat_title, sw=land.sw)
+    # Two laps, not one: 'settle-drive' is the actuator driving the source app's own archive
+    # control, 'settle-confirm' is the disk read-back that proves it. A single 'settle-source'
+    # number could not say which half a slow settle was spending (2026-09-06: ~7.5s per chat
+    # and no way to tell the window drive from the confirm poll).
+    land.sw.lap("settle-confirm")
+    if land.source_row != "visible":
+        ledgerlib.clear("migrate", land.session_id)  # a clean move: the brake is for futility
+
+
+def phase_stamp(land: _Landing, watched: dict | None = None) -> None:
+    """PHASE THREE: the automation doctrine, and the ADJUDICATED verdict about the mode.
+
+    `watched` is a bypass watch somebody else already paid for (watch_bypass_many); None means
+    this chat watches its own record for BYPASS_WATCH_SECS, exactly as a lone move always has.
+    """
+    land.sw.resume()
+    land.doctrine = _stamp_automation_doctrine(
+        land.session_id, land.target, land.after, land.fleet, land.chat_title, watched=watched,
+        sw=land.sw)
+    land.sw.lap("stamp")  # whatever is left after the two laps the doctrine records itself
+    # The verdict outlives the tool call. This incident had to be reconstructed from file
+    # mtimes because nothing about the stamp was ever persisted (2026-09-05).
+    mutationlib.record("setmode", land.session_id, instance=land.target.get("name") or "",
+                       title=str(land.chat_title),
+                       before={"verdict": land.doctrine["verdict"]},
+                       after={"mode": land.doctrine["mode"],
+                              "evidence": land.doctrine["evidence"][:200]},
+                       undoable=False,
+                       why_not="a permission-mode verdict is an observation about the landing, "
+                               "not an act with a previous state to restore")
+
+
+def finish_move(land: _Landing) -> None:
+    """PHASES TWO AND THREE for ONE chat, in the order a lone move has always run them."""
+    phase_settle(land)
+    phase_stamp(land)
+
+
+def landing_payload(land: _Landing) -> dict:
+    """The finished payload for a landing whose phases have run.
+
+    ⛔ A PHASE THAT DID NOT RUN IS REPORTED AS NOT RUN, never as a benign default. A landing
+    printed without its stamp phase would otherwise claim `bypassStamped: false` with no
+    reason attached, which reads exactly like a stamp that was tried and failed.
+    """
+    # THE CLOCK BETWEEN THIS CHAT'S LAST PHASE AND NOW IS OTHER CHATS' WORK. A batch stamps
+    # every chat and only then builds the payloads, so without this the first chat of a
+    # 13-chat batch was charged twelve chats' stamping (~2 minutes) in `secs` while its own
+    # phases summed to ~18s - and the earliest chat always looked the slowest. Same discount
+    # phase_settle and phase_stamp already take on entry (review finding, 2026-09-06).
+    land.sw.resume()
+    doctrine = land.doctrine or {
+        "stamped": False, "stampNote": "the stamp phase did not run", "ultracode": False,
+        "note": "the stamp phase did not run", "mode": None, "verdict": "unknown",
+        "evidence": "the stamp phase did not run",
+        "remedy": BYPASS_REMEDY_CMD.format(sid=land.session_id),
+    }
+    source_row = land.source_row or "unknown"
+    settle_note = land.settle_note if land.settle_note is not None else (
+        " Source row NOT settled - the settle phase did not run.")
+    stamped, uc_ok, mode = doctrine["stamped"], doctrine["ultracode"], doctrine["mode"]
+    stamp_note, uc_note = doctrine["stampNote"], doctrine["note"]
+    return {
+        "landed": True,
+        "sessionId": land.session_id,
+        "title": land.chat_title,
+        "from": land.src_instance,
+        "to": land.target.get("name"),
+        "toNum": land.target.get("num"),
+        "bypassStamped": stamped,
+        "bypassVerdict": doctrine["verdict"],
+        "bypassEvidence": doctrine["evidence"],
+        "bypassRemedy": doctrine["remedy"],
+        "permissionMode": mode,
+        "ultracodeStamped": uc_ok,
+        # sourceRow is the machine half; sourceSettled stays for older readers.
+        "sourceRow": source_row,
+        "sourceSettled": source_row in ("settled", "flagged", "none"),
+        "daemon": land.result,
+        "secs": land.sw.total(),
+        "timings": land.sw.phases,
+        **(land.notes or {}),
+        # A NOT-VERIFIED mode leads the report. Buried at the end of a paragraph it reads
+        # as a footnote to a success, which is exactly how the last three moves were read.
+        "report": (
+            (f"⚠ BYPASS NOT VERIFIED - fix with: {doctrine['remedy']}\n" if not stamped else "")
+            + f"landed and VERIFIED: '{land.chat_title}' now lives in {land.target.get('name')}. "
+            f"{stamp_note}; {uc_note}.{settle_note}{land.sw.text()}"
+        ),
+    }
 
 
 def main(argv: list[str]) -> int:
@@ -1080,96 +1610,13 @@ def main(argv: list[str]) -> int:
         print(__doc__.strip())
         return 0
 
-    parsed = _parse_migrate_argv(argv)
-    if isinstance(parsed, int):
-        return parsed
-    as_json, force, stop_idle = parsed.as_json, parsed.force, parsed.stop_idle
-    to, title, idle_wait, query = parsed.to, parsed.title, parsed.idle_wait, parsed.query
-    now, source, dry_run = parsed.now, parsed.source, parsed.dry_run
-
-    sw = _Stopwatch()
-    notes: dict = {}  # what the fast path decided (window, background scan, target choice)
-    try:
-        match, fleet = _resolve_chat_or_raise(query, source)
-        session_id = match.get("cliSessionId") or ""
-        chat_title = match.get("title")
-        door_title = _untruncated_title(session_id, chat_title)
-        src_name = str(match.get("instance") or "")
-        sw.lap("resolve")
-
-        choice: dict = {}
-        target = _resolve_target_or_raise(fleet, to, match, session_id, chat_title, choice_out=choice)
-        if choice:
-            notes["targetChoice"] = choice
-        if dry_run:
-            return out(_dry_run_plan(match, target, session_id, chat_title, now, notes, sw), as_json, 0)
-        _check_hold_or_raise(session_id, force)
-        match = _settle_live_writer_or_raise(match, query, chat_title, session_id, stop_idle, idle_wait, force,
-                                             now=now, source_name=src_name or None, notes=notes)
-        sw.lap("stop-idle")
-        _check_breaker_or_raise(session_id, force)
-
-        body = _build_import_body(target, title, door_title, force)
-        _pretrust_workspace(session_id)
-
-        ledgerlib.note("migrate", session_id, note=f"'{chat_title}' -> {target.get('name')}")
-        result = _post_import_or_raise(session_id, target, body)
-        sw.lap("import")
-        after = _verify_landing_or_raise(session_id, target, chat_title, result,
-                                          src_instance=str(match.get("instance") or ""))
-        sw.lap("verify")
-    except _MigrateRefusal as refusal:
-        refusal.payload["secs"] = sw.total()
-        refusal.payload["timings"] = sw.phases
-        refusal.payload.update(notes)
-        return out(refusal.payload, as_json, refusal.code)
-
-    # MUTATION LEDGER: before = where it lived, after = the verified landing target. Recorded
-    # unconditionally on a VERIFIED landing (we only reach here once _verify_landing_or_raise
-    # has confirmed the dossier places the chat in the target) - the source-settle outcome
-    # below does not change WHERE the chat is, only whether a stale twin lingers, so it is not
-    # part of the before/after pair an undo (migrate back) needs.
-    src_instance = str(match.get("instance") or "")
-    mutationlib.record("migrate", session_id, instance=target.get("name") or "", title=str(chat_title),
-                       before={"instance": src_instance}, after={"instance": target.get("name")},
-                       undoable=True)
-
-    # (The 'migrate' attempt is cleared below, AFTER the settle - a landing whose source row
-    # is still visible is not a clean move, and its annotation must have a row to land on.)
-    settle_note, source_row = _settle_source_row(match, target, fleet, session_id, chat_title)
-    sw.lap("settle-source")
-    if source_row != "visible":
-        ledgerlib.clear("migrate", session_id)  # a clean move: the brake is for futility
-
-    stamped, stamp_note, uc_ok, uc_note, mode = _stamp_automation_doctrine(session_id, target, after)
-    sw.lap("stamp")
-
-    return out(
-        {
-            "landed": True,
-            "sessionId": session_id,
-            "title": chat_title,
-            "from": src_instance,
-            "to": target.get("name"),
-            "toNum": target.get("num"),
-            "bypassStamped": stamped,
-            "permissionMode": mode,
-            "ultracodeStamped": uc_ok,
-            # sourceRow is the machine half; sourceSettled stays for older readers.
-            "sourceRow": source_row,
-            "sourceSettled": source_row in ("settled", "flagged", "none"),
-            "daemon": result,
-            "secs": sw.total(),
-            "timings": sw.phases,
-            **notes,
-            "report": (
-                f"landed and VERIFIED: '{chat_title}' now lives in {target.get('name')}. "
-                f"{stamp_note}; {uc_note}.{settle_note}{sw.text()}"
-            ),
-        },
-        as_json,
-        0,
-    )
+    outcome = move_only(argv)
+    if outcome.landing is None:
+        if outcome.payload is None:
+            return outcome.code  # a usage error the parser already reported on stderr
+        return out(outcome.payload, outcome.as_json, outcome.code)
+    finish_move(outcome.landing)
+    return out(landing_payload(outcome.landing), outcome.as_json, 0)
 
 
 def _dry_run_plan(match: dict, target: dict, session_id: str, chat_title, now: bool,

@@ -22,6 +22,22 @@
  * a second mechanism, they are chats nobody has woken yet. Per-chat stamping cannot hold for
  * any chat that gets woken again.
  *
+ * RE-MEASURED 2026-09-05, and the IMPORTED row has moved - read the numbers, not the prose
+ * above, because two designs were argued off the stale ones:
+ *
+ *     APP-CREATED  1749 / 1752  bypassPermissions
+ *     IMPORTED      451 /  476  bypassPermissions   (was 4/30)
+ *
+ * What changed is automation-stamp-sweep.ts, which re-asserts the stamp ON DISK every 60s for
+ * as long as the daemon runs, so the file converges back after each boot re-save. What did NOT
+ * change is the thing that actually matters: DISK IS NOT THE MODE THE CHAT OPENS WITH. The app
+ * holds the mode in memory and re-reads the store only at its own process boot, so a chat can
+ * read bypassPermissions here and still open on a prompting mode. This census measures the
+ * FILE. For what a running app will actually do, the only answer is its own permission picker
+ * (automation_chat.py set_mode_via_app), and until 2026-09-05 that picker could not aim: it
+ * filtered candidates to the right of 38% of the window width, and the composer's mode button
+ * sits left of that line on a narrow window, so it found nothing on every chat it ever tried.
+ *
  * Run it after changing anything in the import path, and before believing the stamp works.
  *
  *   bun scripts/permission-mode-census.mjs           summary

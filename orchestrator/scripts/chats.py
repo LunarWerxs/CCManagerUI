@@ -31,6 +31,12 @@ Usage:
   python chats.py --search "rolodexter" --move-to 5claude --yes    # do it
   python chats.py --instance temp2 --move-to work --yes --max 3    # move a few at a time
   python chats.py --instance work --move-to 11 --yes --idle-wait 330   # wait out young engines
+  python chats.py --instance temp2 --move-to work --yes --archived  # ALSO move archived ones
+
+A MOVE TOUCHES UNARCHIVED CHATS ONLY, always, unless --archived says otherwise (owner,
+Michael, 2026-09-05). --all is a LISTING word and widens only what you SEE; --archived is
+the separate word that widens what a batch MOVES. Archived rows held back by that default
+are named in the plan, never silently dropped.
 
 Exit:  0 listed, or every attempted move landed AND left no twin behind on the source
        account - 2 some moves were refused, did not land, or landed with the source row
@@ -80,7 +86,15 @@ def collect(include_archived: bool, account: str | None, instance: str | None,
     by_inst = hydralib.instances_by_name()
     names = account_names()
     rows = []
-    for r in hydralib.sessions():
+    # THE COMPLETE QUESTION, NOT THE LANE'S WINDOW (2026-09-05). This script's whole claim is
+    # "the one place to answer what have I got, and where is it?", and a windowed answer
+    # cannot make that claim: hydralib.sessions()'s default 7d window returned 21 rows the
+    # day this was measured against 500 for all+archived, hiding six UNARCHIVED chats - one
+    # of them live, with an engine running, active that morning. A whole-account sweep read
+    # that as "no chats match" and reported the account drained while a live chat sat in it.
+    # So enumerate everything and let the include_archived filter below do the choosing: the
+    # filter is this script's own decision, and it can only be honest about rows it was shown.
+    for r in hydralib.sessions(period="all", archived="include"):
         if r.get("archived") and not include_archived:
             continue
         inst_name = r.get("instance")
@@ -150,7 +164,8 @@ def render(rows: list[dict]) -> str:
     return "\n".join(L)
 
 
-def move(rows: list[dict], target: str, act: bool, cap: int, idle_wait: int = 0) -> dict:
+def move(rows: list[dict], target: str, act: bool, cap: int, idle_wait: int = 0,
+         move_archived: bool = False) -> dict:
     import migrate_chat
 
     try:
@@ -162,7 +177,20 @@ def move(rows: list[dict], target: str, act: bool, cap: int, idle_wait: int = 0)
         known = ", ".join(f"#{i.get('num')} {i.get('name')}" for i in fleet.get("instances", []))
         return {"error": f"unknown target {target!r}. Known: {known}", "results": []}
 
-    movable = [r for r in rows
+    # ⛔ A MOVE TOUCHES UNARCHIVED CHATS ONLY (owner, Michael, 2026-09-05: "when I tell you to
+    # move, only move UN archived chats. Not archived ones. Make sure that's the default.
+    # Unless asked"). --all is a LISTING word: it widens what you can SEE, and before this it
+    # silently widened what a batch would MOVE too. That matters far more than it sounds:
+    # isArchived is Claude Desktop's RESTING state ("not on screen"), carried by 2,598 of
+    # 2,611 chats when it was measured, so it is the MAJORITY of an account, not a tail.
+    # `--all --move-to X --yes` therefore meant "move everything that ever existed here" -
+    # on the real fleet the day this landed, 26 archived rows against 0 live ones.
+    # --archived is the separate, deliberate word, exactly as --force is the word for a hold.
+    # Skipped rows are NAMED in the plan, never dropped in silence: a chat that did not move
+    # must never look like a chat that was not there.
+    archived_skipped = [] if move_archived else [r for r in rows if r.get("archived")]
+    eligible = rows if move_archived else [r for r in rows if not r.get("archived")]
+    movable = [r for r in eligible
                if str(r["instance"] or "").lower() != str(tgt.get("name") or "").lower()]
     planned = movable[:cap]
     results = []
@@ -177,6 +205,12 @@ def move(rows: list[dict], target: str, act: bool, cap: int, idle_wait: int = 0)
             argv_child = [r["sessionId"], "--to", str(tgt.get("name")), "--stop-idle", "--json"]
             if idle_wait:
                 argv_child += ["--idle-wait", str(idle_wait)]
+            # The child enforces the same archived default independently (it is reachable
+            # directly, and through the MCP, without ever passing through this loop). So an
+            # --archived batch has to SAY so downstream, or every row it deliberately selected
+            # would come back as exit 7 and the flag would look broken rather than forwarded.
+            if move_archived:
+                argv_child += ["--archived"]
             code, out = clilib.capture(migrate_chat.main, argv_child)
             # Read the child's PAYLOAD, never infer the outcome from the exit code alone:
             # migrate_chat also exits 0 for "nothing to do, it already lives there", which is
@@ -217,7 +251,13 @@ def move(rows: list[dict], target: str, act: bool, cap: int, idle_wait: int = 0)
                    "email": (tgt.get("account") or {}).get("email")},
         "planned": [{"sessionId": r["sessionId"], "title": r["title"], "from": r["instance"]}
                     for r in planned],
-        "alreadyThere": len(rows) - len(movable),
+        # COUNTED OFF `eligible`, NEVER `rows`: with the archived rows filtered out above,
+        # len(rows) - len(movable) would fold every skipped archived chat into "already at
+        # the target" - a count that reads as reassurance for chats that were refused. The
+        # two reasons a row did not move are reported separately, because they are separate.
+        "alreadyThere": len(eligible) - len(movable),
+        "archivedSkipped": [{"sessionId": r["sessionId"], "title": r["title"],
+                             "from": r["instance"]} for r in archived_skipped],
         "overCap": max(0, len(movable) - len(planned)),
         "results": results,
     }
@@ -248,6 +288,7 @@ class ChatArgs:
     move_to: str | None
     cap: int
     idle_wait: int
+    move_archived: bool = False   # --archived: include archived chats in a --move-to batch
 
 
 def _take_string_flag(argv: list[str], i: int) -> tuple[str, str] | None:
@@ -307,6 +348,7 @@ def _parse_args(argv: list[str]) -> ChatArgs:
         include_archived="--all" in argv, console_only="--console" in argv,
         account=fields["account"], instance=fields["instance"], search=fields["search"],
         move_to=fields["move_to"], cap=fields["cap"], idle_wait=fields["idle_wait"],
+        move_archived="--archived" in argv,
     )
 
 
@@ -402,6 +444,17 @@ def _print_move_footnotes(plan: dict, act: bool, idle_wait: int) -> None:
     if young and not idle_wait:
         print(f"\n{len(young)} chat(s) refused only because the engine is not quiet enough YET - "
               "re-run with --idle-wait 330 and the command waits that out itself.")
+    # A SKIPPED CHAT MUST NEVER READ AS A CHAT THAT WAS NOT THERE. The archived filter is the
+    # default, so the run that most needs this line is the one whose operator did not ask for
+    # it and would otherwise never learn those rows existed.
+    skipped = plan.get("archivedSkipped") or []
+    if skipped:
+        print(f"\n{len(skipped)} archived chat(s) NOT moved (archived is skipped by default; "
+              "--archived includes them):")
+        for r in skipped[:10]:
+            print(f"  🗄 {str(r.get('title') or '(untitled)')[:64]}  [{r.get('from')}]")
+        if len(skipped) > 10:
+            print(f"  ... and {len(skipped) - 10} more")
     if not act:
         print("\nPLAN ONLY - nothing moved. Add --yes to do it.")
 
@@ -456,7 +509,7 @@ def main(argv: list[str]) -> int:
     if not rows:
         return _refuse_no_match(args.search, args.instance, args.account, args.console_only)
 
-    plan = move(rows, args.move_to, args.act, args.cap, args.idle_wait)
+    plan = move(rows, args.move_to, args.act, args.cap, args.idle_wait, args.move_archived)
     if plan.get("error"):
         print(f"REFUSED: {plan['error']}", file=sys.stderr)
         return 3

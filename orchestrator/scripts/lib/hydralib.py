@@ -172,11 +172,21 @@ def fleet() -> dict:
     return api_get("/api/fleet")  # type: ignore[return-value]
 
 
-def sessions() -> list[dict]:
+def sessions(period: str = "7d", archived: str | None = None) -> list[dict]:
     """Every chat the daemon knows, normalized to a plain list of rows.
 
     A 200 whose body does not carry the expected shape RAISES rather than returning [] - a
     degraded payload ({"error": ...}, a renamed field) must never print as an empty fleet.
+
+    ⛔ THE DEFAULT WINDOW IS A JUDGMENT LANE'S QUESTION, NOT A CENSUS (measured 2026-09-05).
+    An ENUMERATOR must pass period="all", archived="include" and filter locally. The window
+    below is not merely "older chats are missing": on the day this was measured 7d returned
+    21 rows while all+archived returned 500, and SIX UNARCHIVED chats were invisible to every
+    lane - among them one whose last activity was that same morning, live, with an engine
+    running. So a windowed answer cannot be read as "this account is empty"; a chat active
+    today can sit outside a seven-day window, because the window is applied to the daemon's
+    index rather than to what is on disk. That is exactly how a whole-account sweep reported
+    an account drained while a live chat sat in it (owner caught it by looking at the app).
     """
     # ASK FOR THE WEEK, NOT THE LAST DAY (2026-09-01). With no parameters this endpoint
     # answers the previous 24 HOURS, capped at 200 rows - a UI default that is exactly wrong
@@ -185,28 +195,18 @@ def sessions() -> list[dict]:
     # chats present), 7d = 52 (all 4), 30d = 235, all = 324. A week is the horizon a chat can
     # plausibly still be resumed on; 'all' would drag months of dead history into every lane
     # and swamp the judgment queue. Archived rows stay hidden on purpose (every lane filters
-    # on `archived`, and the zombie-twin records would flood them).
-    got = api_get("/api/sessions?period=7d&limit=500")
+    # on `archived`, and the zombie-twin records would flood them). Both remain the DEFAULT,
+    # so no lane's behaviour moved when the parameters above were added; the enumerators opt
+    # out explicitly, one caller at a time.
+    query = f"/api/sessions?period={urllib.parse.quote(period)}&limit=500"
+    if archived:
+        query += f"&archived={urllib.parse.quote(archived)}"
+    got = api_get(query)
     if isinstance(got, list):
         return got
     if isinstance(got, dict) and isinstance(got.get("sessions"), list):
         return got["sessions"]
     raise DaemonError("/api/sessions", None, f"unexpected response shape: {str(got)[:200]!r}")
-
-
-def dossier(query: str) -> list[dict]:
-    """GET /api/chats/dossier?q= - the one query for 'what is the state of chat X'.
-
-    Matches carry: instance, chatId, cliSessionId, priorCliSessionIds, lineageIds, title,
-    archived, doneMark, lastActivityAt, live ({pid,name,startedAt,cwd} or null), metaPath.
-    An empty matches list is a real answer (no such chat); a response WITHOUT a matches list
-    is not, and raises.
-    """
-    path = f"/api/chats/dossier?q={urllib.parse.quote(query)}"
-    got = api_get(path)
-    if isinstance(got, dict) and isinstance(got.get("matches"), list):
-        return got["matches"]
-    raise DaemonError("/api/chats/dossier", None, f"unexpected response shape: {str(got)[:200]!r}")
 
 
 CENSUS_PAGE = 500
@@ -250,6 +250,21 @@ def sessions_all(archived: str = "include", page_size: int = CENSUS_PAGE) -> lis
         if len(page) < page_size or fresh == 0:
             return rows
         offset += len(page)
+
+
+def dossier(query: str) -> list[dict]:
+    """GET /api/chats/dossier?q= - the one query for 'what is the state of chat X'.
+
+    Matches carry: instance, chatId, cliSessionId, priorCliSessionIds, lineageIds, title,
+    archived, doneMark, lastActivityAt, live ({pid,name,startedAt,cwd} or null), metaPath.
+    An empty matches list is a real answer (no such chat); a response WITHOUT a matches list
+    is not, and raises.
+    """
+    path = f"/api/chats/dossier?q={urllib.parse.quote(query)}"
+    got = api_get(path)
+    if isinstance(got, dict) and isinstance(got.get("matches"), list):
+        return got["matches"]
+    raise DaemonError("/api/chats/dossier", None, f"unexpected response shape: {str(got)[:200]!r}")
 
 
 def resolve_one(query: str) -> dict:

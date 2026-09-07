@@ -50,7 +50,7 @@ from lib import ledgerlib
 # ledgerlib.VALID_KINDS and deliverylib.VALID_STATES: a caller that means a NEW kind of act
 # must add it here on purpose, not have a typo silently start a fresh untracked lineage.
 MUTATION_KINDS = ("archive", "unarchive", "rename", "migrate", "hold", "release", "compact",
-                  "delete", "undelete")
+                  "delete", "undelete", "setmode")
 
 # The inverse ACT for each kind, or None when no inverse exists. undo.py is the only reader:
 # kept here, beside the kinds it maps, so the two lists cannot drift apart the way a kind list
@@ -65,6 +65,8 @@ INVERSE_KIND: dict[str, str | None] = {
     "compact": None,          # lossy by design - see the module docstring
     "delete": "undelete",     # delete_chat.py --undo restores from its own trash copy
     "undelete": "delete",     # and deleting again is a fresh delete
+    "setmode": None,          # bypassPermissions is the wanted state for every chat, so there
+                              # is no act called "put it back on a prompting mode"
 }
 
 

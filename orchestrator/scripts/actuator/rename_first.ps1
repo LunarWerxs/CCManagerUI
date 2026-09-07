@@ -103,10 +103,11 @@ function RestoreGroups {
 }
 try {
 $groupNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$landmarkElems = @()
 foreach ($b in $el.FindAll($TREE, [System.Windows.Automation.Condition]::TrueCondition)) {
   try {
     $n = $b.Current.Name
-    if ($n -and $n.Length -gt 15 -and $n.StartsWith('New session in ')) { [void]$groupNames.Add($n.Substring(15).Trim()) }
+    if ($n -and $n.Length -gt 15 -and $n.StartsWith('New session in ')) { [void]$groupNames.Add($n.Substring(15).Trim()); $landmarkElems += $b }
   } catch { continue }
 }
 foreach ($e in $el.FindAll($TREE, [System.Windows.Automation.Condition]::TrueCondition)) {
@@ -121,11 +122,42 @@ foreach ($e in $el.FindAll($TREE, [System.Windows.Automation.Condition]::TrueCon
 }
 $el = Wake $hwndTop
 
+# LOCATE THE SIDEBAR/CHAT-LIST CONTAINER POSITIVELY, THEN SCOPE THE KEBAB SEARCH TO IT
+# (2026-09-06, review: an unscoped FindAll over the WHOLE window can pick up a kebab-shaped
+# button elsewhere in the UI - e.g. a leftover dialog from a previous flaked pass - and rename
+# the wrong thing). Same landmark technique the group-expand pass above already uses: walk up
+# from a "New session in X" button (the app's own per-group marker, nothing else in the window
+# has one) to the nearest ancestor that contains ALL of them - that ancestor IS the chat list.
+$sidebar = $null
+if ($landmarkElems.Count -gt 0) {
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $cur = $null
+  try { $cur = $walker.GetParent($landmarkElems[0]) } catch { $cur = $null }
+  $depth = 0
+  while ($cur -and $depth -lt 25) {
+    $hits = 0
+    try {
+      foreach ($e in $cur.FindAll($TREE, [System.Windows.Automation.Condition]::TrueCondition)) {
+        try { $n = $e.Current.Name; if ($n -and $n.Length -gt 15 -and $n.StartsWith('New session in ')) { $hits++ } } catch { continue }
+      }
+    } catch { $hits = 0 }
+    if ($hits -ge $landmarkElems.Count) { $sidebar = $cur; break }
+    $parent = $null
+    try { $parent = $walker.GetParent($cur) } catch { $parent = $null }
+    if (-not $parent) { break }
+    $cur = $parent
+    $depth++
+  }
+}
+# No group landmark exists when every chat is ungrouped - fall back to the whole window rather
+# than refuse a fleet with no groups at all.
+$scope = if ($sidebar) { $sidebar } else { $el }
+
 # First kebab whose name ends with any match name (word-boundary preferred).
 $c = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $BTN)
 $kebab = $null
 $rowName = $null
-foreach ($b in $el.FindAll($TREE, $c)) {
+foreach ($b in $scope.FindAll($TREE, $c)) {
   $n = $b.Current.Name
   if (-not $n) { continue }
   if (-not (TryPattern $b ([System.Windows.Automation.ExpandCollapsePattern]::Pattern))) { continue }
