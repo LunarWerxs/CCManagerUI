@@ -7,7 +7,7 @@
 // of the interpreter (skipped where none is installed) proving the argv actually lands unquoted.
 
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -95,6 +95,29 @@ describe('resolution', () => {
   test('the toolbox is the sibling folder unless the env points elsewhere', () => {
     expect(orchestratorDir({})).toMatch(/[\\/]orchestrator$/)
     expect(orchestratorDir({ AGENTHYDRA_ORCHESTRATOR_DIR: ' D:/elsewhere ' })).toBe('D:/elsewhere')
+  })
+
+  test("a compiled binary run from the repo's own dist/ finds the toolbox one level up", () => {
+    // 2026-09-06: `bun run dist`, then dist/AgentHydra.exe launched as the daemon. APP_ROOT
+    // became dist/ and every orchestrator-backed tool died with "no orch.py under
+    // app\dist\orchestrator" while the tree sat one level up.
+    const root = mkdtempSync(join(tmpdir(), 'ah-orch-'))
+    const dist = join(root, 'dist')
+    mkdirSync(dist)
+    // No toolbox anywhere: the sibling is still reported, so the error names where it looked.
+    expect(orchestratorDir({}, dist)).toBe(join(dist, 'orchestrator'))
+    // The repo layout: dist/<exe> beside orchestrator/orch.py.
+    mkdirSync(join(root, 'orchestrator'))
+    writeFileSync(join(root, 'orchestrator', 'orch.py'), '')
+    expect(orchestratorDir({}, dist)).toBe(join(root, 'orchestrator'))
+    // A toolbox BESIDE the binary (a release zip) still wins over the parent.
+    mkdirSync(join(dist, 'orchestrator'))
+    writeFileSync(join(dist, 'orchestrator', 'orch.py'), '')
+    expect(orchestratorDir({}, dist)).toBe(join(dist, 'orchestrator'))
+    // The env override beats both.
+    expect(orchestratorDir({ AGENTHYDRA_ORCHESTRATOR_DIR: 'D:/elsewhere' }, dist)).toBe(
+      'D:/elsewhere',
+    )
   })
 
   test('python on Windows, python3 elsewhere, env wins', () => {

@@ -26,9 +26,19 @@ import { readInstanceInfo } from './instance'
 /** Where the toolbox lives. `AGENTHYDRA_ORCHESTRATOR_DIR` overrides for a layout where the Python
  *  tree sits somewhere else (a compiled binary with the tree copied beside it, or a developer
  *  pointing at a second checkout); the default is the sibling folder in this repo / this release. */
-export function orchestratorDir(env: NodeJS.ProcessEnv = process.env): string {
+export function orchestratorDir(env: NodeJS.ProcessEnv = process.env, appRoot = APP_ROOT): string {
   const override = env.AGENTHYDRA_ORCHESTRATOR_DIR?.trim()
-  return override || join(APP_ROOT, 'orchestrator')
+  if (override) return override
+  const beside = join(appRoot, 'orchestrator')
+  if (existsSync(join(beside, 'orch.py'))) return beside
+  // A COMPILED BINARY RUN FROM THE REPO'S OWN dist/ (2026-09-06: `bun run dist` then launching
+  // dist/AgentHydra.exe as the daemon). APP_ROOT is then dist/ itself, the toolbox is one level
+  // up, and every orchestrator-backed tool (move_chats, orchestrator_menu, ...) died with "no
+  // orch.py under app\dist\orchestrator" while the tree sat right beside it. Taken only when the
+  // toolbox is actually there, so a release zip with no orchestrator still reports `beside`
+  // and the honest "not at <dir>" error rather than a guess.
+  const repo = join(appRoot, '..', 'orchestrator')
+  return existsSync(join(repo, 'orch.py')) ? repo : beside
 }
 
 /** The interpreter. `python` is what the toolbox's own docs and both owner machines use on Windows;
