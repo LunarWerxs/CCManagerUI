@@ -141,7 +141,7 @@ function writeAccountsCacheEntry(instanceDir: string, entry: CMAccountCacheEntry
 
 /** Drops one instance's cached identity (used when it turns out to describe a different account
  *  than the instance is signed into now). Best-effort — never throws. */
-function deleteAccountsCacheEntry(instanceDir: string): void {
+export function deleteAccountsCacheEntry(instanceDir: string): void {
   try {
     const cache = readAccountsCache()
     const key = normalizeInstancePath(instanceDir)

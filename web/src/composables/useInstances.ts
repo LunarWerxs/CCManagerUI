@@ -246,6 +246,23 @@ async function focus(dir: string): Promise<api.CMActionResult | undefined> {
   }
 }
 
+/**
+ * Sign an instance out: its stored login is removed, so it asks for one next start.
+ *
+ * Refreshes on success like open/quit do, because the row's account cell is exactly what this
+ * changes — leaving the old email on screen after signing out would be the one wrong answer.
+ */
+async function logout(dir: string): Promise<api.CMActionResult | undefined> {
+  setBusy(dir, true)
+  try {
+    const result = await guard(api.logoutInstance(dir))
+    if (result?.ok) await refreshInstances({ force: true, resolve: 'full' })
+    return result
+  } finally {
+    setBusy(dir, false)
+  }
+}
+
 /** Reveal an instance's profile folder in the OS file browser. */
 async function revealFolder(dir: string): Promise<api.CMActionResult | undefined> {
   return await guard(api.revealInstanceFolder(dir))
@@ -332,6 +349,7 @@ export function useInstances() {
     open,
     quit,
     focus,
+    logout,
     revealFolder,
     createShortcut,
     create,

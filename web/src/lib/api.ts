@@ -436,6 +436,11 @@ export const quitInstance = (dir: string, opts: { confirmExternal?: boolean } = 
     method: 'POST',
     body: JSON.stringify(opts),
   })
+/** Remove the stored login from a profile: it asks for a sign-in the next time it starts. Refused
+ *  while the instance is running (the app would overwrite or corrupt the write), and the failure
+ *  message says so. History, settings and the folder are untouched. */
+export const logoutInstance = (dir: string) =>
+  j<CMActionResult>(`/api/instances/${encodeURIComponent(dir)}/logout`, { method: 'POST' })
 export const focusInstance = (dir: string) =>
   j<CMActionResult>(`/api/instances/${encodeURIComponent(dir)}/focus`, { method: 'POST' })
 export const revealInstanceFolder = (dir: string) =>

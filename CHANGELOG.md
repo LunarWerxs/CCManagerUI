@@ -7,6 +7,24 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this p
 
 ## [Unreleased]
 
+## [0.39.1] - 2026-09-06
+
+### Added
+
+- **A log-out button on each instance row** (`server/src/core/instance-logout.ts`, three-dot menu).
+  An instance's whole login lives in its own `config.json`: `lastKnownAccountUuid` names the
+  account and `oauth:tokenCacheV2` (older builds: `oauth:tokenCache`) holds the encrypted grants.
+  Log out removes exactly those and nothing else, so chats, settings and the folder survive and the
+  profile asks for a sign-in next start. It confirms first, naming the account, because signing
+  back in costs the "Browser Dance".
+
+  ⛔ It REFUSES while the instance is running, and so does the menu item. Claude Desktop holds
+  config.json open and re-saves it, so a logout written underneath is either clobbered seconds
+  later (the button lied) or interleaved with the app's own write (the profile is corrupt and still
+  signed in). Neither announces itself. A process scan that FAILS also refuses, because "I could
+  not tell" is not permission.
+
+
 ## [0.39.0] - 2026-09-06
 
 ### Added

@@ -1,5 +1,6 @@
 import { resolveAccount } from '../core/accounts'
 import { detectDesktopInstall } from '../core/desktop-install'
+import { logoutInstance } from '../core/instance-logout'
 import { setInstanceMeta } from '../core/instance-meta'
 import { createInstanceModeShortcut } from '../core/instance-mode-shortcut'
 import {
@@ -89,6 +90,13 @@ app.post('/api/instances/:dir/quit', async (c) => {
   // opt-in from the caller (the UI shows a confirmation first); quitInstance refuses it otherwise.
   // Mirrors the delete route's confirmName pattern one section below.
   return c.json(await quitInstance(dir, { confirmExternal: body.confirmExternal === true }))
+})
+// Remove the stored login from a profile. Confirmed in the UI first, and refused outright while
+// the instance is running (see core/instance-logout.ts for why writing config.json under a live
+// Electron app is worse than not doing it at all).
+app.post('/api/instances/:dir/logout', async (c) => {
+  const dir = decodeURIComponent(c.req.param('dir'))
+  return c.json(await logoutInstance(dir))
 })
 app.post('/api/instances/:dir/focus', async (c) => {
   const dir = decodeURIComponent(c.req.param('dir'))

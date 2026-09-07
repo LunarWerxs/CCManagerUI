@@ -13,6 +13,7 @@ import {
   Funnel,
   Gauge,
   LogIn,
+  LogOut,
   MonitorDown,
   Pencil,
   Play,
@@ -37,6 +38,7 @@ import EditInstanceDialog from '@/components/EditInstanceDialog.vue'
 import ExpandArea from '@/components/ExpandArea.vue'
 import InstanceNumber from '@/components/InstanceNumber.vue'
 import InstanceSectionsMenu from '@/components/InstanceSectionsMenu.vue'
+import LogoutInstanceDialog from '@/components/LogoutInstanceDialog.vue'
 import QuitExternalInstanceDialog from '@/components/QuitExternalInstanceDialog.vue'
 import UsageBadge from '@/components/UsageBadge.vue'
 import UsageBar from '@/components/UsageBar.vue'
@@ -126,6 +128,7 @@ const {
   open,
   quit,
   focus,
+  logout,
   revealFolder,
   createShortcut,
   create,
@@ -527,6 +530,31 @@ async function onQuitExternalConfirm() {
     quitExternalTarget.value = null
   }
 }
+// --- log out: confirmed, and never while the app is running -------------------------------------
+const logoutOpen = ref(false)
+const logoutTarget = ref<CMInstance | null>(null)
+const loggingOut = ref(false)
+function openLogoutDialog(inst: CMInstance) {
+  logoutTarget.value = inst
+  logoutOpen.value = true
+}
+async function onLogoutConfirm() {
+  const inst = logoutTarget.value
+  if (!inst) return
+  loggingOut.value = true
+  try {
+    const result = await logout(inst.dir)
+    // The server's own message is the useful one on failure: it explains the running-instance
+    // refusal, which is the case a person will actually hit.
+    if (result?.ok) toast.success(result.message ?? t('instances.toastLoggedOut'))
+    else toast.error(result?.message ?? t('instances.toastLogoutFailed'))
+  } finally {
+    loggingOut.value = false
+    logoutOpen.value = false
+    logoutTarget.value = null
+  }
+}
+
 async function onFocus(inst: CMInstance) {
   if (!inst.isRunning || isBusy(inst)) return
   const result = await focus(inst.dir)
@@ -1492,6 +1520,16 @@ onUnmounted(() => {
                     >
                       <UserRound /> {{ $t('instances.useAccountName') }}
                     </DropdownMenuItem>
+                    <!-- Sign this profile out. Disabled while it is RUNNING, because the server
+                         refuses it then anyway (Claude Desktop holds config.json open and would
+                         undo or corrupt the write) - better to say so on the item than to let the
+                         click produce an error toast. -->
+                    <DropdownMenuItem
+                      :disabled="inst.isRunning || isBusy(inst)"
+                      @click="openLogoutDialog(inst)"
+                    >
+                      <LogOut /> {{ $t('instances.logout') }}
+                    </DropdownMenuItem>
                     <DropdownMenuItem
                       :disabled="isBusy(inst)"
                       @click="openEditDialog(inst)"
@@ -1586,6 +1624,13 @@ onUnmounted(() => {
          where there is one rather than the folder: an empty field means "name it after the
          account" (displayName), and the placeholder should show what leaving it empty
          actually gets you. The folder name is the fallback, same as displayName's. -->
+    <LogoutInstanceDialog
+      v-model:open="logoutOpen"
+      :instance-name="logoutTarget ? displayName(logoutTarget) : null"
+      :account-email="accountEmail(logoutTarget?.account)"
+      :submitting="loggingOut"
+      @confirm="onLogoutConfirm"
+    />
     <EditInstanceDialog
       v-model:open="editOpen"
       :instance-name="accountDisplayName(editTarget?.account) ?? editTarget?.name ?? null"

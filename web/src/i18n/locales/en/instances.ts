@@ -69,6 +69,18 @@ export default {
   toastUsingAccountName: 'Cleared the typed name. This instance is called “{name}” again.',
   copyAccountEmailAria: 'Copy the account address {email}',
   toastEmailCopied: 'Copied {email} — the account this instance is signed into.',
+  // Sign a profile out. Removes the stored login ONLY: history, settings and the folder stay.
+  // Disabled while the instance runs, because the server refuses it then (Claude Desktop holds
+  // config.json open and would undo or corrupt the write) and a dead click is worse than a
+  // greyed one.
+  logout: 'Log out of this account',
+  logoutDialogTitle: 'Log {name} out?',
+  logoutDialogDescription:
+    'Removes the stored login from this instance. Its chats, settings and folder are untouched, and it will ask for a sign-in the next time it starts. Signing back in needs the other instances quit first (the “Browser Dance”).',
+  logoutDialogSubmit: 'Log out',
+  logoutDialogWorking: 'Logging out…',
+  toastLoggedOut: 'Signed out. That instance will ask for a login next time it starts.',
+  toastLogoutFailed: 'Could not sign that instance out.',
   openFolder: 'Open folder',
   createShortcut: 'Create desktop shortcut',
   checkUsage: 'Check usage',
